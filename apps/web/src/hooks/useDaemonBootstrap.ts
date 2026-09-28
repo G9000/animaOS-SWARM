@@ -9,6 +9,16 @@ import {
 
 export type DaemonConnection = 'unknown' | 'online' | 'offline';
 
+/** Full agent snapshots are re-read this often without the event stream. */
+export const BOOTSTRAP_POLL_MS = 5_000;
+/** With the stream open, agent summaries are re-read this often (spec §15.5). */
+export const BOOTSTRAP_SUMMARY_POLL_MS = 30_000;
+
+export interface DaemonBootstrapOptions {
+  /** The companion's event stream is open: poll summaries, not snapshots. */
+  live?: boolean;
+}
+
 export interface DaemonBootstrap {
   connection: DaemonConnection;
   loaded: boolean;
@@ -17,6 +27,8 @@ export interface DaemonBootstrap {
   providersError: string | null;
   workspace: DaemonWorkspaceState | null;
   refreshAgents(): Promise<void>;
+  /** Reads every agent's summary, keeping each one's last messages. */
+  refreshSummaries(): Promise<void>;
   retryProviders(): Promise<void>;
   refreshWorkspace(): Promise<void>;
   acceptAgentSnapshot(snapshot: DaemonSnapshot): void;
@@ -46,7 +58,10 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-export function useDaemonBootstrap(): DaemonBootstrap {
+export function useDaemonBootstrap(
+  options: DaemonBootstrapOptions = {},
+): DaemonBootstrap {
+  const live = options.live ?? false;
   const [connection, setConnection] = useState<DaemonConnection>('unknown');
   const [loaded, setLoaded] = useState(false);
   const [agents, setAgents] = useState<DaemonSnapshot[]>([]);
@@ -91,6 +106,47 @@ export function useDaemonBootstrap(): DaemonBootstrap {
       ) {
         setLoaded(true);
       }
+    }
+  }, []);
+
+  /** Agent records without transcripts (`view=summary`); each keeps the
+   *  messages of its last full snapshot. */
+  const refreshSummaries = useCallback(async () => {
+    const requestGeneration = ++agentRequestGenerationRef.current;
+    const mutationEpoch = collectionMutationEpochRef.current;
+
+    try {
+      const summaries = await daemon.listAgentSummaries();
+      if (
+        !mountedRef.current ||
+        requestGeneration !== agentRequestGenerationRef.current
+      ) {
+        return;
+      }
+
+      if (mutationEpoch === collectionMutationEpochRef.current) {
+        setAgents((current) =>
+          sortAgentSnapshots(
+            summaries.map((summary) => ({
+              state: summary.state,
+              messageCount: summary.messageCount,
+              eventCount: summary.eventCount,
+              messages:
+                current.find(({ state }) => state.id === summary.state.id)
+                  ?.messages ?? [],
+            })),
+          ),
+        );
+      }
+      setConnection('online');
+    } catch {
+      if (
+        !mountedRef.current ||
+        requestGeneration !== agentRequestGenerationRef.current
+      ) {
+        return;
+      }
+      setConnection('offline');
     }
   }, []);
 
@@ -170,50 +226,33 @@ export function useDaemonBootstrap(): DaemonBootstrap {
   useEffect(() => {
     mountedRef.current = true;
     let active = true;
-    let pollTimer: number | undefined;
-
-    const schedulePoll = () => {
-      if (!active || !mountedRef.current) {
-        return;
-      }
-
-      pollTimer = window.setTimeout(() => {
-        pollTimer = undefined;
-        void Promise.allSettled([refreshAgents(), refreshWorkspace()]).then(
-          schedulePoll,
-        );
-      }, 5_000);
-    };
 
     const requestGeneration = ++agentRequestGenerationRef.current;
     const mutationEpoch = collectionMutationEpochRef.current;
-    const availability = Promise.allSettled([
-      daemon.health(),
-      daemon.listAgents(),
-    ]).then(([healthResult, agentsResult]) => {
-      if (!active || !mountedRef.current) {
-        return;
-      }
-
-      if (requestGeneration === agentRequestGenerationRef.current) {
-        if (
-          agentsResult.status === 'fulfilled' &&
-          mutationEpoch === collectionMutationEpochRef.current
-        ) {
-          setAgents(sortAgentSnapshots(agentsResult.value.agents));
+    void Promise.allSettled([daemon.health(), daemon.listAgents()]).then(
+      ([healthResult, agentsResult]) => {
+        if (!active || !mountedRef.current) {
+          return;
         }
 
-        setConnection(
-          healthResult.status === 'fulfilled' &&
-            agentsResult.status === 'fulfilled'
-            ? 'online'
-            : 'offline',
-        );
-      }
-      setLoaded(true);
-    });
+        if (requestGeneration === agentRequestGenerationRef.current) {
+          if (
+            agentsResult.status === 'fulfilled' &&
+            mutationEpoch === collectionMutationEpochRef.current
+          ) {
+            setAgents(sortAgentSnapshots(agentsResult.value.agents));
+          }
 
-    void availability.finally(schedulePoll);
+          setConnection(
+            healthResult.status === 'fulfilled' &&
+              agentsResult.status === 'fulfilled'
+              ? 'online'
+              : 'offline',
+          );
+        }
+        setLoaded(true);
+      },
+    );
     void retryProviders();
     void refreshWorkspace();
 
@@ -223,11 +262,41 @@ export function useDaemonBootstrap(): DaemonBootstrap {
       agentRequestGenerationRef.current += 1;
       providerRequestGenerationRef.current += 1;
       workspaceRequestGenerationRef.current += 1;
+    };
+  }, [retryProviders, refreshWorkspace]);
+
+  // Polling starts once the first read settled and waits for each poll to
+  // settle; with the stream open it reads summaries every 30 s instead.
+  useEffect(() => {
+    if (!loaded) return;
+    let active = true;
+    let pollTimer: number | undefined;
+
+    const schedulePoll = () => {
+      if (!active || !mountedRef.current) {
+        return;
+      }
+
+      pollTimer = window.setTimeout(
+        () => {
+          pollTimer = undefined;
+          void Promise.allSettled([
+            live ? refreshSummaries() : refreshAgents(),
+            refreshWorkspace(),
+          ]).then(schedulePoll);
+        },
+        live ? BOOTSTRAP_SUMMARY_POLL_MS : BOOTSTRAP_POLL_MS,
+      );
+    };
+
+    schedulePoll();
+    return () => {
+      active = false;
       if (pollTimer !== undefined) {
         window.clearTimeout(pollTimer);
       }
     };
-  }, [refreshAgents, retryProviders, refreshWorkspace]);
+  }, [loaded, live, refreshAgents, refreshSummaries, refreshWorkspace]);
 
   return {
     connection,
@@ -237,6 +306,7 @@ export function useDaemonBootstrap(): DaemonBootstrap {
     providersError,
     workspace,
     refreshAgents,
+    refreshSummaries,
     retryProviders,
     refreshWorkspace,
     acceptAgentSnapshot,

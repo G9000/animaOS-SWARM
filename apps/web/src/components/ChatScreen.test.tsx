@@ -1,9 +1,10 @@
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import type { AgentDetail } from '../lib/types';
 import { formatTime } from './ui-bits';
 import { Composer, MessageList } from './ChatScreen';
+import { SLASH_COMMANDS } from '../lib/slash-commands';
 
 const messages: AgentDetail['messages'] = [
   {
@@ -125,7 +126,8 @@ describe('MessageList', () => {
     expect(await navigator.clipboard.readText()).toBe('**bold**');
     expect(screen.getByRole('button', { name: 'Copied' })).toBeVisible();
   });
-  it('renders Markdown for user and assistant bubbles while keeping event pills literal', () => {
+  it('renders Markdown bubbles, literal event pills, and tool results as cards', async () => {
+    const user = userEvent.setup();
     const scrollerRef = { current: null };
     render(
       <MessageList
@@ -141,11 +143,194 @@ describe('MessageList', () => {
       screen.getByRole('heading', { level: 2, name: 'Heading' }),
     ).toBeVisible();
     expect(screen.getByText('system · **system marker**')).toBeVisible();
-    expect(screen.getByText('tool · ## tool marker')).toBeVisible();
     expect(screen.getByText('system · **system marker**').tagName).toBe('SPAN');
+    // Tool messages are no longer grey pills (spec §15.1).
+    expect(screen.queryByText(/^tool · /)).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Used 1 tool · <1s' }));
+    await user.click(screen.getByRole('button', { name: /^tool\b/ }));
+    expect(screen.getByText('## tool marker').tagName).toBe('PRE');
     expect(
       screen.queryByRole('heading', { name: 'tool marker' }),
     ).not.toBeInTheDocument();
+  });
+
+  it('labels a stopped reply', () => {
+    render(
+      <MessageList
+        agent={{
+          ...agent,
+          messages: [
+            {
+              id: 'stopped',
+              role: 'Assistant',
+              content: { text: 'Half an answer', metadata: { stopped: true } },
+              created_at_ms: 1_725_000_000_000,
+            },
+          ],
+        }}
+        sending={false}
+        scrollerRef={{ current: null }}
+        onSuggestion={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText('Stopped')).toBeVisible();
+  });
+
+  it('labels an incomplete reply', () => {
+    render(
+      <MessageList
+        agent={{
+          ...agent,
+          messages: [
+            {
+              id: 'incomplete',
+              role: 'Assistant',
+              content: {
+                text: 'Half an answer',
+                metadata: { incomplete: true },
+              },
+              created_at_ms: 1_725_000_000_000,
+            },
+          ],
+        }}
+        sending={false}
+        scrollerRef={{ current: null }}
+        onSuggestion={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText('Incomplete')).toBeVisible();
+  });
+
+  it('anchors a message id shared by a bubble and its tool block to the bubble alone', async () => {
+    // An assistant message with both text and tool calls produces two
+    // transcript items that both cite its id; only one may own it, or
+    // jump/highlight are ambiguous and unmounting either item deletes the
+    // other's registration.
+    const calledOn: Element[] = [];
+    const original = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = function (this: Element) {
+      calledOn.push(this);
+    };
+    try {
+      const user = userEvent.setup();
+      render(
+        <MessageList
+          agent={{
+            ...agent,
+            messages: [
+              {
+                id: 'a1',
+                role: 'Assistant',
+                content: {
+                  text: 'Let me check.',
+                  metadata: {
+                    toolCalls: [{ id: 'call_1', name: 'calculate', args: {} }],
+                  },
+                },
+                created_at_ms: 1_725_000_000_000,
+              },
+            ],
+          }}
+          sending={false}
+          scrollerRef={{ current: null }}
+          onSuggestion={vi.fn()}
+        />,
+      );
+
+      const bubbleAnchor = screen
+        .getByText('Let me check.')
+        .closest('.studio-message-anchor');
+      const toolAnchor = screen
+        .getByRole('button', { name: /Used 1 tool/ })
+        .closest('.studio-message-anchor');
+      expect(bubbleAnchor).not.toBeNull();
+      expect(bubbleAnchor).not.toBe(toolAnchor);
+
+      await user.click(
+        screen.getByRole('button', { name: 'Search conversation' }),
+      );
+      await user.type(
+        screen.getByRole('searchbox', { name: 'Search messages' }),
+        'Let me check',
+      );
+      expect(bubbleAnchor).toHaveAttribute('data-search-match', 'true');
+      expect(toolAnchor).not.toHaveAttribute('data-search-match');
+
+      fireEvent.keyDown(
+        screen.getByRole('searchbox', { name: 'Search messages' }),
+        { key: 'Enter' },
+      );
+      expect(calledOn).toContain(bubbleAnchor);
+      expect(calledOn).not.toContain(toolAnchor);
+    } finally {
+      Element.prototype.scrollIntoView = original;
+    }
+  });
+
+  it('renders the context-trimmed divider without nesting its Compact button inside the separator', () => {
+    const onCompact = vi.fn();
+    render(
+      <MessageList
+        agent={agent}
+        sending={false}
+        scrollerRef={{ current: null }}
+        onSuggestion={vi.fn()}
+        items={[{ kind: 'trimmed', key: 'trimmed' }]}
+        actions={{ onCompact }}
+      />,
+    );
+
+    const separator = screen.getByRole('separator');
+    const button = screen.getByRole('button', { name: 'Compact' });
+    expect(separator.contains(button)).toBe(false);
+  });
+
+  it('disables Compact and shows its progress while pending (S3b-C)', () => {
+    const onCompact = vi.fn();
+    render(
+      <MessageList
+        agent={agent}
+        sending={false}
+        scrollerRef={{ current: null }}
+        onSuggestion={vi.fn()}
+        items={[{ kind: 'trimmed', key: 'trimmed' }]}
+        actions={{ onCompact, compacting: true }}
+      />,
+    );
+
+    const button = screen.getByRole('button', { name: 'Compacting…' });
+    expect(button).toBeDisabled();
+    fireEvent.click(button);
+    expect(onCompact).not.toHaveBeenCalled();
+  });
+
+  it('renders a helper session’s delegated turn from the delegating companion, not the owner', () => {
+    render(
+      <MessageList
+        agent={agent}
+        sending={false}
+        scrollerRef={{ current: null }}
+        onSuggestion={vi.fn()}
+        items={[
+          {
+            kind: 'delegated',
+            key: 'delegated-1',
+            from: 'Nova',
+            message: {
+              id: 'delegated-1',
+              role: 'User',
+              content: { text: 'Compare vendors' },
+              created_at_ms: 1_725_000_000_000,
+            },
+          },
+        ]}
+      />,
+    );
+
+    expect(screen.getByText('From Nova')).toBeVisible();
+    expect(screen.getByText('Compare vendors')).toBeVisible();
   });
 
   it('retains the conversation label and message timestamps', () => {
@@ -212,5 +397,242 @@ describe('Composer keyboard safety', () => {
     view.rerender(<Composer {...props} />);
     fireEvent.keyDown(input, { key: 'Enter' });
     expect(onSend).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('Composer commands and live replies', () => {
+  function composerProps(
+    overrides: Partial<Parameters<typeof Composer>[0]> = {},
+  ) {
+    return {
+      agentName: 'Nova',
+      draft: '',
+      setDraft: vi.fn(),
+      sending: false,
+      disabled: false,
+      onSend: vi.fn(),
+      error: null,
+      onDismissError: vi.fn(),
+      commands: SLASH_COMMANDS,
+      ...overrides,
+    };
+  }
+
+  it('offers the matching commands and runs one with Enter', () => {
+    const props = composerProps({ draft: '/co' });
+    render(<Composer {...props} />);
+
+    const menu = screen.getByRole('listbox', { name: 'Commands' });
+    expect(within(menu).getAllByRole('option')).toHaveLength(1);
+    expect(
+      within(menu).getByRole('option', { selected: true }),
+    ).toHaveTextContent('/compact');
+    fireEvent.keyDown(screen.getByRole('textbox', { name: 'Message Nova' }), {
+      key: 'Enter',
+    });
+    expect(props.onSend).toHaveBeenCalledWith('/compact');
+  });
+
+  it('completes a command that needs more text instead of running it', () => {
+    const props = composerProps({ draft: '/re' });
+    const view = render(<Composer {...props} />);
+    const input = screen.getByRole('textbox', { name: 'Message Nova' });
+
+    fireEvent.keyDown(input, { key: 'Enter' });
+    expect(props.setDraft).toHaveBeenCalledWith('/rename ');
+    expect(props.onSend).not.toHaveBeenCalled();
+
+    view.rerender(<Composer {...props} draft="/n" />);
+    fireEvent.keyDown(input, { key: 'Tab' });
+    expect(props.setDraft).toHaveBeenLastCalledWith('/new');
+  });
+
+  it('moves through commands with the arrow keys, picks by click, and closes with Escape', async () => {
+    const props = composerProps({ draft: '/' });
+    render(<Composer {...props} />);
+    const input = screen.getByRole('textbox', { name: 'Message Nova' });
+
+    fireEvent.keyDown(input, { key: 'ArrowDown' });
+    expect(screen.getByRole('option', { selected: true })).toHaveTextContent(
+      '/stop',
+    );
+    expect(input).toHaveAttribute(
+      'aria-activedescendant',
+      screen.getByRole('option', { selected: true }).id,
+    );
+    await userEvent.click(screen.getByRole('option', { name: /\/export/ }));
+    expect(props.onSend).toHaveBeenCalledWith('/export');
+    fireEvent.keyDown(input, { key: 'Escape' });
+    expect(screen.queryByRole('listbox')).not.toBeInTheDocument();
+  });
+
+  it('shows no command menu without commands', () => {
+    render(
+      <Composer {...composerProps({ draft: '/', commands: undefined })} />,
+    );
+    expect(screen.queryByRole('listbox')).not.toBeInTheDocument();
+  });
+
+  it('turns Send into Stop and steers with Ctrl+Enter while a reply runs', async () => {
+    const props = composerProps({
+      draft: 'also check flights',
+      runActive: true,
+      onStop: vi.fn(),
+      onSteer: vi.fn(),
+    });
+    render(<Composer {...props} />);
+    const input = screen.getByRole('textbox', { name: 'Message Nova' });
+
+    expect(
+      screen.queryByRole('button', { name: 'Send' }),
+    ).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Stop' }));
+    expect(props.onStop).toHaveBeenCalled();
+    fireEvent.keyDown(input, { key: 'Enter', ctrlKey: true });
+    expect(props.onSteer).toHaveBeenCalledTimes(1);
+    expect(props.onSend).not.toHaveBeenCalled();
+    fireEvent.keyDown(input, { key: 'Enter' });
+    expect(props.onSend).toHaveBeenCalledTimes(1);
+    // jsdom reports no Mac platform, so the hint names Ctrl+Enter (S3b-E).
+    expect(
+      screen.getByText('⏎ queue · Ctrl+Enter steer · ⇧⏎ new line'),
+    ).toBeVisible();
+  });
+
+  it('shows the ⌘ steer hint on a Mac', () => {
+    vi.stubGlobal('navigator', { ...navigator, platform: 'MacIntel' });
+    try {
+      render(
+        <Composer
+          {...composerProps({
+            draft: 'and Sunday?',
+            runActive: true,
+            onStop: vi.fn(),
+            onSteer: vi.fn(),
+          })}
+        />,
+      );
+      expect(
+        screen.getByText('⏎ queue · ⌘⏎ steer · ⇧⏎ new line'),
+      ).toBeVisible();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('does not steer or send while composing IME text', () => {
+    const props = composerProps({
+      draft: 'more context',
+      commands: undefined,
+      runActive: true,
+      onStop: vi.fn(),
+      onSteer: vi.fn(),
+    });
+    render(<Composer {...props} />);
+    const input = screen.getByRole('textbox', { name: 'Message Nova' });
+
+    fireEvent.keyDown(input, {
+      key: 'Enter',
+      ctrlKey: true,
+      isComposing: true,
+    });
+    expect(props.onSteer).not.toHaveBeenCalled();
+    expect(props.onSend).not.toHaveBeenCalled();
+    fireEvent.keyDown(input, { key: 'Enter', isComposing: true });
+    expect(props.onSend).not.toHaveBeenCalled();
+  });
+
+  it('wires the input to the open command menu, and picking an option keeps focus in the input', async () => {
+    const props = composerProps({ draft: '/co' });
+    render(<Composer {...props} />);
+    const input = screen.getByRole('textbox', { name: 'Message Nova' });
+    const listbox = screen.getByRole('listbox');
+    const option = screen.getByRole('option', { selected: true });
+
+    // A textbox takes aria-autocomplete, aria-controls and
+    // aria-activedescendant, but not aria-expanded (S3b-E).
+    expect(input).not.toHaveAttribute('aria-expanded');
+    expect(input).toHaveAttribute('aria-autocomplete', 'list');
+    expect(input).toHaveAttribute('aria-controls', listbox.id);
+    expect(input).toHaveAttribute('aria-activedescendant', option.id);
+
+    input.focus();
+    expect(document.activeElement).toBe(input);
+    await userEvent.click(option);
+    expect(document.activeElement).toBe(input);
+  });
+
+  it('drops the menu wiring once no command matches', () => {
+    const props = composerProps({ draft: 'hello' });
+    render(<Composer {...props} />);
+    const input = screen.getByRole('textbox', { name: 'Message Nova' });
+
+    expect(input).not.toHaveAttribute('aria-expanded');
+    expect(input).not.toHaveAttribute('aria-controls');
+    expect(input).not.toHaveAttribute('aria-activedescendant');
+  });
+
+  it('lets Shift+Tab move focus away normally instead of completing a command', () => {
+    const props = composerProps({ draft: '/re' });
+    render(<Composer {...props} />);
+    const input = screen.getByRole('textbox', { name: 'Message Nova' });
+
+    const notPrevented = fireEvent.keyDown(input, {
+      key: 'Tab',
+      shiftKey: true,
+    });
+    expect(notPrevented).toBe(true);
+    expect(props.setDraft).not.toHaveBeenCalled();
+    expect(props.onSend).not.toHaveBeenCalled();
+  });
+
+  it('does not send a picked no-argument command while a send is already in flight', async () => {
+    const props = composerProps({ draft: '/st', sending: true });
+    render(<Composer {...props} />);
+
+    await userEvent.click(screen.getByRole('option', { name: /\/stop/ }));
+    expect(props.onSend).not.toHaveBeenCalled();
+  });
+
+  it('falls back to a normal send with Ctrl+Enter when a run is active but there is no onSteer', () => {
+    const props = composerProps({
+      draft: 'keep going',
+      runActive: true,
+      onStop: vi.fn(),
+      onSteer: undefined,
+    });
+    render(<Composer {...props} />);
+    const input = screen.getByRole('textbox', { name: 'Message Nova' });
+
+    fireEvent.keyDown(input, { key: 'Enter', ctrlKey: true });
+    expect(props.onSend).toHaveBeenCalledTimes(1);
+  });
+
+  it('wraps the active suggestion at both ends of the list with the arrow keys', () => {
+    const props = composerProps({ draft: '/' });
+    render(<Composer {...props} />);
+    const input = screen.getByRole('textbox', { name: 'Message Nova' });
+    const last = SLASH_COMMANDS[SLASH_COMMANDS.length - 1];
+
+    fireEvent.keyDown(input, { key: 'ArrowUp' });
+    expect(screen.getByRole('option', { selected: true })).toHaveTextContent(
+      `/${last.name}`,
+    );
+    fireEvent.keyDown(input, { key: 'ArrowDown' });
+    expect(screen.getByRole('option', { selected: true })).toHaveTextContent(
+      `/${SLASH_COMMANDS[0].name}`,
+    );
+  });
+
+  it('closes the menu when the textarea loses focus and reopens it on refocus with a matching draft', () => {
+    const props = composerProps({ draft: '/co' });
+    render(<Composer {...props} />);
+    const input = screen.getByRole('textbox', { name: 'Message Nova' });
+
+    expect(screen.getByRole('listbox')).toBeInTheDocument();
+    fireEvent.blur(input);
+    expect(screen.queryByRole('listbox')).not.toBeInTheDocument();
+    fireEvent.focus(input);
+    expect(screen.getByRole('listbox')).toBeInTheDocument();
   });
 });

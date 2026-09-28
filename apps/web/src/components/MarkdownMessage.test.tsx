@@ -1,11 +1,52 @@
 import { act, fireEvent, render, screen } from '@testing-library/react';
+import { useState } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MarkdownMessage } from './MarkdownMessage';
+
+/** Counts Markdown parses; the real renderer still renders. */
+const parses = vi.hoisted(() => vi.fn());
+vi.mock('react-markdown', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('react-markdown')>();
+  const Parsed = (props: Parameters<typeof actual.default>[0]) => {
+    parses();
+    return <actual.default {...props} />;
+  };
+  return { ...actual, default: Parsed };
+});
 
 describe('MarkdownMessage', () => {
   afterEach(() => {
     vi.useRealTimers();
     vi.restoreAllMocks();
+  });
+
+  it('parses the same text once however often its parent renders', () => {
+    function Parent() {
+      const [renders, setRenders] = useState(0);
+      const [text, setText] = useState('**steady**');
+      return (
+        <>
+          <button type="button" onClick={() => setRenders(renders + 1)}>
+            Render {renders}
+          </button>
+          <button type="button" onClick={() => setText('**changed**')}>
+            Change
+          </button>
+          <MarkdownMessage>{text}</MarkdownMessage>
+        </>
+      );
+    }
+    parses.mockClear();
+    render(<Parent />);
+    expect(parses).toHaveBeenCalledTimes(1);
+
+    for (let index = 0; index < 3; index += 1)
+      fireEvent.click(screen.getByRole('button', { name: /^Render/ }));
+    expect(parses).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Change' }));
+    expect(parses).toHaveBeenCalledTimes(2);
+    expect(screen.getByText('changed').tagName).toBe('STRONG');
   });
 
   it('renders safe GitHub-flavored Markdown semantics', () => {

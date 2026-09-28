@@ -28,10 +28,14 @@ pub(crate) struct ToolGrantSet {
     pub(crate) write_class: &'static [&'static str],
 }
 
-/// M2 adds no tools. M3 (`search_conversations`), M5 (`load_skill`,
-/// `propose_skill`), and M6 (`list_automations`, `create_automation`,
-/// `pause_automation`) append their grant sets here.
-pub(crate) const TOOL_GRANTS: &[ToolGrantSet] = &[];
+/// Grant sets in the order they shipped. M5 (`load_skill`, `propose_skill`)
+/// and M6 (`list_automations`, `create_automation`, `pause_automation`)
+/// append theirs.
+pub(crate) const TOOL_GRANTS: &[ToolGrantSet] = &[ToolGrantSet {
+    id: "m3-search-conversations",
+    read_class: &["search_conversations"],
+    write_class: &[],
+}];
 
 /// Legacy check-ins ran in a fresh `room-*` room per tick. Those rooms become
 /// the automation's `schedule:<id>` session, and so do their ledger runs;
@@ -39,7 +43,7 @@ pub(crate) const TOOL_GRANTS: &[ToolGrantSet] = &[];
 /// undid may have committed no message to key off, so a schedule-sourced run
 /// whose session id still looks like a per-tick room is also relabelled from
 /// its own `sourceRef`, whether or not its room holds any message. Callers
-/// only run this against a snapshot older than the current store version — a
+/// only run this against a snapshot older than the sessions store version — a
 /// room a live run just created this boot must be left alone, or its
 /// already-mirrored history would be stranded under the old id. Returns how
 /// many messages moved and how many runs were relabelled.
@@ -582,7 +586,7 @@ mod tests {
     }
 
     #[test]
-    fn relabel_only_runs_on_a_snapshot_older_than_the_current_version() {
+    fn relabel_only_runs_on_a_snapshot_older_than_the_sessions_version() {
         let mut source = DaemonState::new();
         let agent_id = source
             .create_agent(config("companion", &[]))
@@ -628,6 +632,21 @@ mod tests {
             .restore_control_plane_snapshot(current)
             .unwrap();
         assert!(restored_current
+            .get_agent(&agent_id)
+            .unwrap()
+            .messages
+            .iter()
+            .all(|message| message.room_id == "room-1-1"));
+
+        // Nor does an M2 (version-5) snapshot: its check-ins already ran in
+        // `schedule:` rooms, so a `room-*` room there is a run's own room.
+        let mut m2 = source.control_plane_snapshot();
+        m2.version = 5;
+        m2.agents[0].messages = checkin_messages();
+        m2.agents[0].message_count = 2;
+        let mut restored_m2 = DaemonState::new();
+        restored_m2.restore_control_plane_snapshot(m2).unwrap();
+        assert!(restored_m2
             .get_agent(&agent_id)
             .unwrap()
             .messages
@@ -1204,6 +1223,49 @@ mod tests {
             .map(|tool| tool.name)
             .collect::<Vec<_>>();
         assert_eq!(tools, ["read_file"]);
+    }
+
+    #[test]
+    fn the_search_conversations_grant_reaches_non_helper_agents_only() {
+        // Ruling 1 (M3 Task 14 pre-flight audit): TOOL_GRANTS must not grant
+        // search_conversations to helper agents, even one whose pre-M3 tools
+        // otherwise match a companion's.
+        let registry = crate::tools::ToolRegistry::new();
+        let mut companion = config("companion", &[]);
+        companion.tools = Some(registry.resolve_descriptors(["calculate"]).unwrap());
+        let mut state = DaemonState::new();
+        let companion_id = state.create_agent(companion).unwrap().state.id;
+        let mut helper = config(
+            "helper",
+            &[
+                ("workspaceRole", "helper"),
+                ("parentAgentId", companion_id.as_str()),
+            ],
+        );
+        helper.tools = Some(registry.resolve_descriptors(["calculate"]).unwrap());
+        let helper_id = state.create_agent(helper).unwrap().state.id;
+
+        let changed = state.apply_pending_tool_grants(TOOL_GRANTS);
+
+        assert_eq!(changed, vec![companion_id.clone()]);
+        let names = |id: &str| {
+            state
+                .get_agent(id)
+                .unwrap()
+                .state
+                .config
+                .tools
+                .unwrap_or_default()
+                .into_iter()
+                .map(|tool| tool.name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&companion_id), ["calculate", "search_conversations"]);
+        assert_eq!(
+            names(&helper_id),
+            ["calculate"],
+            "the migration grant never reaches a helper agent"
+        );
     }
 
     #[test]

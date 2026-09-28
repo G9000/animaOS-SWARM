@@ -3,13 +3,15 @@
 //! valid session id; those map to a stable `legacy-room:<hash>` id and keep
 //! their room on the record.
 
+pub(crate) mod compaction;
+pub(crate) mod context;
 pub(crate) mod migration;
 pub(crate) mod pruning;
 #[cfg(test)]
 pub(crate) mod test_support;
+pub(crate) mod titles;
 pub(crate) mod views;
 
-use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use anima_core::{DataValue, Message, MessageRole};
@@ -170,6 +172,42 @@ pub(crate) struct SessionContextTrimmed {
     pub(crate) at_ms: u64,
 }
 
+/// The last failed compaction (spec §5.4); cleared by the next success.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SessionCompactionError {
+    pub(crate) message: String,
+    pub(crate) at_ms: u64,
+}
+
+/// The newest model-visible message hot-tail pruning removed from a session
+/// (controller ruling, M3 pre-flight audit I5), with its transcript
+/// position: the turns through it are no longer in the control plane.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SessionPrunedThrough {
+    pub(crate) message_id: String,
+    pub(crate) created_at_ms: u64,
+}
+
+impl SessionPrunedThrough {
+    pub(crate) fn of(message: &Message) -> Self {
+        Self {
+            message_id: message.id.clone(),
+            created_at_ms: message.created_at_ms,
+        }
+    }
+
+    /// The message's place in its session's transcript order.
+    pub(crate) fn order(&self) -> crate::history::MessageOrder {
+        crate::history::MessageOrder {
+            created_at_ms: self.created_at_ms,
+            ordinal: crate::history::message_ordinal(&self.message_id),
+            id: self.message_id.clone(),
+        }
+    }
+}
+
 /// The stored session record (spec §3.2). Derived fields are computed per
 /// response and never stored.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -197,6 +235,20 @@ pub(crate) struct SessionRecord {
     pub(crate) summary: Option<SessionSummary>,
     #[serde(default)]
     pub(crate) context_trimmed: Option<SessionContextTrimmed>,
+    /// The last run's reported prompt tokens over its estimate, in permille
+    /// (spec §5.2 calibration; clamped 500–2000 when written).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) context_calibration_permille: Option<u32>,
+    /// Why the last compaction failed (spec §5.4), until one succeeds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) compaction_error: Option<SessionCompactionError>,
+    /// The newest visible message hot-tail pruning removed from this
+    /// session, set in the prune's own save (audit I5); silent check-in
+    /// pairs never move it. A run's context counts the pruned turns as
+    /// dropped unless the summary covers them
+    /// (`context::uncovered_pruned_through`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pruned_through: Option<SessionPrunedThrough>,
     /// The transcript room when it differs from `id`: a legacy room whose id
     /// is not a valid session id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -231,6 +283,9 @@ impl SessionRecord {
             parent_agent_id: None,
             summary: None,
             context_trimmed: None,
+            context_calibration_permille: None,
+            compaction_error: None,
+            pruned_through: None,
             room_id: room,
         }
     }
@@ -515,24 +570,9 @@ pub(crate) fn is_calendar_write_followup(source_ref: Option<&str>) -> bool {
     source_ref.is_some_and(|source_ref| source_ref.starts_with(CALENDAR_WRITE_SOURCE_REF_PREFIX))
 }
 
-/// Where each turn of `messages` starts, oldest first; `messages` are one
-/// room's messages in transcript order. A turn starts at a user message and
-/// holds every following assistant, tool, and system message up to the next
-/// user message, so a cut made only at these indices never separates an
-/// assistant tool-call message from its tool results (providers reject a
-/// tool result whose call is missing). Messages before the first user
-/// message end a turn whose start is gone. Hot-tail pruning, a run's
-/// history, and the `schedule:` room context cap all cut here (final fix
-/// wave A); M3's context selection is meant to reuse it.
-pub(crate) fn turn_starts<M: Borrow<Message>>(
-    messages: &[M],
-) -> impl DoubleEndedIterator<Item = usize> + '_ {
-    messages
-        .iter()
-        .enumerate()
-        .filter(|(_, message)| Borrow::<Message>::borrow(*message).role == MessageRole::User)
-        .map(|(index, _)| index)
-}
+/// Where each turn starts; the single definition lives in `anima-core`
+/// (context selection, pruning, and the silent check-in grouping share it).
+pub(crate) use anima_core::turn_starts;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GroupStart {
@@ -548,22 +588,22 @@ enum GroupStart {
 pub(crate) fn hidden_message_ids<'a>(
     messages: impl IntoIterator<Item = &'a Message>,
 ) -> HashSet<String> {
+    let messages: Vec<&Message> = messages.into_iter().collect();
+    let starts: Vec<usize> = turn_starts(&messages).collect();
     let mut hidden = HashSet::new();
-    let mut group: Vec<&Message> = Vec::new();
-    let mut start = GroupStart::Missing;
-    for message in messages {
-        if message.role == MessageRole::User {
-            close_group(&group, start, &mut hidden);
-            group.clear();
-            start = if is_checkin_message(message) {
-                GroupStart::Checkin
-            } else {
-                GroupStart::Other
-            };
-        }
-        group.push(message);
+    // Messages before the first turn belong to a turn whose opening is gone.
+    let first = starts.first().copied().unwrap_or(messages.len());
+    close_group(&messages[..first], GroupStart::Missing, &mut hidden);
+    for (index, &start) in starts.iter().enumerate() {
+        let end = starts.get(index + 1).copied().unwrap_or(messages.len());
+        let group = &messages[start..end];
+        let opening = if is_checkin_message(group[0]) {
+            GroupStart::Checkin
+        } else {
+            GroupStart::Other
+        };
+        close_group(group, opening, &mut hidden);
     }
-    close_group(&group, start, &mut hidden);
     hidden
 }
 
@@ -1502,6 +1542,28 @@ mod tests {
         assert!(!minimal.archived);
         assert_eq!(minimal.summary, None);
         assert_eq!(minimal.last_read_at_ms, None);
+        // M3 fields read as unset from a snapshot written before them.
+        assert_eq!(minimal.context_calibration_permille, None);
+        assert_eq!(minimal.pruned_through, None);
+        let mut context = chat_record("agent-1", "chat:x", 1);
+        let unset = serde_json::to_value(&context).unwrap();
+        assert_eq!(unset.get("contextCalibrationPermille"), None);
+        assert_eq!(unset.get("prunedThrough"), None);
+        context.context_calibration_permille = Some(1_250);
+        context.pruned_through = Some(SessionPrunedThrough {
+            message_id: "m-1".into(),
+            created_at_ms: 7,
+        });
+        let value = serde_json::to_value(&context).unwrap();
+        assert_eq!(value["contextCalibrationPermille"], 1_250);
+        assert_eq!(
+            value["prunedThrough"],
+            serde_json::json!({ "messageId": "m-1", "createdAtMs": 7 })
+        );
+        assert_eq!(
+            serde_json::from_value::<SessionRecord>(value).unwrap(),
+            context
+        );
         assert_eq!(SessionKind::parse("checkin"), Some(SessionKind::Checkin));
         assert_eq!(SessionKind::parse("chats"), None);
         assert_eq!(SessionOrigin::Delegation.as_str(), "delegation");

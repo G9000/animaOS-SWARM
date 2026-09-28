@@ -132,25 +132,33 @@ impl ModelAdapter for RuntimeModelAdapter {
             _ => self.providers.generate(config, request).await,
         }
     }
+    /// Every provider streams (spec §4.5, §12.4).
     async fn stream(
         &self,
         config: &AgentConfig,
         request: &ModelGenerateRequest,
         sink: &dyn anima_core::ModelStreamSink,
     ) -> Result<(), String> {
-        if config
+        let provider = config
             .provider
             .as_deref()
-            .is_some_and(|p| p.trim().eq_ignore_ascii_case("chatgpt"))
-        {
-            let (access_token, account_id) = self.chatgpt_auth.usable_credential().await?;
-            return anima_model_adapters::ChatGptResponsesAdapter::new(access_token, account_id)?
-                .stream(config, request, sink)
-                .await;
+            .map(str::trim)
+            .filter(|provider| !provider.is_empty())
+            .unwrap_or("deterministic")
+            .to_ascii_lowercase();
+        match provider.as_str() {
+            "deterministic" | "test" => {
+                DeterministicModelAdapter
+                    .stream(config, request, sink)
+                    .await
+            }
+            "chatgpt" => {
+                let (access_token, account_id) = self.chatgpt_auth.usable_credential().await?;
+                anima_model_adapters::ChatGptResponsesAdapter::new(access_token, account_id)?
+                    .stream(config, request, sink)
+                    .await
+            }
+            _ => self.providers.stream(config, request, sink).await,
         }
-        sink.emit(anima_core::ModelStreamFrame::Final(
-            self.generate(config, request).await?,
-        ))
-        .await
     }
 }

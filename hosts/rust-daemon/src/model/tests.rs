@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use anima_core::{
     AgentConfig, Content, DataValue, Message, MessageRole, ModelAdapter, ModelGenerateRequest,
-    TaskResult,
+    ModelStreamFrame, ModelStreamSink, TaskResult,
 };
 use futures::executor::block_on;
 
@@ -281,4 +281,46 @@ fn task_result_data_value(result: &TaskResult<Content>) -> DataValue {
         DataValue::Number(result.duration_ms as f64),
     );
     DataValue::Object(value)
+}
+
+struct Frames(std::sync::Mutex<Vec<ModelStreamFrame>>);
+
+#[async_trait::async_trait]
+impl ModelStreamSink for Frames {
+    async fn emit(&self, frame: ModelStreamFrame) -> Result<(), String> {
+        self.0.lock().unwrap().push(frame);
+        Ok(())
+    }
+}
+
+#[test]
+fn deterministic_stream_sends_word_deltas_then_the_generated_response() {
+    let adapter = DeterministicModelAdapter;
+    let request = ModelGenerateRequest {
+        system: "You are helpful".into(),
+        messages: vec![message(
+            "msg-1",
+            "room-1",
+            MessageRole::User,
+            "plan the week",
+        )],
+        temperature: None,
+        max_tokens: None,
+    };
+    let frames = Frames(std::sync::Mutex::new(Vec::new()));
+
+    block_on(adapter.stream(&config_with_tools(&[]), &request, &frames)).unwrap();
+
+    let generated = block_on(adapter.generate(&config_with_tools(&[]), &request)).unwrap();
+    let frames = frames.0.into_inner().unwrap();
+    let deltas: String = frames
+        .iter()
+        .filter_map(|frame| match frame {
+            ModelStreamFrame::TextDelta(text) => Some(text.as_str()),
+            ModelStreamFrame::Final(_) => None,
+        })
+        .collect();
+    assert_eq!(deltas, generated.content.text);
+    assert!(frames.len() > 2, "one delta per word");
+    assert_eq!(frames.last(), Some(&ModelStreamFrame::Final(generated)));
 }

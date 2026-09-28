@@ -144,6 +144,76 @@ async fn tool_execution_context_rejects_registered_but_unconfigured_write_tool()
     );
 }
 
+#[tokio::test]
+async fn search_conversations_without_a_workspace_run_answers_plainly() {
+    // Controller ruling 2 (M3 Task 14 pre-flight audit, M14): a run outside
+    // a workspace agent coordinator (no `context.team`) must not panic or
+    // read the daemon state; it answers with this exact message.
+    let context = ToolExecutionContext::new(
+        Arc::new(AsyncRwLock::new(MemoryManager::new())),
+        Arc::new(AsyncRwLock::new(MemoryEmbeddingRuntime::disabled())),
+        None,
+        ToolRegistry::new(),
+        new_shared_process_manager_with_limit(DEFAULT_MAX_BACKGROUND_PROCESSES),
+        None,
+        None,
+    );
+    let agent = AgentState {
+        id: "agent-no-team".into(),
+        name: "no-team".into(),
+        status: AgentStatus::Running,
+        config: AgentConfig {
+            name: "no-team".into(),
+            model: "deterministic".into(),
+            bio: None,
+            lore: None,
+            knowledge: None,
+            topics: None,
+            adjectives: None,
+            style: None,
+            provider: None,
+            system: None,
+            tools: Some(
+                ToolRegistry::new()
+                    .resolve_descriptors(["search_conversations"])
+                    .unwrap(),
+            ),
+            plugins: None,
+            settings: None,
+        },
+        created_at_ms: 1,
+        token_usage: Default::default(),
+    };
+    let user_message = Message {
+        id: "message-no-team".into(),
+        agent_id: agent.id.clone(),
+        room_id: "room-no-team".into(),
+        content: Content {
+            text: "search".into(),
+            ..Content::default()
+        },
+        role: MessageRole::User,
+        created_at_ms: 1,
+    };
+    let result = context
+        .execute_tool(
+            agent,
+            user_message,
+            ToolCall {
+                id: "search-no-team".into(),
+                name: "search_conversations".into(),
+                args: BTreeMap::from([("query".into(), DataValue::String("lisbon".into()))]),
+            },
+        )
+        .await;
+
+    assert_eq!(result.status, TaskStatus::Error);
+    assert_eq!(
+        result.error.as_deref(),
+        Some("Conversation search is unavailable in this execution context")
+    );
+}
+
 #[test]
 fn registry_resolves_canonical_descriptors() {
     let registry = ToolRegistry::new();
@@ -225,6 +295,7 @@ fn registry_defines_every_registered_tool_schema() {
         ),
         ("get_current_time", &[][..], &[][..]),
         ("calculate", &["expression"][..], &[][..]),
+        ("search_conversations", &["query"][..], &["limit"][..]),
         ("read_file", &["file_path"][..], &["offset", "limit"][..]),
         ("list_dir", &["path"][..], &[][..]),
         ("glob", &["pattern"][..], &["path"][..]),
@@ -312,6 +383,15 @@ fn registry_encodes_parameter_constraints() {
     for property in ["offset", "limit"] {
         assert_property_schema(&registry, "read_file", property, "integer", Some(0.0), None);
     }
+    // Final fix wave S2-L (deferred T14): the schema says what the tool enforces.
+    assert_property_schema(
+        &registry,
+        "search_conversations",
+        "limit",
+        "integer",
+        Some(1.0),
+        Some(10.0),
+    );
     assert_property_schema(
         &registry,
         "memory_add",
@@ -1365,12 +1445,78 @@ fn multi_edit_workspace_file_is_atomic_on_missing_match() {
 #[test]
 fn execute_bash_command_runs_shell_command() {
     let workspace = create_temp_workspace("bash");
-    let result = execute_bash_command_from_root(&workspace, "echo hello", 5_000, ".")
+    let result = execute_bash_command_from_root(&workspace, "echo hello", 5_000, ".", None)
         .expect("bash command result");
 
     assert_eq!(result.status, "success");
     assert!(result.output.to_ascii_lowercase().contains("hello"));
 
+    fs::remove_dir_all(workspace).expect("remove workspace");
+}
+
+#[cfg(unix)]
+#[test]
+fn execute_bash_command_kills_its_child_when_the_run_is_stopped() {
+    let workspace = create_temp_workspace("bash-stop");
+    let signal = anima_core::CancelSignal::new();
+    let canceller = {
+        let signal = signal.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            signal.cancel();
+        })
+    };
+    let started = std::time::Instant::now();
+
+    let result =
+        execute_bash_command_from_root(&workspace, "exec sleep 30", 60_000, ".", Some(&signal))
+            .expect("bash command result");
+
+    canceller.join().unwrap();
+    assert_eq!(result.status, "error");
+    assert_eq!(result.output, "Command stopped by owner");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "the child was killed, not waited for"
+    );
+    fs::remove_dir_all(workspace).expect("remove workspace");
+}
+
+/// Fix round 1 (Task 8 review): a stopped command returns at once even when a
+/// process it started still holds its output open; only the direct child is
+/// killed (audit M11), and the grandchild ends on its own.
+#[cfg(unix)]
+#[test]
+fn execute_bash_command_returns_at_once_when_a_stopped_commands_grandchild_holds_its_output() {
+    let workspace = create_temp_workspace("bash-stop-grandchild");
+    let signal = anima_core::CancelSignal::new();
+    let canceller = {
+        let signal = signal.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            signal.cancel();
+        })
+    };
+    let started = std::time::Instant::now();
+
+    // Not `exec`: the shell forks `sleep`, which keeps the pipes open.
+    let result = execute_bash_command_from_root(
+        &workspace,
+        "sleep 15 && echo done",
+        60_000,
+        ".",
+        Some(&signal),
+    )
+    .expect("bash command result");
+
+    canceller.join().unwrap();
+    assert_eq!(result.status, "error");
+    assert_eq!(result.output, "Command stopped by owner");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "the stop did not wait for the grandchild: {:?}",
+        started.elapsed()
+    );
     fs::remove_dir_all(workspace).expect("remove workspace");
 }
 

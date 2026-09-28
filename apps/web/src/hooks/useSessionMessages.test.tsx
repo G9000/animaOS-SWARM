@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { daemon } from '../lib/daemon-api';
 import {
+  SESSION_MESSAGES_LIVE_POLL_MS,
   SESSION_MESSAGES_POLL_MS,
   mergeNewest,
   useSessionMessages,
@@ -568,5 +569,142 @@ describe('useSessionMessages', () => {
       'm2',
       'm3',
     ]);
+  });
+
+  it('says whether a refresh’s page reached the view', async () => {
+    capturePolls();
+    let answer: (page: SessionMessagePage) => void = () => undefined;
+    const read = vi
+      .spyOn(daemon, 'sessionMessages')
+      .mockResolvedValueOnce({ messages: [], nextBefore: null });
+    const { result, rerender } = renderHook(
+      ({ sessionId }) => useSessionMessages('agent-main', sessionId),
+      { initialProps: { sessionId: 'chat:1' } },
+    );
+    await waitFor(() => expect(read).toHaveBeenCalledTimes(1));
+
+    read.mockResolvedValueOnce({
+      messages: [message('m1', 1)],
+      nextBefore: null,
+    });
+    let applied: boolean | undefined;
+    await act(async () => {
+      applied = await result.current.refresh();
+    });
+    expect(applied).toBe(true);
+
+    read.mockRejectedValueOnce(new Error('offline'));
+    await act(async () => {
+      applied = await result.current.refresh();
+    });
+    expect(applied).toBe(false);
+
+    // A newer read supersedes it.
+    read
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            answer = resolve;
+          }),
+      )
+      .mockResolvedValueOnce({
+        messages: [message('m2', 2)],
+        nextBefore: null,
+      });
+    let first: Promise<boolean> = Promise.resolve(true);
+    act(() => {
+      first = result.current.refresh();
+    });
+    await act(async () => {
+      await result.current.refresh();
+    });
+    answer({ messages: [], nextBefore: null });
+    await act(async () => {
+      applied = await first;
+    });
+    expect(applied).toBe(false);
+
+    // So does a change of session while it reads.
+    read.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          answer = resolve;
+        }),
+    );
+    act(() => {
+      first = result.current.refresh();
+    });
+    read.mockResolvedValue({ messages: [], nextBefore: null });
+    rerender({ sessionId: 'chat:2' });
+    answer({ messages: [message('m3', 3)], nextBefore: null });
+    await act(async () => {
+      applied = await first;
+    });
+    expect(applied).toBe(false);
+    expect(result.current.messages).toEqual([]);
+  });
+
+  it('counts the reads it began and the newest one it applied', async () => {
+    capturePolls();
+    const read = vi
+      .spyOn(daemon, 'sessionMessages')
+      .mockResolvedValueOnce({ messages: [], nextBefore: null });
+    const { result, rerender } = renderHook(
+      ({ sessionId }) => useSessionMessages('agent-main', sessionId),
+      { initialProps: { sessionId: 'chat:1' } },
+    );
+    await waitFor(() => expect(result.current.appliedRead).toBe(1));
+    expect(result.current.readsStarted()).toBe(1);
+
+    read.mockRejectedValueOnce(new Error('offline'));
+    await act(async () => {
+      await result.current.refresh();
+    });
+    expect(result.current.readsStarted()).toBe(2);
+    expect(result.current.appliedRead).toBe(1);
+
+    read.mockResolvedValueOnce({
+      messages: [message('m1', 1)],
+      nextBefore: null,
+    });
+    await act(async () => {
+      await result.current.refresh();
+    });
+    expect(result.current.appliedRead).toBe(3);
+
+    // Another session has applied nothing until its own read lands.
+    read.mockResolvedValueOnce({ messages: [], nextBefore: null });
+    rerender({ sessionId: 'chat:2' });
+    expect(result.current.appliedRead).toBe(0);
+    await waitFor(() => expect(result.current.appliedRead).toBe(4));
+  });
+
+  it('polls at the interval its caller gives', async () => {
+    const armed: number[] = [];
+    vi.spyOn(window, 'setTimeout').mockImplementation(((
+      handler: TimerHandler,
+      timeout?: number,
+    ) => {
+      if (timeout === SESSION_MESSAGES_LIVE_POLL_MS) {
+        armed.push(timeout);
+        return armed.length;
+      }
+      return nativeSetTimeout(handler, timeout);
+    }) as typeof window.setTimeout);
+    vi.spyOn(daemon, 'sessionMessages').mockResolvedValue({
+      messages: [],
+      nextBefore: null,
+    });
+
+    renderHook(() =>
+      useSessionMessages(
+        'agent-main',
+        'chat:1',
+        0,
+        SESSION_MESSAGES_LIVE_POLL_MS,
+      ),
+    );
+
+    await waitFor(() => expect(armed).toEqual([SESSION_MESSAGES_LIVE_POLL_MS]));
   });
 });

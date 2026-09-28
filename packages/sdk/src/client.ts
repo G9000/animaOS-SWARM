@@ -7,6 +7,8 @@ import { ConnectorsClient } from './connectors.js';
 import { MemoriesClient } from './memories.js';
 import { SwarmsClient } from './swarms.js';
 import { SessionsClient } from './sessions.js';
+import { RunsClient } from './runs.js';
+import { AgentEventsClient } from './events.js';
 import type { DaemonCapabilities } from './capabilities.js';
 
 const DEFAULT_BASE_URL = 'http://127.0.0.1:8080';
@@ -71,6 +73,8 @@ export class DaemonClient {
   readonly memories: MemoriesClient;
   readonly swarms: SwarmsClient;
   readonly sessions: SessionsClient;
+  readonly runs: RunsClient;
+  readonly events: AgentEventsClient;
 
   private readonly baseUrl: string;
   private readonly fetchImpl: FetchLike;
@@ -93,6 +97,8 @@ export class DaemonClient {
     this.memories = new MemoriesClient(this);
     this.swarms = new SwarmsClient(this);
     this.sessions = new SessionsClient(this);
+    this.runs = new RunsClient(this);
+    this.events = new AgentEventsClient(this);
   }
 
   async health(): Promise<DaemonHealth> {
@@ -125,7 +131,9 @@ export class DaemonClient {
       body,
     });
 
-    const payload = await readResponseBody(response);
+    const payload = await this.readWithConnectionErrors(path, () =>
+      readResponseBody(response),
+    );
     if (!response.ok) {
       throw new DaemonHttpError(response.status, payload);
     }
@@ -145,10 +153,12 @@ export class DaemonClient {
     if (!response.ok) {
       throw new DaemonHttpError(
         response.status,
-        await readResponseBody(response),
+        await this.readWithConnectionErrors(path, () =>
+          readResponseBody(response),
+        ),
       );
     }
-    return response.text();
+    return this.readWithConnectionErrors(path, () => response.text());
   }
 
   async *subscribe<T = unknown>(
@@ -233,6 +243,23 @@ export class DaemonClient {
   ): Promise<Response> {
     try {
       return await this.fetchImpl(this.url(path), init);
+    } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') {
+        throw error;
+      }
+
+      throw new DaemonConnectionError(this.url(path), error);
+    }
+  }
+
+  /** A body that fails after its headers (the connection dropped midway)
+   *  is a connection error too, not a bare TypeError (T18). */
+  private async readWithConnectionErrors<T>(
+    path: string,
+    read: () => Promise<T>,
+  ): Promise<T> {
+    try {
+      return await read();
     } catch (error) {
       if (error instanceof Error && error.name === 'AbortError') {
         throw error;

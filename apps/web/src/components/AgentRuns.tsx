@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import {
   DaemonHttpError,
   type AgentJob,
+  type AgentJobAttempt,
   type GoalView,
 } from '@animaOS-SWARM/sdk';
 import { daemon } from '../lib/daemon-api';
@@ -14,7 +15,7 @@ type Draft = {
   requiresApproval: boolean;
   goalId: string | null;
 };
-const labels: Record<AgentJob['status'], string> = {
+const labels: Record<AgentJob['status'] | AgentJobAttempt['status'], string> = {
   awaiting_approval: 'Awaiting approval',
   queued: 'Queued',
   running: 'Running',
@@ -22,6 +23,7 @@ const labels: Record<AgentJob['status'], string> = {
   failed: 'Failed',
   needs_review: 'Needs review',
   cancelled: 'Cancelled',
+  stopped: 'Stopped',
 };
 const freshDraft = (): Draft => ({
   title: '',

@@ -1,9 +1,7 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::schedules::{
-    ScheduleOutcomeStatus, ScheduleTarget, ScheduleTrigger, ScheduledPromptRecord,
-};
+use crate::schedules::{ScheduleTarget, ScheduleTrigger, ScheduledPromptRecord};
 
 #[derive(Clone, Debug, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase", tag = "type", deny_unknown_fields)]
@@ -165,12 +163,7 @@ impl From<ScheduledPromptRecord> for ScheduleResponse {
             }
         };
         let last_outcome = value.last_safe_outcome.map(|item| ScheduleOutcomeResponse {
-            status: match item.status {
-                ScheduleOutcomeStatus::Silent => "silent",
-                ScheduleOutcomeStatus::Spoke => "spoke",
-                ScheduleOutcomeStatus::Failed => "error",
-            }
-            .into(),
+            status: item.status.contract_name().into(),
             occurred_at_ms: item.occurred_at_ms,
             error_code: item.error_code,
         });

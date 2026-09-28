@@ -270,6 +270,28 @@ describe('SessionSidebar', () => {
     expect(helperTrigger).toHaveFocus();
   });
 
+  it('closes the row menu and its delete confirmation on a press outside it', async () => {
+    const user = userEvent.setup();
+    const plans = sessionFixture('chat:plans', {
+      title: 'Plans',
+      lastActivityAtMs: NOW.getTime(),
+    });
+    renderSidebar({ sessions: [plans] });
+    const rowTrigger = screen.getByRole('button', {
+      name: 'Actions for Plans',
+    });
+
+    await user.click(rowTrigger);
+    await user.click(screen.getByRole('menuitem', { name: 'Delete' }));
+    expect(screen.getByText(/memories are kept/i)).toBeVisible();
+    fireEvent.pointerDown(document.body);
+    expect(screen.queryByRole('menu')).not.toBeInTheDocument();
+    // Reopened, the menu shows its actions, not the confirmation.
+    await user.click(rowTrigger);
+    expect(screen.getByRole('menuitem', { name: 'Delete' })).toBeVisible();
+    expect(screen.queryByText(/memories are kept/i)).not.toBeInTheDocument();
+  });
+
   // C: sidebar paging.
   it('shows a keyboard-reachable Load more sessions button while more sessions remain', async () => {
     const onLoadMore = vi.fn();
@@ -489,5 +511,31 @@ describe('SessionSidebar', () => {
     await waitFor(() =>
       expect(screen.getByRole('button', { name: 'Old notes' })).toHaveFocus(),
     );
+  });
+
+  it('keeps one row menu open at a time and closes it on a press elsewhere', async () => {
+    const user = userEvent.setup();
+    renderSidebar({
+      sessions: [
+        sessionFixture('chat:a', { title: 'Plan A' }),
+        sessionFixture('chat:b', { title: 'Plan B' }),
+      ],
+    });
+
+    await user.click(
+      screen.getByRole('button', { name: 'Actions for Plan A' }),
+    );
+    expect(screen.getByRole('menu', { name: 'Plan A actions' })).toBeVisible();
+    await user.click(
+      screen.getByRole('button', { name: 'Actions for Plan B' }),
+    );
+    expect(
+      screen.queryByRole('menu', { name: 'Plan A actions' }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole('menu', { name: 'Plan B actions' })).toBeVisible();
+    await user.click(
+      screen.getByRole('searchbox', { name: 'Search sessions' }),
+    );
+    expect(screen.queryByRole('menu')).not.toBeInTheDocument();
   });
 });

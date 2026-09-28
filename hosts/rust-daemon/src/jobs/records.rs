@@ -11,6 +11,9 @@ pub(crate) enum AgentJobStatus {
     Failed,
     NeedsReview,
     Cancelled,
+    /// An attempt the owner stopped (spec §4.6); the job itself goes to
+    /// `NeedsReview`.
+    Stopped,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -40,6 +43,9 @@ pub(crate) struct AgentJobRecord {
     pub(crate) attempts: Vec<AgentJobAttempt>,
     #[serde(default)]
     pub(crate) goal_id: Option<String>,
+    /// Saved before a running attempt is signalled to stop (spec §4.6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) stop_requested_at_ms: Option<u64>,
 }
 
 fn default_max_attempts() -> u32 {
@@ -128,6 +134,7 @@ impl AgentJobRecord {
                     AgentJobStatus::Completed
                         | AgentJobStatus::Failed
                         | AgentJobStatus::NeedsReview
+                        | AgentJobStatus::Stopped
                 )
                 || attempt.started_at_ms < self.created_at_ms
                 || attempt.finished_at_ms < attempt.started_at_ms
@@ -157,7 +164,9 @@ impl AgentJobRecord {
                         | AgentJobStatus::Failed
                         | AgentJobStatus::NeedsReview
                 )
-                && (attempt.status != self.status
+                && ((attempt.status != self.status
+                    && !(attempt.status == AgentJobStatus::Stopped
+                        && self.status == AgentJobStatus::NeedsReview))
                     || Some(attempt.started_at_ms) != self.started_at_ms
                     || Some(attempt.finished_at_ms) != self.finished_at_ms
                     || attempt.result != self.result
@@ -218,6 +227,7 @@ impl AgentJobRecord {
             AgentJobStatus::Cancelled if self.finished_at_ms.is_none() => {
                 Err("Invalid cancelled job".into())
             }
+            AgentJobStatus::Stopped => Err("A job's own status is never stopped".into()),
             _ => Ok(()),
         }
     }

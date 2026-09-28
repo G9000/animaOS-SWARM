@@ -12,12 +12,18 @@ use crate::sessions::views::{MessagePage, PageMessage, SessionPage, SessionView}
 use crate::sessions::SessionCapabilities;
 
 /// Message metadata the session routes expose: spec §3.3's list plus `kind`
-/// (check-in prompts) and `source` (Telegram turns).
-pub(crate) const EXPOSED_MESSAGE_METADATA: [&str; 12] = [
+/// (check-in prompts) and `source` (Telegram turns), and what a historical
+/// tool card or step label shows: a tool result's `toolStatus` and
+/// `toolDurationMs`, and `incomplete` on a model call's unfinished text.
+/// `taskResult` stays hidden: it repeats the whole tool result.
+pub(crate) const EXPOSED_MESSAGE_METADATA: [&str; 15] = [
     "toolCalls",
     "toolCallId",
     "stepId",
     "runId",
+    "toolStatus",
+    "toolDurationMs",
+    "incomplete",
     "stopped",
     "revised",
     "steer",
@@ -74,6 +80,13 @@ pub(crate) struct SessionContextTrimmedResponse {
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct SessionCompactionErrorResponse {
+    pub(crate) message: String,
+    pub(crate) at_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct SessionMatchResponse {
     /// `null` when only the title matched.
     pub(crate) message_id: Option<String>,
@@ -100,6 +113,8 @@ pub(crate) struct SessionResponse {
     pub(crate) parent_agent_id: Option<String>,
     pub(crate) summary: Option<SessionSummaryResponse>,
     pub(crate) context_trimmed: Option<SessionContextTrimmedResponse>,
+    /// The last failed compaction, until one succeeds (spec §5.4).
+    pub(crate) compaction_error: Option<SessionCompactionErrorResponse>,
     pub(crate) message_count: usize,
     pub(crate) preview: Option<String>,
     pub(crate) active_runs: usize,
@@ -142,6 +157,12 @@ impl From<&SessionView> for SessionResponse {
                 SessionContextTrimmedResponse {
                     dropped_through_message_id: trimmed.dropped_through_message_id.clone(),
                     at_ms: trimmed.at_ms,
+                }
+            }),
+            compaction_error: record.compaction_error.as_ref().map(|error| {
+                SessionCompactionErrorResponse {
+                    message: error.message.clone(),
+                    at_ms: error.at_ms,
                 }
             }),
             message_count: view.message_count,
@@ -194,6 +215,10 @@ pub(crate) struct SessionMessageResponse {
     pub(crate) text: String,
     /// Metadata only; attachment contents are not repeated here.
     pub(crate) attachments: Vec<SessionAttachmentResponse>,
+    /// Only `toolCalls`, `toolCallId`, `stepId`, `runId`, `toolStatus`
+    /// (`success` or `error`), `toolDurationMs`, `incomplete`, `stopped`,
+    /// `revised`, `steer`, `skill`, `clientRequestId`, `communication`,
+    /// `kind`, and `source`; other keys are not exposed.
     pub(crate) metadata: BTreeMap<String, Value>,
     pub(crate) created_at_ms: u64,
     /// Present (true) only on silent check-in messages, with `includeHidden=true`.

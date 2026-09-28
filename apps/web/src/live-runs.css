@@ -1,0 +1,253 @@
+/* Live runs, tool steps, helper cards, and outcomes (spec §15.2). */
+.tool-block {
+  display: flex;
+  max-width: 85%;
+  flex-direction: column;
+  gap: 6px;
+  align-self: flex-start;
+}
+.tool-block-label,
+.tool-block-toggle {
+  color: var(--color-ink-3);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-align: left;
+}
+.tool-block-toggle:hover {
+  color: var(--color-ink);
+}
+.tool-block-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.tool-step,
+.helper-card {
+  border: 1px solid var(--color-line);
+  border-radius: 10px;
+  background: rgb(255 255 255 / 0.02);
+}
+.tool-step-toggle {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  color: var(--color-ink-2);
+  font-size: 12px;
+  text-align: left;
+}
+.tool-step-toggle:hover {
+  color: var(--color-ink);
+}
+.tool-step-icon {
+  display: inline-flex;
+  width: 12px;
+  flex-shrink: 0;
+  justify-content: center;
+}
+.tool-step[data-status='success'] .tool-step-icon {
+  color: var(--color-mint);
+}
+.tool-step[data-status='error'] .tool-step-icon {
+  color: var(--color-danger);
+}
+.tool-step-spinner {
+  width: 10px;
+  height: 10px;
+  border: 2px solid var(--color-line-strong);
+  border-top-color: var(--color-ink-2);
+  border-radius: 999px;
+  animation: tool-step-spin 0.8s linear infinite;
+}
+@keyframes tool-step-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .tool-step-spinner {
+    animation: none;
+  }
+}
+.tool-step-name {
+  flex-shrink: 0;
+  color: var(--color-ink);
+  font-family: var(--font-mono);
+}
+.tool-step-args {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tool-step-duration {
+  flex-shrink: 0;
+  color: var(--color-ink-3);
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+.tool-step-result {
+  border-top: 1px solid var(--color-line);
+  padding: 8px 10px;
+  color: var(--color-ink-2);
+  font-size: 12px;
+}
+.tool-step-result pre {
+  max-height: 240px;
+  overflow: auto;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.tool-step-note {
+  margin-top: 6px;
+  color: var(--color-ink-3);
+  font-size: 11px;
+}
+.helper-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+}
+.helper-card-title {
+  color: var(--color-ink);
+  font-size: 12px;
+  font-weight: 600;
+}
+.helper-card-status {
+  color: var(--color-ink-3);
+  font-size: 11px;
+}
+.helper-card[data-status='error'] .helper-card-status {
+  color: var(--color-danger);
+}
+.run-activity,
+.run-queued,
+.pending-message {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.run-queued-meta,
+.pending-message-label {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  color: var(--color-ink-3);
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+.pending-message[data-status='retrying'] .pending-message-label {
+  color: var(--color-amber);
+}
+.run-phase {
+  color: var(--color-ink-3);
+  font-size: 12px;
+}
+.run-outcome {
+  display: flex;
+  max-width: 85%;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  align-self: flex-start;
+  border: 1px solid var(--color-line);
+  border-radius: 12px;
+  padding: 8px 12px;
+  color: var(--color-ink-2);
+  font-size: 12px;
+}
+.run-outcome[data-outcome='failed'] {
+  border-color: rgb(240 140 140 / 0.35);
+}
+.run-outcome-warning {
+  color: var(--color-amber);
+}
+.message-flag {
+  border: 1px solid var(--color-line);
+  border-radius: 999px;
+  padding: 0 6px;
+  color: var(--color-ink-2);
+}
+.revised-draft {
+  color: var(--color-ink-3);
+  font-size: 12px;
+}
+.revised-draft summary {
+  cursor: pointer;
+  margin-bottom: 6px;
+}
+.delegated-turn {
+  border: 1px solid var(--color-line);
+  border-radius: 12px;
+  background: rgb(255 255 255 / 0.02);
+  padding: 10px 14px;
+  color: var(--color-ink);
+  font-size: 13px;
+}
+.delegated-turn-from {
+  margin-bottom: 4px;
+  color: var(--color-ink-3);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.context-trimmed {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  border-top: 1px dashed var(--color-line);
+  padding-top: 8px;
+  color: var(--color-ink-3);
+  font-size: 11px;
+}
+/* Decorative-only: carries the separator role without joining the flex
+ * layout (the dashed border above is the visible divider). */
+.context-trimmed-rule {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+}
+/* Composer command menu (spec §15.3). */
+.slash-menu {
+  margin-bottom: 8px;
+  overflow: hidden;
+  border: 1px solid var(--color-line);
+  border-radius: 12px;
+  background: var(--color-panel);
+  box-shadow: 0 12px 32px rgb(0 0 0 / 0.4);
+}
+.slash-menu-option {
+  display: flex;
+  cursor: pointer;
+  align-items: baseline;
+  gap: 10px;
+  padding: 7px 12px;
+  color: var(--color-ink-2);
+  font-size: 12px;
+}
+.slash-menu-option[aria-selected='true'] {
+  background: rgb(255 255 255 / 0.05);
+  color: var(--color-ink);
+}
+.slash-menu-name {
+  flex-shrink: 0;
+  color: var(--color-ink);
+  font-family: var(--font-mono);
+}
+.slash-menu-description {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

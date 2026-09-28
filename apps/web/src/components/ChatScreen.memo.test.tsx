@@ -78,7 +78,7 @@ function DraftHarness() {
 }
 
 describe('MessageList memoization', () => {
-  it('skips Markdown work for draft updates but rerenders for sending and messages', () => {
+  it('renders a message once while the list around it changes', () => {
     markdownRenderProbe.mockClear();
     render(<DraftHarness />);
 
@@ -90,11 +90,14 @@ describe('MessageList memoization', () => {
 
     expect(markdownRenderProbe).toHaveBeenCalledTimes(1);
 
+    // The list renders again for its thinking indicator; the message not.
     fireEvent.click(screen.getByRole('button', { name: 'Start sending' }));
-    expect(markdownRenderProbe).toHaveBeenCalledTimes(2);
+    expect(screen.getByText('Nova is thinking')).toBeVisible();
+    expect(markdownRenderProbe).toHaveBeenCalledTimes(1);
 
+    // Only the new message renders.
     fireEvent.click(screen.getByRole('button', { name: 'Update messages' }));
-    expect(markdownRenderProbe).toHaveBeenCalledTimes(4);
+    expect(markdownRenderProbe).toHaveBeenCalledTimes(2);
     expect(screen.getByText('Updated response')).toBeVisible();
   });
 });

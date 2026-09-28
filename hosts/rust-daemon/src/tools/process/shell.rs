@@ -5,6 +5,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use anima_core::CancelSignal;
+
 use super::super::workspace::{
     canonical_workspace_root, resolve_workspace_search_root, workspace_root_path,
 };
@@ -16,6 +18,15 @@ const BASH_MAX_OUTPUT_LINES: usize = 500;
 /// runs at the end. Set comfortably above `BASH_MAX_OUTPUT_CHARS` so genuine
 /// long output still survives post-truncation.
 const BASH_MAX_CAPTURE_BYTES: usize = 256 * 1024;
+
+/// A bash command whose run was stopped (spec §4.6).
+pub(in super::super) const BASH_STOPPED: &str = "Command stopped by owner";
+
+/// How the polling loop ended, when it did not return a stop.
+enum Waited {
+    Exited(std::process::ExitStatus),
+    TimedOut,
+}
 
 /// Environment variables that are safe and necessary to pass through to the
 /// shell tool subprocess. Anything not on this list — including LLM provider
@@ -65,9 +76,10 @@ pub(super) fn execute_bash_command(
     command: &str,
     timeout_ms: u64,
     cwd: &str,
+    cancel: Option<&CancelSignal>,
 ) -> Result<BashCommandResult, String> {
     let workspace_root = workspace_root_path("bash", configured_root)?;
-    execute_bash_command_from_root(&workspace_root, command, timeout_ms, cwd)
+    execute_bash_command_from_root(&workspace_root, command, timeout_ms, cwd, cancel)
 }
 
 pub(in super::super) fn execute_bash_command_from_root(
@@ -75,6 +87,7 @@ pub(in super::super) fn execute_bash_command_from_root(
     command: &str,
     timeout_ms: u64,
     cwd: &str,
+    cancel: Option<&CancelSignal>,
 ) -> Result<BashCommandResult, String> {
     let cwd = resolve_workspace_search_root(
         &canonical_workspace_root(workspace_root, "bash")?,
@@ -117,12 +130,29 @@ pub(in super::super) fn execute_bash_command_from_root(
     let stderr_thread = spawn_output_capture(stderr, Arc::clone(&stderr_buffer), true);
 
     let start = Instant::now();
-    let exit_status = loop {
+    let waited = loop {
         if let Some(status) = child
             .try_wait()
             .map_err(|error| format!("bash failed while waiting for command: {error}"))?
         {
-            break Some(status);
+            break Waited::Exited(status);
+        }
+
+        if cancel.is_some_and(|signal| signal.is_cancelled()) {
+            // Kills the direct child only (spec §4.6: "kills its child
+            // process"); a process the command started keeps running, and a
+            // process-group kill is later work (audit M11). The answer comes
+            // at once: the capture threads are left to end on their own when
+            // the last holder of the pipes closes them, so such a process
+            // cannot keep the stopped run waiting (Task 8 fix round 1).
+            child
+                .kill()
+                .map_err(|error| format!("bash failed to stop the command: {error}"))?;
+            let _ = child.wait();
+            return Ok(BashCommandResult {
+                status: "error",
+                output: BASH_STOPPED.to_string(),
+            });
         }
 
         if start.elapsed() >= Duration::from_millis(timeout_ms) {
@@ -130,7 +160,7 @@ pub(in super::super) fn execute_bash_command_from_root(
                 .kill()
                 .map_err(|error| format!("bash failed to stop timed out command: {error}"))?;
             let _ = child.wait();
-            break None;
+            break Waited::TimedOut;
         }
 
         thread::sleep(Duration::from_millis(10));
@@ -148,14 +178,17 @@ pub(in super::super) fn execute_bash_command_from_root(
         .map_err(|_| "bash stderr lock poisoned".to_string())?
         .clone();
 
-    if exit_status.is_none() {
-        return Ok(BashCommandResult {
-            status: "error",
-            output: format!("Command timed out after {timeout_ms}ms"),
-        });
-    }
+    let exit_status = match waited {
+        Waited::Exited(status) => status,
+        Waited::TimedOut => {
+            return Ok(BashCommandResult {
+                status: "error",
+                output: format!("Command timed out after {timeout_ms}ms"),
+            });
+        }
+    };
 
-    let exit_code = exit_status.and_then(|status| status.code()).unwrap_or(-1);
+    let exit_code = exit_status.code().unwrap_or(-1);
     let combined = if stdout_text.trim().is_empty() {
         stderr_text.clone()
     } else if stderr_text.trim().is_empty() {

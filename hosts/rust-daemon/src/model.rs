@@ -6,7 +6,7 @@ mod tests;
 
 use anima_core::{
     AgentConfig, Content, MessageRole, ModelAdapter, ModelGenerateRequest, ModelGenerateResponse,
-    ModelStopReason, TokenUsage, ToolCall,
+    ModelStopReason, ModelStreamFrame, ModelStreamSink, TokenUsage, ToolCall,
 };
 use async_trait::async_trait;
 
@@ -69,6 +69,21 @@ impl ModelAdapter for DeterministicModelAdapter {
 
         let output_text = format!("{} handled task: {}", config.name, input);
         Ok(text_response(output_text, prompt_tokens))
+    }
+
+    /// Streams the reply word by word, so local runs show live text too.
+    async fn stream(
+        &self,
+        config: &AgentConfig,
+        request: &ModelGenerateRequest,
+        sink: &dyn ModelStreamSink,
+    ) -> Result<(), String> {
+        let response = self.generate(config, request).await?;
+        for word in response.content.text.split_inclusive(' ') {
+            sink.emit(ModelStreamFrame::TextDelta(word.to_string()))
+                .await?;
+        }
+        sink.emit(ModelStreamFrame::Final(response)).await
     }
 }
 

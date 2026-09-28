@@ -39,6 +39,12 @@ export interface SessionContextTrimmed {
   atMs: number;
 }
 
+/** The last failed compaction; cleared by the next success (spec §5.4). */
+export interface SessionCompactionError {
+  message: string;
+  atMs: number;
+}
+
 /** Why a search result matched; `messageId` is null for a title match. */
 export interface SessionMatch {
   messageId: string | null;
@@ -64,6 +70,7 @@ export interface Session {
   parentAgentId: string | null;
   summary: SessionSummary | null;
   contextTrimmed: SessionContextTrimmed | null;
+  compactionError: SessionCompactionError | null;
   messageCount: number;
   preview: string | null;
   activeRuns: number;
@@ -267,6 +274,16 @@ export class SessionsClient {
         signal: options.signal,
       },
     );
+  }
+
+  /** Folds every uncovered turn but the newest into the session summary
+   *  (spec §5.4). The summary arrives later with `session.updated`. */
+  async compact(agentId: string, sessionId: string): Promise<Session> {
+    const response = await this.client.requestJson<{ session: Session }>(
+      `${sessionPath(agentId, sessionId)}/compact`,
+      { method: 'POST' },
+    );
+    return response.session;
   }
 }
 

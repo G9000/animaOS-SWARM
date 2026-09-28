@@ -36,7 +36,7 @@
 | M0 Security and groundwork | `2026-09-23-companion-console-m0.md` | done (Nx rust-daemon:test 1,082 passed at 4e3eb7d)                                         |
 | M1 Run coordinator         | `2026-09-23-companion-console-m1.md` | done (Nx rust-daemon:test 1,141 passed at ef5b6fe)                                         |
 | M2 Sessions                | `2026-09-23-companion-console-m2.md` | done (Nx rust-daemon:test 1,287 passed; sdk + web test, typecheck, build green at 5b020c4) |
-| M3 Live runs               | (written before M3)                  | pending                                                                                    |
+| M3 Live runs               | `2026-09-23-companion-console-m3.md` | done (Nx rust-daemon:test 1,564 passed; sdk + web test, typecheck, build green at 6737da3) |
 | M4 Approvals               | (written before M4)                  | pending                                                                                    |
 | M5 Skills                  | (written before M5)                  | pending                                                                                    |
 | M6 Automations             | (written before M6)                  | pending                                                                                    |
@@ -88,6 +88,28 @@ Dependencies: M0 → M1 → M2 → M3 → M4 → M5 → M6 → M7 → M8 → M9 
 - **T3.8 SDK runs and events.** Create `packages/sdk/src/runs.ts`, `packages/sdk/src/events.ts`.
 - **T3.9 Web live rendering.** Create `apps/web/src/hooks/useAgentEvents.ts`, `apps/web/src/lib/session-events.ts`, `apps/web/src/components/sessions/{RunActivity.tsx,ToolStepCard.tsx,HelperCard.tsx}`.
 - **T3.10 Web composer.** Modify `ChatScreen.tsx` composer; create `apps/web/src/components/sessions/SlashCommandMenu.tsx`, `apps/web/src/lib/slash-commands.ts`.
+
+Carried from M3 (decided during M3's reviews):
+
+- M4: the ⌘K additions (spec §15.3) arrive with Review approvals.
+- M8:
+  - Stopped or failed model calls record no token usage, even when a provider already reported prompt tokens.
+  - A run's pending steers don't count toward the 8-per-agent queue cap.
+  - Usage records for compaction and title calls are still missing.
+- M10:
+  - Rewrite the Playwright specs that mock the legacy `/run` route (`apps/web-e2e/src/companion.spec.ts`, `independent-agents.spec.ts`) for the event stream.
+  - File-size chores: move `agent_runs.rs`'s inline tests out, split `connectors/runtime.rs`, and split `ViewHarness` and its test file.
+  - Pre-M3 items:
+    - The provider HTTP client has no request timeout.
+    - The daemon handles only Ctrl+C, not SIGTERM.
+    - Telegram delivery holds the control-plane transaction across the network send.
+    - The session list scan runs under the state read lock.
+  - Shutdown improvements: signal every producer (jobs, scheduler, pollers) to stop before waiting for accepted runs, and don't match `is_shutting_down` on the message text.
+  - A timed-out helper's cancelled tool results say "stopped by owner".
+  - Retention of session records and silent check-in pairs (also M6).
+- Manual acceptance (spec §17):
+  - One real call each to xAI (running usage totals) and to a gpt-6 model (whether it accepts `temperature: 0.2` for compaction and titles).
+  - Anthropic and OpenAI streaming, checked end to end.
 
 ## M4 Approvals (spec §7)
 

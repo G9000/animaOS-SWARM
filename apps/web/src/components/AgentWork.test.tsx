@@ -183,3 +183,20 @@ it('allows drafting but prevents saving while the agent is running', async () =>
   fireEvent.click(screen.getByRole('button', { name: 'Add task' }));
   expect(screen.getByRole('button', { name: 'Save tasks' })).toBeDisabled();
 });
+
+it('says a check-in the owner stopped was stopped by the owner', async () => {
+  vi.spyOn(daemon, 'listSchedules').mockResolvedValue({
+    schedules: [
+      {
+        ...createdSchedule({ type: 'workspace' }),
+        lastFiredAtMs: 3,
+        lastOutcome: { status: 'stopped', occurredAtMs: 3, errorCode: null },
+      },
+    ],
+  });
+  vi.spyOn(daemon, 'listConnectors').mockResolvedValue({ connectors: [] });
+  render(<AgentProactiveView agentId="agent-main" name="Nova" />);
+  expect(
+    await screen.findByText('Last result: Stopped by owner'),
+  ).toBeVisible();
+});

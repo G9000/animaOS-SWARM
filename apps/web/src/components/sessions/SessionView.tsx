@@ -5,11 +5,19 @@ import {
   type ReactNode,
   type RefObject,
 } from 'react';
-import type { Session } from '@animaOS-SWARM/sdk';
+import { isTerminalRunStatus, type Session } from '@animaOS-SWARM/sdk';
 
+import type { LiveRun } from '../../lib/session-events';
 import { SESSION_KIND_LABELS } from '../../lib/session-groups';
+import type { SlashCommand } from '../../lib/slash-commands';
 import type { AgentDetail, ChatMessage } from '../../lib/types';
 import { Composer, MessageList } from '../ChatScreen';
+import {
+  buildHistory,
+  placeRuns,
+  type PendingBubble,
+  type TranscriptActions,
+} from '../../lib/transcript';
 import { ghostBtnCls } from '../ui-bits';
 
 export interface SessionComposerState {
@@ -18,7 +26,7 @@ export interface SessionComposerState {
   sending: boolean;
   disabled: boolean;
   offline: boolean;
-  onSend: () => void;
+  onSend: (text?: string) => void;
   error: string | null;
   onDismissError: () => void;
   recovery?: {
@@ -27,6 +35,11 @@ export interface SessionComposerState {
     restore: () => void;
     dismiss: () => void;
   };
+  commands?: readonly SlashCommand[];
+  /** This session's reply is in progress (spec §15.3). */
+  runActive?: boolean;
+  onStop?: () => void;
+  onSteer?: () => void;
 }
 
 export interface SessionViewProps {
@@ -34,6 +47,15 @@ export interface SessionViewProps {
   /** null for a new chat that has no session yet. */
   session: Session | null;
   messages: ChatMessage[];
+  /** Messages on their way to the daemon (spec §15.5). */
+  pending?: readonly PendingBubble[];
+  /** The session's runs from its stream and ledger (spec §15.2). */
+  runs?: readonly LiveRun[];
+  actions?: TranscriptActions;
+  /** Set for helper sessions: who wrote their user turns. */
+  delegatedBy?: string | null;
+  /** Read politely to screen readers when a reply finishes (spec §15.5). */
+  announcement?: string;
   hasOlder: boolean;
   loadingOlder: boolean;
   onLoadOlder: () => void;
@@ -53,7 +75,7 @@ export interface SessionViewProps {
 
 export type SessionFooter =
   | { kind: 'composer'; label?: string }
-  | { kind: 'note'; text: string; action?: 'new-chat' | 'work' };
+  | { kind: 'note'; text: string; action?: 'work' };
 
 /** What replaces the composer for each kind (spec §3.2, §15.2). */
 export function sessionFooter(
@@ -72,11 +94,7 @@ export function sessionFooter(
             text: 'This Telegram connection is not available. Reconnect it in Connectors to reply.',
           };
     case 'checkin':
-      return {
-        kind: 'note',
-        text: 'Replying to a check-in is not available yet. Start a new chat to follow up.',
-        action: 'new-chat',
-      };
+      return { kind: 'composer', label: 'Reply to this check-in' };
     case 'job':
       return {
         kind: 'note',
@@ -174,11 +192,21 @@ function SessionHeader({
   );
 }
 
-/** One session (or a new chat) on today's blocking run route (spec §15.2). */
+const EMPTY_PENDING: readonly PendingBubble[] = [];
+const EMPTY_RUNS: readonly LiveRun[] = [];
+// One element, so a render of the view keeps the message list's props.
+const NO_MESSAGES = <p className="session-footer-note">No messages yet.</p>;
+
+/** One session (or a new chat): its transcript and composer (spec §15.2). */
 export function SessionView({
   agent,
   session,
   messages,
+  pending = EMPTY_PENDING,
+  runs = EMPTY_RUNS,
+  actions,
+  delegatedBy = null,
+  announcement = '',
   hasOlder,
   loadingOlder,
   onLoadOlder,
@@ -198,6 +226,18 @@ export function SessionView({
     () => ({ ...agent, messages }),
     [agent, messages],
   );
+  const trimmedThrough =
+    session?.contextTrimmed?.droppedThroughMessageId ?? null;
+  // History is built apart from the runs and sends, so a streamed delta
+  // rebuilds only what it changes and history items keep their identity.
+  const history = useMemo(
+    () => buildHistory({ messages, trimmedThrough, delegatedBy }),
+    [messages, trimmedThrough, delegatedBy],
+  );
+  const items = useMemo(
+    () => placeRuns(history, { runs, pending, olderHistory: hasOlder }),
+    [history, runs, pending, hasOlder],
+  );
   if (missing) {
     return (
       <section
@@ -211,6 +251,12 @@ export function SessionView({
       </section>
     );
   }
+  // A run the transcript shows speaks for itself; the thinking indicator
+  // covers active runs it does not know about (no stream).
+  const thinking =
+    composer.sending ||
+    ((session?.activeRuns ?? 0) > 0 &&
+      !runs.some((item) => !isTerminalRunStatus(item.run.status)));
   const footer = sessionFooter(session, telegramAvailable);
   return (
     <section
@@ -226,18 +272,28 @@ export function SessionView({
         />
       ) : null}
       {notice}
+      {/* Mounted empty and filled when an error arrives, so it is
+       *  announced (S3b-E). */}
+      <div role="status">
+        {session?.compactionError ? (
+          <p className="px-4 pt-3 text-xs text-ink-3">
+            Earlier messages could not be summarized:{' '}
+            {session.compactionError.message}
+          </p>
+        ) : null}
+      </div>
       <MessageList
         agent={conversation}
-        sending={composer.sending || (session?.activeRuns ?? 0) > 0}
+        items={items}
+        actions={actions}
+        sending={thinking}
         scrollerRef={scrollerRef}
         onSuggestion={onSuggestion}
         hasOlder={hasOlder}
         loadingOlder={loadingOlder}
         onLoadOlder={onLoadOlder}
         emptyState={
-          session && session.kind !== 'chat' ? (
-            <p className="session-footer-note">No messages yet.</p>
-          ) : undefined
+          session && session.kind !== 'chat' ? NO_MESSAGES : undefined
         }
       />
       {footer.kind === 'composer' ? (
@@ -253,15 +309,14 @@ export function SessionView({
           error={composer.error}
           onDismissError={composer.onDismissError}
           recovery={composer.recovery}
+          commands={composer.commands}
+          runActive={composer.runActive}
+          onStop={composer.onStop}
+          onSteer={composer.onSteer}
         />
       ) : (
         <div className="session-footer-note" role="note">
           <p>{footer.text}</p>
-          {footer.action === 'new-chat' && (
-            <button type="button" className={ghostBtnCls} onClick={onNewChat}>
-              Start a new chat
-            </button>
-          )}
           {footer.action === 'work' && (
             <button type="button" className={ghostBtnCls} onClick={onOpenWork}>
               Open Work
@@ -269,6 +324,9 @@ export function SessionView({
           )}
         </div>
       )}
+      <p className="sr-only" aria-live="polite" aria-atomic="true">
+        {announcement}
+      </p>
     </section>
   );
 }

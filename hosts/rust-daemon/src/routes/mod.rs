@@ -5,6 +5,7 @@ mod capabilities;
 mod chatgpt;
 mod connectors;
 mod contracts;
+mod events;
 mod folder_picker;
 mod gcalendar;
 mod goals;
@@ -15,6 +16,7 @@ mod mail;
 mod memories;
 mod oauth_apps;
 mod profile;
+mod runs;
 mod schedules;
 mod sessions;
 mod swarms;
@@ -44,6 +46,7 @@ use crate::app::{DaemonConfig, SharedDaemonState};
 use crate::connectors::runtime::{ConnectorManager, ConnectorManagerError};
 use crate::schedules::SchedulerService;
 
+pub(crate) use self::contracts::data_value_to_json;
 use self::contracts::{
     AgencyCreateRequest, AgencyCreateResponse, AgencyGenerateRequest, AgencyGenerateResponse,
     AgentConfigRequest, AgentEnvelope, AgentProfileEnvelope, AgentRecentMemoriesQuery,
@@ -61,7 +64,7 @@ use self::contracts::{
     WorkspaceResumeResponse,
 };
 pub(crate) use self::contracts::{
-    AgentRunEnvelope, AgentRuntimeSnapshotResponse, TaskResultResponse,
+    AgentRunEnvelope, AgentRuntimeSnapshotResponse, RunResponse, TaskResultResponse,
 };
 pub(crate) use self::http::configured_bind_is_loopback;
 use self::http::{json_response, make_http_span, read_limited_body, request_query};
@@ -165,6 +168,9 @@ use crate::runtime_model::provider_summaries;
         schedules::import_legacy_schedules,
         sessions::list_sessions, sessions::get_session, sessions::list_session_messages,
         sessions::create_session, sessions::update_session, sessions::delete_session, sessions::export_session,
+        sessions::compact_session,
+        events::agent_events,
+        runs::start_session_run, runs::list_session_runs, runs::get_run, runs::stop_run,
     ),
     components(schemas(self::contracts::AgentSummariesEnvelope)),
     tags(
@@ -178,6 +184,7 @@ use crate::runtime_model::provider_summaries;
         (name = "connector-thread", description = "Dedicated connector-room messages"),
         (name = "schedules", description = "Daemon-backed scheduled prompts"),
         (name = "sessions", description = "Agent sessions and their transcripts"),
+        (name = "runs", description = "Live runs: the agent event stream, session runs, and stop"),
         (name = "workspace", description = "Workspace configuration and onboarding"),
     )
 )]
@@ -292,6 +299,13 @@ impl ApiError {
     pub(crate) fn service_unavailable(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn too_many_requests(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
             message: message.into(),
         }
     }
@@ -485,6 +499,19 @@ fn router_with_services_with_policies(
         .route(
             "/api/agents/{agent_id}/sessions/{session_id}/export",
             get(sessions::export_session),
+        )
+        .route(
+            "/api/agents/{agent_id}/sessions/{session_id}/compact",
+            axum::routing::post(sessions::compact_session),
+        )
+        .route(
+            "/api/agents/{agent_id}/sessions/{session_id}/runs",
+            get(runs::list_session_runs).post(runs::start_session_run),
+        )
+        .route("/api/agents/{agent_id}/runs/{run_id}", get(runs::get_run))
+        .route(
+            "/api/agents/{agent_id}/runs/{run_id}/stop",
+            axum::routing::post(runs::stop_run),
         )
         .route("/api/ready", get(ready_entry))
         .route(
@@ -717,6 +744,7 @@ fn router_with_services_with_policies(
             axum::routing::post(folder_picker::pick_folder),
         )
         .route("/api/swarms/{swarm_id}/events", get(swarm_events_entry))
+        .route("/api/agents/{agent_id}/events", get(events::agent_events))
         // Auth gates everything mounted above this line; the middleware
         // exempts health/readiness/metrics/docs by path. When
         // ANIMAOS_RS_API_KEY is unset the daemon runs in trust-the-network
@@ -732,12 +760,24 @@ fn router_with_services_with_policies(
 
 #[cfg(test)]
 pub(crate) fn router(state: SharedDaemonState, config: DaemonConfig) -> Router {
+    router_with_runs(state, config, |runs| runs)
+}
+
+/// `router` with its run coordinator adjusted by `configure`.
+#[cfg(test)]
+pub(crate) fn router_with_runs(
+    state: SharedDaemonState,
+    config: DaemonConfig,
+    configure: impl FnOnce(AgentRunCoordinator) -> AgentRunCoordinator,
+) -> Router {
     use crate::connectors::credentials::InMemoryCredentialStore;
     use crate::connectors::telegram::TelegramClient;
 
     let run_limiter = Arc::new(Semaphore::new(config.max_concurrent_runs));
-    let agent_runs = AgentRunCoordinator::new(Arc::clone(&state), Arc::clone(&run_limiter))
-        .with_max_runs_per_agent(config.max_runs_per_agent);
+    let agent_runs = configure(
+        AgentRunCoordinator::new(Arc::clone(&state), Arc::clone(&run_limiter))
+            .with_max_runs_per_agent(config.max_runs_per_agent),
+    );
     let connector_manager = ConnectorManager::new(
         Arc::clone(&state),
         agent_runs.clone(),
@@ -1278,7 +1318,7 @@ async fn get_agent_entry(
     tag = "agents",
     params(("agent_id" = String, Path, description = "Agent identifier")),
     responses(
-        (status = 200, description = "Agent deleted", body = DeleteResponse),
+        (status = 200, description = "Agent deleted; its messages still waiting to start are cancelled (agent_deleted)", body = DeleteResponse),
         (status = 403, description = "Local owner authorization required", body = ErrorBody),
         (status = 404, description = "Not found", body = ErrorBody),
         (status = 409, description = "The agent has a run in progress", body = ErrorBody)
@@ -1870,8 +1910,10 @@ async fn handle_memory_search(uri: Uri, state: &SharedDaemonState) -> AxumRespon
 #[cfg(test)]
 mod tests {
     mod capabilities;
+    mod events;
     mod goals;
     mod jobs;
+    mod runs;
     mod sessions;
     mod swarm_reliability;
 

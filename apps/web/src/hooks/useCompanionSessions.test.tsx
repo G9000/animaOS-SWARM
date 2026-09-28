@@ -9,6 +9,7 @@ import {
 import { daemon } from '../lib/daemon-api';
 import { sessionFixture } from '../test/sessions';
 import {
+  SESSION_LIST_LIVE_POLL_MS,
   SESSION_LIST_MAX_PAGES,
   SESSION_LIST_POLL_MS,
   useCompanionSessions,
@@ -470,5 +471,104 @@ describe('useCompanionSessions', () => {
     expect(result.current.sessions).toHaveLength(SESSION_LIST_MAX_PAGES);
     expect(result.current.hasMore).toBe(false);
     expect(result.current.loadingMore).toBe(false);
+  });
+
+  it('walks the current filters even when an older render asks', async () => {
+    const list = vi
+      .spyOn(daemon, 'listSessions')
+      .mockResolvedValue({ sessions: [], nextCursor: null });
+    const { result, rerender } = renderHook(
+      ({ query }) =>
+        useCompanionSessions('agent-main', { archived: false, query }),
+      { initialProps: { query: '' } },
+    );
+    await waitFor(() => expect(list).toHaveBeenCalled());
+    const olderRefresh = result.current.refresh;
+
+    rerender({ query: 'budget' });
+    await waitFor(() =>
+      expect(list).toHaveBeenLastCalledWith(
+        'agent-main',
+        expect.objectContaining({ q: 'budget' }),
+      ),
+    );
+    list.mockClear();
+    await act(async () => {
+      await olderRefresh();
+    });
+    expect(list).toHaveBeenCalledWith(
+      'agent-main',
+      expect.objectContaining({ q: 'budget' }),
+    );
+  });
+
+  it('keeps a local change that a walk begun before it did not see', async () => {
+    const server = pagedDaemon([sessionFixture('chat:1')]);
+    const { result } = renderHook(() =>
+      useCompanionSessions('agent-main', { archived: false, query: '' }),
+    );
+    await waitFor(() =>
+      expect(ids(result.current.sessions)).toEqual(['chat:1']),
+    );
+
+    server.hold();
+    let walk: Promise<void> = Promise.resolve();
+    act(() => {
+      walk = result.current.refresh();
+    });
+    act(() => result.current.upsert(sessionFixture('chat:new')));
+    act(() => result.current.remove(sessionFixture('chat:1')));
+    await server.releaseAll();
+    await act(async () => {
+      await walk;
+    });
+    expect(ids(result.current.sessions)).toEqual(['chat:new']);
+
+    // A walk begun after the changes shows the daemon's listing as it is.
+    server.setOrder([sessionFixture('chat:new'), sessionFixture('chat:1')]);
+    await act(async () => {
+      await result.current.refresh();
+    });
+    expect(ids(result.current.sessions)).toEqual(['chat:new']);
+    await act(async () => {
+      await result.current.loadMore();
+    });
+    expect(ids(result.current.sessions)).toEqual(['chat:new', 'chat:1']);
+  });
+
+  it('polls rarely while the event stream is open', async () => {
+    const armed: number[] = [];
+    vi.spyOn(window, 'setTimeout').mockImplementation(((
+      handler: TimerHandler,
+      timeout?: number,
+    ) => {
+      if (
+        timeout === SESSION_LIST_POLL_MS ||
+        timeout === SESSION_LIST_LIVE_POLL_MS
+      ) {
+        armed.push(timeout);
+        return armed.length;
+      }
+      return nativeSetTimeout(handler, timeout);
+    }) as typeof window.setTimeout);
+    vi.spyOn(daemon, 'listSessions').mockResolvedValue({
+      sessions: [],
+      nextCursor: null,
+    });
+    const { rerender } = renderHook(
+      ({ live }) =>
+        useCompanionSessions(
+          'agent-main',
+          { archived: false, query: '' },
+          { live },
+        ),
+      { initialProps: { live: false } },
+    );
+
+    await waitFor(() => expect(armed).toEqual([SESSION_LIST_POLL_MS]));
+    rerender({ live: true });
+    await waitFor(() =>
+      expect(armed).toEqual([SESSION_LIST_POLL_MS, SESSION_LIST_LIVE_POLL_MS]),
+    );
   });
 });

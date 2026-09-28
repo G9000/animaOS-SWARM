@@ -6,6 +6,7 @@ mod control_plane_store;
 mod events;
 mod history;
 mod jobs;
+mod live;
 mod memory_embeddings;
 mod memory_store;
 mod model;

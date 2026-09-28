@@ -3,6 +3,7 @@ pub mod communication;
 pub use communication::{AgentCommunicationRoute, MAX_AGENT_COMMUNICATION_HOPS};
 pub mod capability;
 pub mod components;
+pub mod context_window;
 pub mod definition;
 pub mod engine;
 pub mod events;
@@ -37,6 +38,11 @@ pub use capability::{
     MAX_DURABLE_RESULT_SIZE_BYTES,
 };
 pub use components::{Evaluator, EvaluatorDecision, EvaluatorResult, Provider, ProviderResult};
+pub use context_window::{
+    calibration_factor, select_context, turn_starts, ContextSelection, ContextSummary,
+    TokenEstimator, CHARS_PER_TOKEN, MAX_CALIBRATION, MAX_CONTEXT_IMAGES, MESSAGE_OVERHEAD_TOKENS,
+    MIN_CALIBRATION,
+};
 pub use definition::{
     AgentDefinition, AgentDefinitionDraft, CapabilityOverride, DefinitionPublisher,
     DefinitionValidationError, HostRequirement, LifecyclePolicy, MemoryPolicy, ModelPolicy,
@@ -108,6 +114,10 @@ pub use primitives::{
     MessageRole, RoomId, TaskResult, TaskStatus, UuidString,
 };
 pub use runtime::{
-    content_retry_key, new_room_id, AgentRuntime, AgentRuntimeSnapshot, RuntimeRunBase,
-    RuntimeRunDelta, RuntimeRunUndo, MAX_RETAINED_EVENTS,
+    content_retry_key, new_room_id, run_step_id, AgentRuntime, AgentRuntimeSnapshot, CancelSignal,
+    CancelWait, RunControl, RunFrame, RunObserver, RuntimeRunBase, RuntimeRunDelta, RuntimeRunUndo,
+    SteeringInbox, CANCELLED_TOOL_RESULT, INCOMPLETE_METADATA_KEY, MAX_RETAINED_EVENTS,
+    MODEL_STREAM_WITHOUT_FINAL, REVISED_METADATA_KEY, RUN_ID_METADATA_KEY, RUN_STOPPED_ERROR,
+    STEER_METADATA_KEY, STEP_ID_METADATA_KEY, STOPPED_METADATA_KEY, TOOL_DURATION_METADATA_KEY,
+    TOOL_STATUS_METADATA_KEY,
 };

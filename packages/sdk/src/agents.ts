@@ -68,7 +68,7 @@ export interface AgentJobReviewInput {
 
 export interface AgentJobAttempt {
   attempt: number;
-  status: 'completed' | 'failed' | 'needs_review';
+  status: 'completed' | 'failed' | 'needs_review' | 'stopped';
   startedAtMs: number;
   finishedAtMs: number;
   result: string | null;
@@ -108,6 +108,8 @@ export interface AgentJob {
   finishedAtMs: number | null;
   result: string | null;
   error: string | null;
+  /** Set when the owner stopped the running attempt (spec §4.6). */
+  stopRequestedAtMs?: number;
 }
 
 export interface AgentJobInput {
@@ -141,7 +143,7 @@ export interface AgentSchedule extends AgentScheduleInput {
   nextDueAtMs: number;
   lastFiredAtMs: number | null;
   lastOutcome: {
-    status: 'silent' | 'spoke' | 'error';
+    status: 'silent' | 'spoke' | 'error' | 'stopped';
     occurredAtMs: number;
     errorCode: string | null;
   } | null;

@@ -18,8 +18,8 @@ use super::{
 use crate::agent_runs::config_helper_parent;
 use crate::app::SharedDaemonState;
 use crate::history::{
-    display_text, search_snippet, search_tokens, searchable_text, text_matches, HistoryMessage,
-    HistoryStore, MessageOrder, MessagePageQuery,
+    display_text, search_snippet, search_tokens, searchable_text, snippet_text, text_matches,
+    HistoryMessage, HistoryStore, MessageOrder, MessagePageQuery,
 };
 use crate::state::DaemonState;
 
@@ -228,7 +228,7 @@ fn candidate(
             .find(|message| text_matches(searchable_text(message), tokens))
             .map(|message| SessionMatch {
                 message_id: Some(message.id.clone()),
-                snippet: search_snippet(display_text(message), tokens),
+                snippet: search_snippet(snippet_text(message), tokens),
             })
     };
     Candidate {
@@ -331,7 +331,7 @@ async fn store_matches(
             .entry((row.agent_id.clone(), row.session_id.clone()))
             .or_insert_with(|| SessionMatch {
                 message_id: Some(row.message.id.clone()),
-                snippet: search_snippet(display_text(&row.message), tokens),
+                snippet: search_snippet(snippet_text(&row.message), tokens),
             });
     }
     matches
@@ -466,6 +466,42 @@ pub(crate) async fn list_sessions(
         sessions: complete(&*store, candidates).await,
         next_cursor,
     })
+}
+
+/// Past sessions of `agent_id` matching `query` for `search_conversations`
+/// (spec §7.1): every kind, archived or not, newest activity first, without
+/// `exclude_session`. `None` when the agent does not exist.
+pub(crate) async fn search_conversations(
+    state: &SharedDaemonState,
+    agent_id: &str,
+    exclude_session: Option<&str>,
+    query: &str,
+    limit: usize,
+) -> Option<Vec<SessionView>> {
+    let mut found = Vec::new();
+    for archived in [false, true] {
+        let page = list_sessions(
+            state,
+            agent_id,
+            &SessionListQuery {
+                kind: None,
+                archived,
+                q: Some(query.to_string()),
+                cursor: None,
+                limit: limit + 1,
+                include_helpers: false,
+            },
+        )
+        .await?;
+        found.extend(
+            page.sessions
+                .into_iter()
+                .filter(|view| Some(view.record.id.as_str()) != exclude_session),
+        );
+    }
+    found.sort_by(|left, right| sort_key(&left.record).cmp(&sort_key(&right.record)));
+    found.truncate(limit);
+    Some(found)
 }
 
 /// One session with its derived fields; `None` when the agent or session is missing.

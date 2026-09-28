@@ -14,14 +14,47 @@ pub(crate) const MAX_TERMINAL_RUNS_PER_AGENT: usize = 50;
 pub(crate) const MAX_RUN_INPUT_TEXT_BYTES: usize = 32 * 1024;
 /// Distinct tool names kept per run (spec §4.1).
 pub(crate) const MAX_RUN_TOOLS_STARTED: usize = 50;
+/// Per-model-call usage kept per run (spec §4.1 `steps`).
+pub(crate) const MAX_RUN_STEPS: usize = 50;
+/// Attachments per message (spec §4.1, §16).
+pub(crate) const MAX_RUN_ATTACHMENTS: usize = 10;
+/// A reused `Idempotency-Key` answers with its original run for 24 hours
+/// (spec §4.2), within the ledger's retention: only while the ledger still
+/// holds the run, so at most 24 hours and, once mirrored, among the agent's
+/// newest `MAX_TERMINAL_RUNS_PER_AGENT` finished runs (audit M1).
+pub(crate) const IDEMPOTENCY_WINDOW_MS: u64 = 24 * 60 * 60 * 1000;
 
 pub(crate) const RESTART_BEFORE_START: &str = "restart_before_start";
+pub(crate) const RESTART_BEFORE_START_MESSAGE: &str =
+    "The daemon restarted before this run started; it is safe to send it again.";
 pub(crate) const RESTART_DURING_RUN: &str = "restart_during_run";
 pub(crate) const RUN_FAILED: &str = "run_failed";
 pub(crate) const RUN_ABORTED: &str = "run_aborted";
 pub(crate) const COMMIT_REJECTED: &str = "commit_rejected";
 pub(crate) const COMMIT_FAILED: &str = "commit_failed";
 pub(crate) const AGENT_DELETED: &str = "agent_deleted";
+pub(crate) const RUN_STOPPED: &str = "stopped";
+pub(crate) const STOPPED_BY_OWNER: &str = "Stopped by owner";
+/// A steer its run never read because the owner stopped the run (controller
+/// ruling, M3 pre-flight audit M8): kept as an `interrupted` run to send again.
+pub(crate) const STOPPED_BEFORE_START: &str = "stopped_before_start";
+pub(crate) const STOPPED_BEFORE_START_MESSAGE: &str =
+    "The run was stopped before this message reached it; it is safe to send it again.";
+/// A steer its run left behind when eight messages were already waiting
+/// (controller ruling, M3 pre-flight audit M9): kept as an `interrupted` run to
+/// send again instead of passing the queue cap.
+pub(crate) const QUEUE_FULL_BEFORE_START: &str = "queue_full_before_start";
+pub(crate) const QUEUE_FULL_BEFORE_START_MESSAGE: &str =
+    "Eight messages were already waiting when the run this message joined ended; it is safe to send it again.";
+/// A steer held by a run that failed (its result refused or unsaved, or its
+/// task crashed) before its transcript was saved (Task 9 fix round 1): kept
+/// as an `interrupted` run to send again.
+pub(crate) const FAILED_BEFORE_START: &str = "failed_before_start";
+pub(crate) const FAILED_BEFORE_START_MESSAGE: &str =
+    "The run this message joined failed before reading it; send it again.";
+/// A deleted agent's queued message (spec §4.4 item 6).
+pub(crate) const AGENT_DELETED_BEFORE_START_MESSAGE: &str =
+    "The companion was deleted before this message ran";
 
 /// Ledger states (spec §4.1). M1 produces `Running`, `Completed`, `Failed`,
 /// and `Interrupted`; the others arrive with async runs and approvals.
@@ -50,10 +83,21 @@ impl RunStatus {
     pub(crate) const fn is_in_flight(self) -> bool {
         matches!(self, Self::Running | Self::AwaitingApproval)
     }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::AwaitingApproval => "awaiting_approval",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Interrupted => "interrupted",
+        }
+    }
 }
 
-/// What started a run (spec §4.1). `Web` arrives with the async runs route.
-#[allow(dead_code)]
+/// What started a run (spec §4.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RunSource {
@@ -64,6 +108,20 @@ pub(crate) enum RunSource {
     Job,
     Delegation,
     Peer,
+}
+
+impl RunSource {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Web => "web",
+            Self::Api => "api",
+            Self::Telegram => "telegram",
+            Self::Schedule => "schedule",
+            Self::Job => "job",
+            Self::Delegation => "delegation",
+            Self::Peer => "peer",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,22 +150,39 @@ impl RunError {
     }
 }
 
-/// A persisted stop request (spec §4.6); set from M3 on.
-#[allow(dead_code)]
+/// A persisted stop request (spec §4.6).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RunStopRequest {
     pub(crate) requested_at_ms: u64,
 }
 
-/// Usage of one model call (spec §4.1 `steps`); recorded from M3's observer.
-#[allow(dead_code)]
+/// Usage of one model call (spec §4.1 `steps`), recorded by the live run observer.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RunStepUsage {
     pub(crate) step_id: String,
     #[serde(default)]
     pub(crate) usage: TokenUsage,
+}
+
+/// A steer saved with the run it joined (spec §4.7; controller ruling, M3
+/// pre-flight audit I3): the owner's message with its key and acceptance time.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RunSteer {
+    pub(crate) idempotency_key: String,
+    pub(crate) text: String,
+    pub(crate) accepted_at_ms: u64,
+}
+
+/// A steer a run's committed transcript took in: its key, which answers a
+/// retry within the idempotency window of its acceptance (spec §4.2).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SteeredKey {
+    pub(crate) idempotency_key: String,
+    pub(crate) accepted_at_ms: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -145,6 +220,18 @@ pub(crate) struct RunRecord {
     pub(crate) provider: Option<String>,
     #[serde(default)]
     pub(crate) parent_run_id: Option<String>,
+    /// The committed final reply of a completed run (spec §4.4 item 3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) reply_message_id: Option<String>,
+    /// Steers accepted into this run that are in no committed transcript or
+    /// run of their own yet, oldest first: each leaves in the save that puts
+    /// it in one, and a restart offers the rest again (audit I3).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) pending_steers: Vec<RunSteer>,
+    /// Keys of the steers this run's committed transcript took in, so a
+    /// retried one is answered with this run (spec §4.2).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) steered_keys: Vec<SteeredKey>,
     /// Set once the history store holds this terminal record (spec §4.1).
     #[serde(default)]
     pub(crate) mirrored: bool,
@@ -191,8 +278,28 @@ impl RunRecord {
             model: start.model,
             provider: start.provider,
             parent_run_id: start.parent_run_id,
+            reply_message_id: None,
+            pending_steers: Vec::new(),
+            steered_keys: Vec::new(),
             mirrored: false,
         }
+    }
+
+    /// A run accepted now that starts later (spec §4.2).
+    pub(crate) fn queued(start: RunStart, now_ms: u64) -> Self {
+        let mut record = Self::running(start, now_ms);
+        record.status = RunStatus::Queued;
+        record.started_at_ms = None;
+        record
+    }
+
+    /// A queued run starts executing now, with the model it runs on.
+    pub(crate) fn start(&mut self, model: String, provider: Option<String>, now_ms: u64) {
+        self.status = RunStatus::Running;
+        self.started_at_ms = Some(now_ms.max(self.created_at_ms));
+        self.model = model;
+        self.provider = provider;
+        self.mirrored = false;
     }
 
     /// Records a terminal status; a later call (for example a rolled-back
@@ -215,12 +322,92 @@ impl RunRecord {
         }
     }
 
+    /// The steers `taken` were committed with this run's transcript: they
+    /// leave its pending steers, and their keys stay to answer a retry.
+    pub(crate) fn commit_steers(&mut self, taken: &[RunSteer]) {
+        if taken.is_empty() {
+            return;
+        }
+        self.pending_steers.retain(|pending| {
+            !taken
+                .iter()
+                .any(|steer| steer.idempotency_key == pending.idempotency_key)
+        });
+        for steer in taken {
+            if !self
+                .steered_keys
+                .iter()
+                .any(|steered| steered.idempotency_key == steer.idempotency_key)
+            {
+                self.steered_keys.push(SteeredKey {
+                    idempotency_key: steer.idempotency_key.clone(),
+                    accepted_at_ms: steer.accepted_at_ms,
+                });
+            }
+        }
+    }
+
+    /// Undoes `commit_steers` for a transcript that did not stand: the
+    /// steers are pending again, so nothing the owner sent is lost.
+    pub(crate) fn revert_steers(&mut self, taken: &[RunSteer]) {
+        if taken.is_empty() {
+            return;
+        }
+        self.steered_keys.retain(|steered| {
+            !taken
+                .iter()
+                .any(|steer| steer.idempotency_key == steered.idempotency_key)
+        });
+        for steer in taken {
+            if !self
+                .pending_steers
+                .iter()
+                .any(|pending| pending.idempotency_key == steer.idempotency_key)
+            {
+                self.pending_steers.push(steer.clone());
+            }
+        }
+        self.pending_steers
+            .sort_by_key(|pending| pending.accepted_at_ms);
+    }
+
+    /// Finished, and holding no steer a restart still has to hand on.
+    fn is_prunable(&self) -> bool {
+        self.status.is_terminal() && self.pending_steers.is_empty()
+    }
+
+    /// A run of this record's session for each steer it still holds, never
+    /// started: the owner can send it again (audit I3).
+    fn steers_to_send_again(&mut self) -> Vec<Self> {
+        if self.pending_steers.is_empty() {
+            return Vec::new();
+        }
+        // The history store's copy, if any, is written again without them.
+        self.mirrored = false;
+        std::mem::take(&mut self.pending_steers)
+            .into_iter()
+            .map(|steer| {
+                Self::queued(
+                    RunStart {
+                        agent_id: self.agent_id.clone(),
+                        session_id: self.session_id.clone(),
+                        source: RunSource::Web,
+                        source_ref: None,
+                        idempotency_key: Some(steer.idempotency_key),
+                        text: steer.text,
+                        model: self.model.clone(),
+                        provider: self.provider.clone(),
+                        parent_run_id: None,
+                    },
+                    steer.accepted_at_ms,
+                )
+            })
+            .collect()
+    }
+
     fn recover_after_restart(&mut self, now_ms: u64) {
         let (code, message) = match self.status {
-            RunStatus::Queued => (
-                RESTART_BEFORE_START,
-                "The daemon restarted before this run started; it is safe to send it again.",
-            ),
+            RunStatus::Queued => (RESTART_BEFORE_START, RESTART_BEFORE_START_MESSAGE),
             RunStatus::Running | RunStatus::AwaitingApproval => (
                 RESTART_DURING_RUN,
                 "The daemon restarted while this run was in progress; tools it started may have had effects.",
@@ -275,6 +462,51 @@ impl RunLedger {
             .count()
     }
 
+    /// Runs of this agent accepted but not started (spec §4.2's queue).
+    pub(crate) fn queued_count(&self, agent_id: &str) -> usize {
+        self.records
+            .values()
+            .filter(|record| record.agent_id == agent_id && record.status == RunStatus::Queued)
+            .count()
+    }
+
+    /// The newest run of this agent created with `key` at or after `since_ms`.
+    pub(crate) fn find_by_idempotency_key(
+        &self,
+        agent_id: &str,
+        key: &str,
+        since_ms: u64,
+    ) -> Option<&RunRecord> {
+        self.records
+            .values()
+            .filter(|record| {
+                record.agent_id == agent_id
+                    && record.created_at_ms >= since_ms
+                    && record.idempotency_key.as_deref() == Some(key)
+            })
+            .max_by(|left, right| {
+                left.created_at_ms
+                    .cmp(&right.created_at_ms)
+                    .then_with(|| left.id.cmp(&right.id))
+            })
+    }
+
+    /// This session's runs, newest first.
+    pub(crate) fn for_session(&self, agent_id: &str, session_id: &str) -> Vec<&RunRecord> {
+        let mut records = self
+            .records
+            .values()
+            .filter(|record| record.agent_id == agent_id && record.session_id == session_id)
+            .collect::<Vec<_>>();
+        records.sort_by(|left, right| {
+            right
+                .created_at_ms
+                .cmp(&left.created_at_ms)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        records
+    }
+
     /// Runs of this session that are queued, running, or awaiting approval.
     pub(crate) fn active_count_for_session(&self, agent_id: &str, session_id: &str) -> usize {
         self.records
@@ -285,6 +517,14 @@ impl RunLedger {
                     && !record.status.is_terminal()
             })
             .count()
+    }
+
+    /// Every run that is queued, running, or awaiting approval.
+    pub(crate) fn active_records(&self) -> Vec<&RunRecord> {
+        self.records
+            .values()
+            .filter(|record| !record.status.is_terminal())
+            .collect()
     }
 
     /// `(agentId, sessionId)` of every run that is queued, running, or awaiting approval.
@@ -335,6 +575,98 @@ impl RunLedger {
             .collect()
     }
 
+    /// Cancels a deleted agent's queued runs (spec §4.4 item 6) and returns
+    /// each as it was and as it is now.
+    pub(crate) fn cancel_queued_for_agent(
+        &mut self,
+        agent_id: &str,
+        now_ms: u64,
+    ) -> Vec<(RunRecord, RunRecord)> {
+        self.records
+            .values_mut()
+            .filter(|record| record.agent_id == agent_id && record.status == RunStatus::Queued)
+            .map(|record| {
+                let queued = record.clone();
+                record.finish(
+                    RunStatus::Cancelled,
+                    Some(RunError::new(
+                        AGENT_DELETED,
+                        AGENT_DELETED_BEFORE_START_MESSAGE,
+                    )),
+                    now_ms,
+                );
+                (queued, record.clone())
+            })
+            .collect()
+    }
+
+    /// The run of this agent a steer sent with `key` at or after `since_ms`
+    /// joined, and the steer while that run still holds it (spec §4.2,
+    /// §4.7). Only the ledger's records are read, never a transcript (audit
+    /// M28).
+    pub(crate) fn find_steer(
+        &self,
+        agent_id: &str,
+        key: &str,
+        since_ms: u64,
+    ) -> Option<(&RunRecord, Option<&RunSteer>)> {
+        self.records
+            .values()
+            .filter(|record| record.agent_id == agent_id)
+            .find_map(|record| {
+                if let Some(steer) = record
+                    .pending_steers
+                    .iter()
+                    .find(|steer| steer.idempotency_key == key && steer.accepted_at_ms >= since_ms)
+                {
+                    return Some((record, Some(steer)));
+                }
+                record
+                    .steered_keys
+                    .iter()
+                    .any(|steered| {
+                        steered.idempotency_key == key && steered.accepted_at_ms >= since_ms
+                    })
+                    .then_some((record, None))
+            })
+    }
+
+    /// Makes each steer a failed run still holds an `interrupted` run of its
+    /// own to send again (`failed_before_start`) and returns them as
+    /// inserted; a run in any other state keeps its steers.
+    pub(crate) fn offer_steers_of_failed_run(
+        &mut self,
+        run_id: &str,
+        now_ms: u64,
+    ) -> Vec<RunRecord> {
+        let Some(record) = self
+            .records
+            .get_mut(run_id)
+            .filter(|record| record.status == RunStatus::Failed)
+        else {
+            return Vec::new();
+        };
+        let offered = record
+            .steers_to_send_again()
+            .into_iter()
+            .map(|mut steer| {
+                steer.finish(
+                    RunStatus::Interrupted,
+                    Some(RunError::new(
+                        FAILED_BEFORE_START,
+                        FAILED_BEFORE_START_MESSAGE,
+                    )),
+                    now_ms,
+                );
+                steer
+            })
+            .collect::<Vec<_>>();
+        for record in &offered {
+            self.insert(record.clone());
+        }
+        offered
+    }
+
     pub(crate) fn has_in_flight_idempotency_key(&self, agent_id: &str, key: &str) -> bool {
         self.records.values().any(|record| {
             record.agent_id == agent_id
@@ -343,8 +675,9 @@ impl RunLedger {
         })
     }
 
-    /// This agent's runs, oldest first. Read by M3's runs routes; tests use it now.
-    #[allow(dead_code)]
+    /// This agent's runs, oldest first, for tests; the runs routes read a
+    /// session's runs with `for_session`.
+    #[cfg(test)]
     pub(crate) fn for_agent(&self, agent_id: &str) -> Vec<&RunRecord> {
         let mut records = self
             .records
@@ -366,11 +699,7 @@ impl RunLedger {
         let cutoff = now_ms.saturating_sub(TERMINAL_RUN_RETENTION_MS);
         let expired: Vec<String> = {
             let mut terminal: HashMap<&str, Vec<(u64, &str, bool)>> = HashMap::new();
-            for record in self
-                .records
-                .values()
-                .filter(|record| record.status.is_terminal())
-            {
+            for record in self.records.values().filter(|record| record.is_prunable()) {
                 terminal.entry(record.agent_id.as_str()).or_default().push((
                     record.finished_at_ms.unwrap_or(record.created_at_ms),
                     record.id.as_str(),
@@ -476,7 +805,9 @@ impl RunLedger {
     }
 
     /// The ledger after a restart: runs of missing agents are dropped, queued
-    /// and in-flight runs become interrupted (spec §4.8), and retention applies.
+    /// and in-flight runs become interrupted (spec §4.8), each steer a run
+    /// still held becomes an interrupted run of its own (audit I3), and
+    /// retention applies.
     pub(crate) fn restored(
         records: Vec<RunRecord>,
         live_agents: &HashSet<String>,
@@ -486,6 +817,10 @@ impl RunLedger {
         for mut record in records {
             if !live_agents.contains(&record.agent_id) {
                 continue;
+            }
+            for mut steer in record.steers_to_send_again() {
+                steer.recover_after_restart(now_ms);
+                ledger.insert(steer);
             }
             record.recover_after_restart(now_ms);
             ledger.insert(record);
@@ -542,6 +877,7 @@ mod tests {
             (RunStatus::Interrupted, "interrupted"),
         ] {
             assert_eq!(serde_json::to_value(status).unwrap(), json!(name));
+            assert_eq!(status.as_str(), name);
             assert_eq!(
                 status.is_terminal(),
                 matches!(name, "completed" | "failed" | "cancelled" | "interrupted"),
@@ -563,6 +899,7 @@ mod tests {
             (RunSource::Peer, "peer"),
         ] {
             assert_eq!(serde_json::to_value(source).unwrap(), json!(name));
+            assert_eq!(source.as_str(), name);
         }
     }
 
@@ -587,6 +924,43 @@ mod tests {
         assert_eq!(value["startedAtMs"], 42);
         assert_eq!(value["toolsStarted"], json!([]));
         assert_eq!(value["mirrored"], false);
+        assert!(
+            value.get("replyMessageId").is_none(),
+            "an unset reply is not written, so saved records keep their shape"
+        );
+        assert!(value.get("pendingSteers").is_none());
+        assert!(value.get("steeredKeys").is_none());
+        let mut steered = record.clone();
+        steered.pending_steers = vec![RunSteer {
+            idempotency_key: "key-2".into(),
+            text: "and this".into(),
+            accepted_at_ms: 43,
+        }];
+        steered.steered_keys = vec![SteeredKey {
+            idempotency_key: "key-3".into(),
+            accepted_at_ms: 44,
+        }];
+        let written = serde_json::to_value(&steered).unwrap();
+        assert_eq!(
+            written["pendingSteers"],
+            json!([{"idempotencyKey": "key-2", "text": "and this", "acceptedAtMs": 43}])
+        );
+        assert_eq!(
+            written["steeredKeys"],
+            json!([{"idempotencyKey": "key-3", "acceptedAtMs": 44}])
+        );
+        assert_eq!(
+            serde_json::from_value::<RunRecord>(written).unwrap(),
+            steered
+        );
+        let mut replied = record.clone();
+        replied.reply_message_id = Some("msg-1".into());
+        let written = serde_json::to_value(&replied).unwrap();
+        assert_eq!(written["replyMessageId"], "msg-1");
+        assert_eq!(
+            serde_json::from_value::<RunRecord>(written).unwrap(),
+            replied
+        );
 
         let minimal: RunRecord = serde_json::from_value(json!({
             "id": "run_legacy",
@@ -603,6 +977,9 @@ mod tests {
         assert_eq!(minimal.usage, TokenUsage::default());
         assert_eq!(minimal.input, RunInput::default());
         assert_eq!(minimal.parent_run_id, None);
+        assert_eq!(minimal.reply_message_id, None);
+        assert!(minimal.pending_steers.is_empty());
+        assert!(minimal.steered_keys.is_empty());
     }
 
     #[test]
@@ -688,6 +1065,125 @@ mod tests {
             "runs of missing agents are dropped"
         );
         assert_eq!(ledger.in_flight_count("agent-a"), 0);
+    }
+
+    /// Controller ruling (M3 pre-flight audit I3): each steer a run still
+    /// held when the daemon stopped becomes one `interrupted` run of the
+    /// run's session to send again, at its acceptance time; the run keeps
+    /// none of them.
+    #[test]
+    fn restart_recovery_offers_the_steers_a_run_still_held_once() {
+        let now = 5 * TERMINAL_RUN_RETENTION_MS;
+        let steer = |key: &str, at: u64| RunSteer {
+            idempotency_key: key.into(),
+            text: format!("text of {key}"),
+            accepted_at_ms: at,
+        };
+        let mut running = record("agent-a", now - 10);
+        running.session_id = "chat:s".into();
+        running.pending_steers = vec![steer("key-2", now - 9), steer("key-3", now - 8)];
+        // A run whose result could not be saved keeps the steers it took in.
+        let mut failed = mirrored("agent-a", now - 7);
+        failed.status = RunStatus::Failed;
+        failed.pending_steers = vec![steer("key-4", now - 6)];
+        let live = HashSet::from(["agent-a".to_string()]);
+
+        let ledger = RunLedger::restored(vec![running.clone(), failed.clone()], &live, now);
+
+        for (key, at, session) in [
+            ("key-2", now - 9, "chat:s"),
+            ("key-3", now - 8, "chat:s"),
+            ("key-4", now - 6, "direct:test"),
+        ] {
+            let offered = ledger
+                .find_by_idempotency_key("agent-a", key, 0)
+                .unwrap_or_else(|| panic!("{key} is offered again"));
+            assert_eq!(offered.status, RunStatus::Interrupted);
+            assert_eq!(offered.error.as_ref().unwrap().code, RESTART_BEFORE_START);
+            assert_eq!(
+                offered.error.as_ref().unwrap().message,
+                RESTART_BEFORE_START_MESSAGE
+            );
+            assert_eq!(offered.source, RunSource::Web);
+            assert_eq!(offered.session_id, session);
+            assert_eq!(offered.input.text, format!("text of {key}"));
+            assert_eq!(offered.created_at_ms, at);
+            assert_eq!(offered.started_at_ms, None);
+            assert!(!offered.mirrored);
+        }
+        assert!(ledger.get(&running.id).unwrap().pending_steers.is_empty());
+        let failed = ledger.get(&failed.id).unwrap();
+        assert!(failed.pending_steers.is_empty());
+        assert!(!failed.mirrored, "the history store gets the change");
+        assert_eq!(ledger.for_agent("agent-a").len(), 5);
+    }
+
+    /// Fix round 1 (Task 9 review 7a): a steer's key answers for the same
+    /// 24 hours as a run's, counted from when the steer was accepted.
+    #[test]
+    fn steer_keys_are_found_per_agent_within_the_idempotency_window() {
+        let now = 10 * IDEMPOTENCY_WINDOW_MS;
+        let since = now - IDEMPOTENCY_WINDOW_MS;
+        let mut ledger = RunLedger::default();
+        let mut run = record("agent-a", since - 100);
+        run.pending_steers = vec![
+            RunSteer {
+                idempotency_key: "old-pending".into(),
+                text: "old".into(),
+                accepted_at_ms: since - 1,
+            },
+            RunSteer {
+                idempotency_key: "pending".into(),
+                text: "new".into(),
+                accepted_at_ms: since,
+            },
+        ];
+        run.steered_keys = vec![
+            SteeredKey {
+                idempotency_key: "old-steered".into(),
+                accepted_at_ms: since - 1,
+            },
+            SteeredKey {
+                idempotency_key: "steered".into(),
+                accepted_at_ms: now,
+            },
+        ];
+        ledger.insert(run.clone());
+
+        let (found, pending) = ledger.find_steer("agent-a", "pending", since).unwrap();
+        assert_eq!(found.id, run.id);
+        assert_eq!(pending.unwrap().text, "new");
+        let (found, pending) = ledger.find_steer("agent-a", "steered", since).unwrap();
+        assert_eq!(found.id, run.id);
+        assert!(pending.is_none());
+        for expired in ["old-pending", "old-steered"] {
+            assert!(
+                ledger.find_steer("agent-a", expired, since).is_none(),
+                "{expired}"
+            );
+            assert!(
+                ledger.find_steer("agent-a", expired, 0).is_some(),
+                "{expired}"
+            );
+        }
+        assert!(ledger.find_steer("agent-b", "pending", 0).is_none());
+    }
+
+    #[test]
+    fn a_finished_run_still_holding_steers_is_not_pruned() {
+        let now = 10 * TERMINAL_RUN_RETENTION_MS;
+        let mut ledger = RunLedger::default();
+        let mut holding = mirrored("agent-a", now - 2 * TERMINAL_RUN_RETENTION_MS);
+        holding.pending_steers = vec![RunSteer {
+            idempotency_key: "key-2".into(),
+            text: "and this".into(),
+            accepted_at_ms: 1,
+        }];
+        ledger.insert(holding.clone());
+
+        ledger.prune(now);
+
+        assert!(ledger.get(&holding.id).is_some());
     }
 
     #[test]
@@ -976,5 +1472,119 @@ mod tests {
             .for_agent("agent-a")
             .iter()
             .all(|run| run.id == running_id));
+    }
+
+    #[test]
+    fn queued_runs_wait_until_started_and_count_toward_the_queue() {
+        let mut ledger = RunLedger::default();
+        let queued = RunRecord::queued(start("agent-1"), 10);
+        assert_eq!(queued.status, RunStatus::Queued);
+        assert_eq!(queued.started_at_ms, None);
+        ledger.insert(queued.clone());
+        ledger.insert(record("agent-1", 11));
+        ledger.insert(RunRecord::queued(start("agent-2"), 12));
+        assert_eq!(ledger.queued_count("agent-1"), 1);
+        assert_eq!(
+            ledger.in_flight_count("agent-1"),
+            1,
+            "a queued run is not in flight"
+        );
+
+        let run = ledger.get_mut(&queued.id).unwrap();
+        run.start("gpt-5.5".into(), Some("openai".into()), 20);
+        assert_eq!(run.status, RunStatus::Running);
+        assert_eq!(run.started_at_ms, Some(20));
+        assert_eq!(run.model, "gpt-5.5");
+        assert_eq!(ledger.queued_count("agent-1"), 0);
+    }
+
+    #[test]
+    fn idempotency_keys_are_found_per_agent_within_the_window() {
+        let mut ledger = RunLedger::default();
+        let mut keyed = start("agent-1");
+        keyed.idempotency_key = Some("key-1".into());
+        let old = RunRecord::queued(keyed.clone(), 100);
+        let newer = RunRecord::queued(keyed, 200);
+        ledger.insert(old.clone());
+        ledger.insert(newer.clone());
+
+        assert_eq!(
+            ledger
+                .find_by_idempotency_key("agent-1", "key-1", 0)
+                .map(|record| record.id.as_str()),
+            Some(newer.id.as_str())
+        );
+        assert_eq!(
+            ledger.find_by_idempotency_key("agent-1", "key-1", 201),
+            None,
+            "outside the window"
+        );
+        assert_eq!(ledger.find_by_idempotency_key("agent-2", "key-1", 0), None);
+        assert_eq!(ledger.find_by_idempotency_key("agent-1", "key-2", 0), None);
+        let ids: Vec<&str> = ledger
+            .for_session("agent-1", "direct:test")
+            .iter()
+            .map(|record| record.id.as_str())
+            .collect();
+        assert_eq!(ids, [newer.id.as_str(), old.id.as_str()], "newest first");
+    }
+
+    /// A deleted agent's queued runs are cancelled, each returned as it was
+    /// and as it is now; its running runs and other agents' runs are not
+    /// touched (spec §4.4 item 6; M3 Task 7 review Minor 3).
+    #[test]
+    fn a_deleted_agents_queued_runs_are_cancelled_and_returned_before_and_after() {
+        let mut ledger = RunLedger::default();
+        let queued = RunRecord::queued(start("agent-a"), 10);
+        let running = record("agent-a", 11);
+        let other = RunRecord::queued(start("agent-b"), 12);
+        for record in [&queued, &running, &other] {
+            ledger.insert(record.clone());
+        }
+
+        let cancelled = ledger.cancel_queued_for_agent("agent-a", 20);
+
+        assert_eq!(cancelled.len(), 1);
+        let (before, after) = &cancelled[0];
+        assert_eq!(before, &queued);
+        assert_eq!(after.id, queued.id);
+        assert_eq!(after.status, RunStatus::Cancelled);
+        assert_eq!(after.finished_at_ms, Some(20));
+        assert_eq!(after.started_at_ms, None);
+        assert_eq!(
+            after.error,
+            Some(RunError::new(
+                AGENT_DELETED,
+                "The companion was deleted before this message ran"
+            ))
+        );
+        assert_eq!(ledger.get(&queued.id), Some(after));
+        assert_eq!(ledger.get(&running.id), Some(&running));
+        assert_eq!(ledger.get(&other.id), Some(&other));
+        assert!(ledger.cancel_queued_for_agent("agent-a", 30).is_empty());
+    }
+
+    /// Carry-forward (M2 T17 Minor 9): a message still waiting to start keeps
+    /// its session active, so the web never declares the send unconfirmed.
+    #[test]
+    fn a_queued_run_alone_keeps_its_session_active() {
+        let mut ledger = RunLedger::default();
+        let queued = RunRecord::queued(start("agent-1"), 10);
+        ledger.insert(queued);
+
+        assert_eq!(
+            ledger.active_sessions(),
+            HashSet::from([("agent-1".to_string(), "direct:test".to_string())])
+        );
+        assert_eq!(ledger.active_count_for_session("agent-1", "direct:test"), 1);
+        assert_eq!(ledger.active_records().len(), 1);
+    }
+
+    #[test]
+    fn the_accepted_run_limits_match_the_spec() {
+        assert_eq!(MAX_RUN_ATTACHMENTS, 10);
+        assert_eq!(IDEMPOTENCY_WINDOW_MS, 24 * 60 * 60 * 1000);
+        assert_eq!(RUN_STOPPED, "stopped");
+        assert_eq!(STOPPED_BY_OWNER, "Stopped by owner");
     }
 }

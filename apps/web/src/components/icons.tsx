@@ -23,6 +23,8 @@ function base({ size = 16, ...props }: IconProps, path: React.ReactNode) {
 
 export const SendIcon = (p: IconProps) =>
   base(p, <path d="M12 19V5M5 12l7-7 7 7" />);
+export const StopIcon = (p: IconProps) =>
+  base(p, <rect x="7" y="7" width="10" height="10" rx="1.5" />);
 export const GearIcon = (p: IconProps) =>
   base(
     p,

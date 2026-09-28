@@ -530,7 +530,7 @@ describe('daemon workspace requests', () => {
 });
 
 describe('daemon integration requests', () => {
-  it('uses connector routes and requires a caller supplied idempotency key for sends', async () => {
+  it('reads a connector’s messages with its page query', async () => {
     const fetchMock = vi.fn<typeof fetch>().mockImplementation(
       async () =>
         new Response(JSON.stringify({ messages: [], nextBefore: null }), {
@@ -544,29 +544,11 @@ describe('daemon integration requests', () => {
       before: 'message 1',
       limit: 25,
     });
-    await daemon.sendConnectorMessage(
-      'agent 1',
-      'connector/1',
-      'hello',
-      'telegram-send-1',
-    );
 
-    expect(fetchMock).toHaveBeenNthCalledWith(
-      1,
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledWith(
       '/api/agents/agent%201/connectors/connector%2F1/messages?before=message+1&limit=25',
       expect.any(Object),
-    );
-    expect(fetchMock).toHaveBeenNthCalledWith(
-      2,
-      '/api/agents/agent%201/connectors/connector%2F1/messages',
-      expect.objectContaining({
-        method: 'POST',
-        headers: expect.objectContaining({
-          'content-type': 'application/json',
-          'Idempotency-Key': 'telegram-send-1',
-        }),
-        body: JSON.stringify({ text: 'hello' }),
-      }),
     );
   });
 

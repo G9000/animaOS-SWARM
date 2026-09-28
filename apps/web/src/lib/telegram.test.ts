@@ -1,10 +1,6 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 
-import {
-  connectorStatusLabel,
-  createTelegramIdempotencyKey,
-  safeIntegrationError,
-} from './telegram';
+import { connectorStatusLabel, safeIntegrationError } from './telegram';
 
 describe('telegram helpers', () => {
   it('maps daemon statuses to safe user labels', () => {
@@ -17,12 +13,5 @@ describe('telegram helpers', () => {
     expect(
       safeIntegrationError(new Error('Telegram rejected 123456:supersecret')),
     ).toBe('Telegram request failed. Check the connector and try again.');
-  });
-
-  it('creates bounded visible idempotency keys', () => {
-    vi.stubGlobal('crypto', { randomUUID: () => 'fixed-uuid' });
-    const key = createTelegramIdempotencyKey();
-    expect(key).toBe('telegram-fixed-uuid');
-    expect(key.length).toBeLessThanOrEqual(128);
   });
 });

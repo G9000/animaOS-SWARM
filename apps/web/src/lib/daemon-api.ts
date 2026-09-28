@@ -22,6 +22,7 @@ import {
   type SessionMessage,
   type SessionMessageOptions,
   type SessionUpdateInput,
+  type StartRunInput,
 } from '@animaOS-SWARM/sdk';
 
 const setupClient = createDaemonClient({
@@ -90,13 +91,6 @@ export interface DaemonSnapshot {
   eventCount: number;
 }
 
-export interface DaemonRunResult {
-  status: 'success' | 'error';
-  durationMs: number;
-  error?: string | null;
-  data?: { text: string } | null;
-}
-
 export interface AgentUpdateInput {
   name?: string;
   model?: string;
@@ -150,7 +144,7 @@ export type ScheduleTarget =
   | { type: 'workspace' }
   | { type: 'connector'; connectorId: string };
 export interface ScheduleOutcome {
-  status: 'silent' | 'spoke' | 'error';
+  status: 'silent' | 'spoke' | 'error' | 'stopped';
   occurredAtMs: number;
   errorCode: string | null;
 }
@@ -361,6 +355,26 @@ export const daemon = {
   ) => setupClient.sessions.messages(agentId, sessionId, options),
   exportSession: (agentId: string, sessionId: string) =>
     setupClient.sessions.exportMarkdown(agentId, sessionId),
+  /** Accepts a message into a session (spec §4.2). */
+  startRun: (
+    agentId: string,
+    sessionId: string,
+    input: StartRunInput,
+    idempotencyKey: string,
+  ) => setupClient.runs.start(agentId, sessionId, input, { idempotencyKey }),
+  stopRun: (agentId: string, runId: string) =>
+    setupClient.runs.stop(agentId, runId),
+  sessionRuns: (
+    agentId: string,
+    sessionId: string,
+    options: { limit?: number; signal?: AbortSignal } = {},
+  ) => setupClient.runs.listForSession(agentId, sessionId, options),
+  compactSession: (agentId: string, sessionId: string) =>
+    setupClient.sessions.compact(agentId, sessionId),
+  /** The companion's live event stream (spec §6). */
+  agentEvents: (agentId: string, options: { signal?: AbortSignal } = {}) =>
+    setupClient.events.stream(agentId, options),
+  listAgentSummaries: () => setupClient.agents.listSummaries(),
   cancelAgentJob: (id: string, jobId: string, input: { revision: number }) =>
     setupClient.agents.cancelJob(id, jobId, input),
   retryAgentJob: (id: string, jobId: string, input: AgentJobRetryInput) =>
@@ -424,25 +438,6 @@ export const daemon = {
       method: 'DELETE',
     }),
 
-  /** Run one agent chat turn: user text in, task result out. */
-  runAgent: (
-    id: string,
-    text: string,
-    metadata?: Record<string, unknown>,
-    roomId?: string,
-  ) =>
-    request<{ agent: DaemonSnapshot; result: DaemonRunResult }>(
-      `/agents/${id}/run`,
-      {
-        method: 'POST',
-        body: JSON.stringify({
-          text,
-          ...(metadata ? { metadata } : {}),
-          ...(roomId ? { roomId } : {}),
-        }),
-      },
-    ),
-
   listConnectors: (agentId: string) =>
     request<{ connectors: TelegramConnector[] }>(
       `/agents/${encodeURIComponent(agentId)}/connectors`,
@@ -493,24 +488,6 @@ export const daemon = {
       `/agents/${encodeURIComponent(agentId)}/connectors/${encodeURIComponent(connectorId)}/messages${suffix}`,
     );
   },
-  sendConnectorMessage: (
-    agentId: string,
-    connectorId: string,
-    text: string,
-    idempotencyKey: string,
-  ) =>
-    request<{
-      messages: ConnectorMessage[];
-      result: DaemonRunResult;
-      deliveryQueued: boolean;
-    }>(
-      `/agents/${encodeURIComponent(agentId)}/connectors/${encodeURIComponent(connectorId)}/messages`,
-      {
-        method: 'POST',
-        headers: { 'Idempotency-Key': idempotencyKey },
-        body: JSON.stringify({ text }),
-      },
-    ),
   listSchedules: (agentId: string) =>
     request<{ schedules: DaemonSchedule[] }>(
       `/agents/${encodeURIComponent(agentId)}/schedules`,

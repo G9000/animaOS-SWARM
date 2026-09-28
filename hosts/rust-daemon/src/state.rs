@@ -1,9 +1,13 @@
+mod live_state;
 mod run_commit;
+pub(crate) mod run_stop;
 mod runtime_events;
 mod session_state;
 mod swarm_relationships;
 mod swarm_runtime;
 mod swarm_tools;
+pub(crate) use self::run_commit::RunBuild;
+pub(crate) use self::run_commit::RunContextReport;
 pub(crate) use self::session_state::RunSessionRequest;
 
 use std::collections::{HashMap, HashSet};
@@ -29,8 +33,8 @@ use crate::connectors::gcalendar::{
     CalendarManager, CalendarPendingWriteRecord, GoogleCalendarConnectorRecord,
 };
 use crate::connectors::{
-    InboundProcessingState, OutboundDeliveryState, TelegramConnectorRecord,
-    TelegramCredentialCleanupIntent, TelegramInboundRecord, TelegramOutboundRecord,
+    TelegramConnectorRecord, TelegramCredentialCleanupIntent, TelegramInboundRecord,
+    TelegramOutboundRecord,
 };
 use crate::control_plane_store::{
     save_control_plane_snapshot, ControlPlaneSnapshot, ControlPlaneStoreConfig,
@@ -1166,7 +1170,7 @@ mod tests {
         }
 
         let snapshot = source.control_plane_snapshot();
-        assert_eq!(snapshot.version, 5);
+        assert_eq!(snapshot.version, 6);
         assert_eq!(
             snapshot.runs.len(),
             3,
@@ -1306,6 +1310,88 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_v6_snapshot_holding_stopped_and_suppressed_values_round_trips() {
+        use crate::jobs::{AgentJobAttempt, AgentJobRecord, AgentJobStatus, JOB_STOPPED_ERROR};
+
+        let (mut snapshot, _) = valid_connector_snapshot();
+        snapshot.inbound[0].processing_state = InboundProcessingState::Stopped;
+        snapshot.outbound[0].delivery_state = OutboundDeliveryState::Suppressed;
+        snapshot.jobs.push(AgentJobRecord {
+            id: "job-stop".into(),
+            agent_id: snapshot.inbound[0].agent_id.clone(),
+            title: "Stopped job".into(),
+            prompt: "do it".into(),
+            request_key: "key".into(),
+            status: AgentJobStatus::NeedsReview,
+            revision: 2,
+            attempt: 1,
+            created_at_ms: 10,
+            updated_at_ms: 20,
+            started_at_ms: Some(15),
+            finished_at_ms: Some(20),
+            result: None,
+            error: Some(JOB_STOPPED_ERROR.into()),
+            max_attempts: 3,
+            requires_approval: false,
+            approved_at_ms: None,
+            attempts: vec![AgentJobAttempt {
+                attempt: 1,
+                status: AgentJobStatus::Stopped,
+                started_at_ms: 15,
+                finished_at_ms: 20,
+                result: None,
+                error: Some(JOB_STOPPED_ERROR.into()),
+                result_truncated: false,
+                review: None,
+            }],
+            goal_id: None,
+            stop_requested_at_ms: Some(20),
+        });
+        assert_eq!(
+            snapshot.version,
+            crate::control_plane_store::CONTROL_PLANE_STORE_VERSION
+        );
+        assert_eq!(snapshot.version, 6);
+
+        let payload = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(payload["inbound"][0]["processingState"], "stopped");
+        assert_eq!(payload["outbound"][0]["deliveryState"], "suppressed");
+        assert_eq!(payload["jobs"][0]["stopRequestedAtMs"], 20);
+        assert_eq!(payload["jobs"][0]["attempts"][0]["status"], "stopped");
+
+        let path = std::env::temp_dir().join(format!(
+            "anima-stop-roundtrip-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        crate::control_plane_store::save_control_plane_snapshot(
+            Some(&ControlPlaneStoreConfig::Json(path.clone())),
+            &snapshot,
+        )
+        .await
+        .unwrap();
+        let loaded = load_control_plane_snapshot(&ControlPlaneStoreConfig::Json(path.clone()))
+            .await
+            .unwrap()
+            .expect("the saved snapshot should load");
+        assert_eq!(loaded.version, 6);
+        assert_eq!(
+            loaded.inbound[0].processing_state,
+            InboundProcessingState::Stopped
+        );
+        assert_eq!(
+            loaded.outbound[0].delivery_state,
+            OutboundDeliveryState::Suppressed
+        );
+        assert_eq!(loaded.jobs[0].stop_requested_at_ms, Some(20));
+        assert_eq!(loaded.jobs[0].attempts[0].status, AgentJobStatus::Stopped);
+
+        DaemonState::new()
+            .restore_control_plane_snapshot(loaded)
+            .expect("a v6 snapshot holding stopped/suppressed values restores");
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn pending_history_deletions_are_saved_and_restored() {
         use crate::history::HistoryDeletion;
@@ -1430,6 +1516,12 @@ pub(crate) struct DaemonState {
     pub(crate) tool_registry: ToolRegistry,
     pub(crate) process_manager: SharedProcessManager,
     pub(crate) event_fanout: EventFanout,
+    /// Live runs and per-agent event streams (spec §6).
+    pub(crate) live: crate::live::LiveHub,
+    /// AI titles for new chats (spec §12.3). Only `app::serve` turns them on;
+    /// test and embedding states leave them off, so no test model is ever
+    /// asked for a title it did not script.
+    pub(crate) generated_titles: bool,
     pub(crate) db: Option<Arc<dyn DatabaseAdapter>>,
 }
 
@@ -1582,6 +1674,8 @@ impl DaemonState {
             tool_registry: ToolRegistry::new(),
             process_manager: new_shared_process_manager_with_limit(max_background_processes),
             event_fanout,
+            live: crate::live::LiveHub::new(crate::live::DEFAULT_SESSION_EVENT_BUFFER),
+            generated_titles: false,
             db: None,
         }
     }
@@ -1754,7 +1848,12 @@ impl DaemonState {
         snapshot.jobs.sort_by(|left, right| left.id.cmp(&right.id));
         snapshot.goals = self.goals.values().cloned().collect();
         snapshot.goals.sort_by(|left, right| left.id.cmp(&right.id));
-        snapshot.runs = self.runs.snapshot_records(&self.live_agent_ids());
+        snapshot.runs = self
+            .runs
+            .snapshot_records(&self.live_agent_ids())
+            .into_iter()
+            .map(|record| self.with_live_tools(record))
+            .collect();
         snapshot.sessions = self.sessions.snapshot_records(&self.live_agent_ids());
         snapshot.tool_grants_applied = self.tool_grants_applied.iter().cloned().collect();
         snapshot.pending_history_deletions = self.pending_history_deletions.clone();
@@ -1767,12 +1866,12 @@ impl DaemonState {
     ) -> Result<(usize, usize), String> {
         self.validate_control_plane_snapshot(&snapshot)?;
         // Spec §13.3 step 2: legacy per-tick check-in rooms become their
-        // automation's session. Only a snapshot older than this store version
-        // can still hold a pre-M2 room-* check-in; relabeling a room a live
-        // run created this boot would strand its already-mirrored history
-        // under the old id, so a current snapshot is left alone.
+        // automation's session. Only a snapshot older than the sessions
+        // version can still hold a pre-M2 room-* check-in; relabeling a room a
+        // live run created would strand its already-mirrored history under
+        // the old id, so an M2 or later snapshot is left alone.
         let (relabelled_messages, relabelled_runs) =
-            if snapshot.version < crate::control_plane_store::CONTROL_PLANE_STORE_VERSION {
+            if snapshot.version < crate::control_plane_store::SESSIONS_STORE_VERSION {
                 crate::sessions::migration::relabel_legacy_checkin_rooms(
                     &mut snapshot.agents,
                     &mut snapshot.runs,
@@ -2038,22 +2137,13 @@ impl DaemonState {
                     record.connector_id
                 )
             })?;
-            if connector.deleted_at_ms.is_some()
-                && !matches!(
-                    record.processing_state,
-                    InboundProcessingState::Processed | InboundProcessingState::Rejected
-                )
-            {
+            if connector.deleted_at_ms.is_some() && !record.processing_state.is_terminal() {
                 return Err(format!(
                     "inbound update {}:{} cannot remain unprocessed after connector deletion",
                     record.connector_id, record.update_id
                 ));
             }
-            let archived = !connector.is_active()
-                && matches!(
-                    record.processing_state,
-                    InboundProcessingState::Processed | InboundProcessingState::Rejected
-                );
+            let archived = !connector.is_active() && record.processing_state.is_terminal();
             if !agent_ids.contains(&record.agent_id) && !archived {
                 return Err(format!(
                     "inbound update references missing agent '{}'",
@@ -2092,16 +2182,13 @@ impl DaemonState {
                     record.connector_id
                 )
             })?;
-            if connector.deleted_at_ms.is_some()
-                && record.delivery_state != OutboundDeliveryState::Delivered
-            {
+            if connector.deleted_at_ms.is_some() && !record.delivery_state.is_settled() {
                 return Err(format!(
                     "outbound delivery '{}' cannot remain undelivered after connector deletion",
                     record.id
                 ));
             }
-            let archived =
-                !connector.is_active() && record.delivery_state == OutboundDeliveryState::Delivered;
+            let archived = !connector.is_active() && record.delivery_state.is_settled();
             if !agent_ids.contains(&record.agent_id) && !archived {
                 return Err(format!(
                     "outbound delivery references missing agent '{}'",
@@ -2125,7 +2212,7 @@ impl DaemonState {
                     record.id
                 ));
             }
-            if record.message_pruned && record.delivery_state != OutboundDeliveryState::Delivered {
+            if record.message_pruned && !record.delivery_state.is_settled() {
                 return Err(format!(
                     "outbound delivery '{}' is marked messagePruned but was not delivered",
                     record.id

@@ -11,8 +11,10 @@ import { daemon } from '../lib/daemon-api';
 
 /** Messages per page (the daemon default). */
 export const SESSION_MESSAGE_PAGE = 50;
-/** The open session re-reads its newest page this often until M3's stream. */
+/** The open session re-reads its newest page this often without the stream. */
 export const SESSION_MESSAGES_POLL_MS = 3_000;
+/** With the stream open, message events refresh the page; this is a backstop. */
+export const SESSION_MESSAGES_LIVE_POLL_MS = 30_000;
 
 /**
  * The newest page always replaces the tail from its first message onward.
@@ -70,6 +72,7 @@ export function useSessionMessages(
   agentId: string | null,
   sessionId: string | null,
   refreshKey = 0,
+  pollMs = SESSION_MESSAGES_POLL_MS,
 ) {
   const [messages, setMessages] = useState<SessionMessage[]>([]);
   const [nextBefore, setNextBefore] = useState<string | null>(null);
@@ -80,6 +83,9 @@ export function useSessionMessages(
   // Load older is not hidden by the poll that follows it.
   const [newestError, setNewestError] = useState<string | null>(null);
   const [olderError, setOlderError] = useState<string | null>(null);
+  /** The number (in `readsStarted` order) of the newest-page read on
+   *  screen for this session; 0 before its first. */
+  const [appliedRead, setAppliedRead] = useState(0);
   // Invalidates every in-flight request (both `refresh` and `loadOlder`)
   // when the hook resets for a different agent/session.
   const generation = useRef(0);
@@ -109,10 +115,18 @@ export function useSessionMessages(
     setMissing(false);
     setNewestError(null);
     setOlderError(null);
+    setAppliedRead(0);
   }, [agentId, sessionId]);
 
-  const refresh = useCallback(async () => {
-    if (!agentId || !sessionId) return;
+  /** Newest-page reads begun so far, by any caller (a poll, a refresh key,
+   *  an event): a read numbered above this began after now. */
+  const readsStarted = useCallback(() => refreshGeneration.current, []);
+
+  /** Reads the newest page; true once that page is what the view shows,
+   *  false when the read failed or a newer read or another session
+   *  superseded it. */
+  const refresh = useCallback(async (): Promise<boolean> => {
+    if (!agentId || !sessionId) return false;
     const sessionEpoch = generation.current;
     const request = ++refreshGeneration.current;
     try {
@@ -123,7 +137,7 @@ export function useSessionMessages(
         sessionEpoch !== generation.current ||
         request !== refreshGeneration.current
       )
-        return;
+        return false;
       const previous = messagesRef.current;
       const merged = mergeNewest(previous, page.messages);
       messagesRef.current = merged;
@@ -137,18 +151,21 @@ export function useSessionMessages(
       missingRef.current = false;
       setMissing(false);
       setNewestError(null);
+      setAppliedRead(request);
+      return true;
     } catch (caught) {
       if (
         sessionEpoch !== generation.current ||
         request !== refreshGeneration.current
       )
-        return;
+        return false;
       if (httpStatus(caught) === 404) {
         missingRef.current = true;
         setMissing(true);
       } else {
         setNewestError(errorText(caught));
       }
+      return false;
     }
   }, [agentId, sessionId]);
 
@@ -202,14 +219,14 @@ export function useSessionMessages(
       timer = window.setTimeout(() => {
         timer = undefined;
         void refresh().finally(schedule);
-      }, SESSION_MESSAGES_POLL_MS);
+      }, pollMs);
     };
     void refresh().finally(schedule);
     return () => {
       active = false;
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [agentId, sessionId, refresh, refreshKey]);
+  }, [agentId, sessionId, refresh, refreshKey, pollMs]);
 
   return {
     messages,
@@ -219,5 +236,7 @@ export function useSessionMessages(
     missing,
     error: newestError ?? olderError,
     refresh,
+    appliedRead,
+    readsStarted,
   };
 }

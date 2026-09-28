@@ -16,12 +16,19 @@ use crate::connectors::{
 use crate::schedules::ScheduledPromptRecord;
 
 /// Snapshot format version. Version 5 adds sessions (companion console M2);
-/// older daemons refuse it, so the first start writes a backup (spec §13.3).
-pub(crate) const CONTROL_PLANE_STORE_VERSION: u32 = 5;
+/// version 6 adds the live-run fields (M3: accepted `queued` runs and each
+/// run's `replyMessageId`). Older daemons refuse a newer version, so the first
+/// start of a new version writes a backup (spec §13.3).
+pub(crate) const CONTROL_PLANE_STORE_VERSION: u32 = 6;
+/// The version that added sessions: older snapshots still need the M2
+/// migration (spec §13.3 step 2).
+pub(crate) const SESSIONS_STORE_VERSION: u32 = 5;
 /// JSON snapshots written before the format was versioned.
 const UNVERSIONED_SNAPSHOT_VERSION: u32 = 1;
 /// Suffix of the JSON backup taken before the sessions upgrade (spec §13.3).
 pub(crate) const PRE_SESSIONS_BACKUP_SUFFIX: &str = ".pre-sessions.bak";
+/// Suffix of the JSON backup taken before the live-runs upgrade.
+pub(crate) const PRE_LIVE_RUNS_BACKUP_SUFFIX: &str = ".pre-live-runs.bak";
 const CONTROL_PLANE_SNAPSHOT_KEY: &str = "control_plane";
 
 #[derive(Clone, Debug)]
@@ -184,7 +191,8 @@ fn load_json_snapshot(path: &Path) -> io::Result<Option<ControlPlaneSnapshot>> {
     Ok(Some(snapshot))
 }
 
-/// Where the JSON snapshot is backed up before the sessions upgrade.
+/// Where the JSON snapshot is backed up before the sessions upgrade (from a
+/// version below `SESSIONS_STORE_VERSION`).
 pub(crate) fn pre_sessions_backup_path(path: &Path) -> PathBuf {
     let mut name = path
         .file_name()
@@ -192,6 +200,28 @@ pub(crate) fn pre_sessions_backup_path(path: &Path) -> PathBuf {
         .unwrap_or_default();
     name.push(PRE_SESSIONS_BACKUP_SUFFIX);
     path.with_file_name(name)
+}
+
+/// Where the JSON snapshot is backed up before the live-runs upgrade (from
+/// version `SESSIONS_STORE_VERSION`).
+pub(crate) fn pre_live_runs_backup_path(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_default();
+    name.push(PRE_LIVE_RUNS_BACKUP_SUFFIX);
+    path.with_file_name(name)
+}
+
+/// Where the JSON snapshot of `loaded_version` is backed up before it is
+/// upgraded: each upgrade keeps its own file, so a later upgrade never
+/// overwrites an earlier one's backup.
+pub(crate) fn pre_upgrade_backup_path(path: &Path, loaded_version: u32) -> PathBuf {
+    if loaded_version < SESSIONS_STORE_VERSION {
+        pre_sessions_backup_path(path)
+    } else {
+        pre_live_runs_backup_path(path)
+    }
 }
 
 /// The `host_snapshots` key of the Postgres backup of a `version` snapshot.
@@ -207,7 +237,7 @@ pub(crate) async fn write_pre_upgrade_backup(
 ) -> io::Result<String> {
     match config {
         ControlPlaneStoreConfig::Json(path) => {
-            backup_json_snapshot(path).map(|backup| backup.display().to_string())
+            backup_json_snapshot(path, loaded_version).map(|backup| backup.display().to_string())
         }
         ControlPlaneStoreConfig::Postgres(pool) => {
             backup_postgres_snapshot(pool, loaded_version).await
@@ -215,9 +245,9 @@ pub(crate) async fn write_pre_upgrade_backup(
     }
 }
 
-fn backup_json_snapshot(path: &Path) -> io::Result<PathBuf> {
+fn backup_json_snapshot(path: &Path, loaded_version: u32) -> io::Result<PathBuf> {
     let bytes = fs::read(path)?;
-    let backup = pre_sessions_backup_path(path);
+    let backup = pre_upgrade_backup_path(path, loaded_version);
     AtomicFile::new(&backup, AllowOverwrite)
         .write(|file| {
             file.write_all(&bytes)?;
@@ -469,7 +499,7 @@ mod tests {
         let loaded = super::load_json_snapshot(&path)
             .expect("replacement should load")
             .expect("replacement should exist");
-        assert_eq!(loaded.version, 5);
+        assert_eq!(loaded.version, super::CONTROL_PLANE_STORE_VERSION);
         assert_no_temp_residue(&path);
         let _ = std::fs::remove_dir_all(path.parent().expect("snapshot path has a parent"));
     }
@@ -527,7 +557,7 @@ mod tests {
         let snapshot = ControlPlaneSnapshot::new(vec![], vec![]);
         let payload = serde_json::to_value(snapshot).expect("snapshot should serialize");
 
-        assert_eq!(payload["version"], 5);
+        assert_eq!(payload["version"], 6);
         assert_eq!(payload["connectors"], serde_json::json!([]));
         assert_eq!(payload["credentialCleanup"], serde_json::json!([]));
         assert_eq!(payload["inbound"], serde_json::json!([]));
@@ -646,6 +676,52 @@ mod tests {
             std::path::PathBuf::from("/data/control-plane.json.pre-sessions.bak")
         );
         assert_eq!(super::postgres_backup_key(4), "control_plane.backup.4");
+        assert_eq!(super::postgres_backup_key(5), "control_plane.backup.5");
+    }
+
+    /// Controller ruling (M3 pre-flight audit I2): each upgrade keeps its own
+    /// backup, so the M3 upgrade never overwrites the one M2 wrote.
+    #[test]
+    fn the_backup_is_named_by_the_version_it_upgrades_from() {
+        let path = std::path::Path::new("/data/control-plane.json");
+        for version in [1, 2, 3, 4] {
+            assert_eq!(
+                super::pre_upgrade_backup_path(path, version),
+                std::path::PathBuf::from("/data/control-plane.json.pre-sessions.bak"),
+                "version {version}"
+            );
+        }
+        assert_eq!(
+            super::pre_upgrade_backup_path(path, 5),
+            std::path::PathBuf::from("/data/control-plane.json.pre-live-runs.bak")
+        );
+        assert_eq!(
+            super::pre_live_runs_backup_path(path),
+            super::pre_upgrade_backup_path(path, 5)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_version_five_backup_leaves_the_pre_sessions_backup_alone() {
+        let path = test_snapshot_path("live-runs-backup");
+        let m2_backup = "{\"version\":4,\"agents\":[],\"swarms\":[]}";
+        std::fs::write(super::pre_sessions_backup_path(&path), m2_backup).unwrap();
+        let original = "{\n  \"version\": 5,\n  \"agents\": [],\n  \"swarms\": []\n}\n";
+        std::fs::write(&path, original).unwrap();
+        let config = super::ControlPlaneStoreConfig::Json(path.clone());
+
+        let location = super::write_pre_upgrade_backup(&config, 5).await.unwrap();
+
+        let backup = super::pre_live_runs_backup_path(&path);
+        assert_eq!(location, backup.display().to_string());
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), original);
+        assert_eq!(
+            std::fs::read_to_string(super::pre_sessions_backup_path(&path)).unwrap(),
+            m2_backup,
+            "the M2 upgrade's backup survives the M3 upgrade"
+        );
+        assert_no_temp_residue(&path);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[tokio::test]

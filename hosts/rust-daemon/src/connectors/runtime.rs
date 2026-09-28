@@ -21,8 +21,9 @@ use crate::agent_runs::{AgentRunCoordinator, AgentRunRequest, RunRoom};
 use crate::app::SharedDaemonState;
 use crate::connectors::{InboundProcessingState, OutboundDeliveryState, TelegramOutboundRecord};
 use crate::history::HistoryDeletion;
+use crate::live::run_status_event;
 use crate::routes::{AgentRunEnvelope, AgentRuntimeSnapshotResponse, ApiError, TaskResultResponse};
-use crate::runs::RunSource;
+use crate::runs::{RunOutcome, RunSource, RunStatus};
 use crate::schedules::{ScheduleOutcomeStatus, ScheduleSafeOutcome, ScheduleTarget};
 use crate::state::DaemonState;
 
@@ -185,6 +186,11 @@ impl ConnectorManager {
             closing: Arc::new(AtomicBool::new(false)),
             owner_close: Some(owner_close),
         }
+    }
+
+    /// Shutdown has begun: no new work starts (see `ensure_open`).
+    pub(crate) fn is_closing(&self) -> bool {
+        self.closing.load(Ordering::SeqCst)
     }
 
     fn ensure_open(&self) -> Result<(), ConnectorManagerError> {
@@ -851,8 +857,31 @@ impl ConnectorManager {
         let manager = self.clone();
         tokio::spawn(async move {
             manager
-                .send_from_owner_owned(agent_id, connector_id, text, idempotency_key)
+                .send_from_owner_owned(agent_id, connector_id, text, idempotency_key, None)
                 .await
+        })
+        .await
+        .map_err(|_| ConnectorManagerError::WorkerStopped)?
+    }
+
+    /// A Telegram session's owner turn accepted as run `run_id` by the
+    /// session runs route (spec §4.2): the same flow, without the fail-fast
+    /// waiting budget (the accepted queue has its own cap) and without the
+    /// transcript replay (acceptance already checked the key in the ledger).
+    pub(crate) async fn send_from_owner_accepted(
+        &self,
+        agent_id: String,
+        connector_id: String,
+        text: String,
+        idempotency_key: String,
+        run_id: String,
+    ) -> Result<(), ConnectorManagerError> {
+        let manager = self.clone();
+        tokio::spawn(async move {
+            manager
+                .send_from_owner_owned(agent_id, connector_id, text, idempotency_key, Some(run_id))
+                .await
+                .map(|_| ())
         })
         .await
         .map_err(|_| ConnectorManagerError::WorkerStopped)?
@@ -864,6 +893,7 @@ impl ConnectorManager {
         connector_id: String,
         text: String,
         idempotency_key: String,
+        accepted: Option<String>,
     ) -> Result<(crate::routes::AgentRunEnvelope, bool), ConnectorManagerError> {
         let owner_send_lock = self.owner_send_lock(&connector_id, &idempotency_key);
         let _owner_send_guard = owner_send_lock.lock().await;
@@ -882,8 +912,7 @@ impl ConnectorManager {
                     .outbound
                     .values()
                     .filter(|record| {
-                        record.connector_id == connector_id
-                            && record.delivery_state != OutboundDeliveryState::Delivered
+                        record.connector_id == connector_id && !record.delivery_state.is_settled()
                     })
                     .count()
                     >= MAX_UNDELIVERED_OUTBOUND
@@ -896,23 +925,57 @@ impl ConnectorManager {
                 .await
                 .get(&connector_id)
                 .map(|worker| worker.generation);
-            let replay = owner_send_replay(&state, &connector, &text, &idempotency_key)?;
+            let replay = if accepted.is_some() {
+                OwnerSendReplay::New
+            } else {
+                owner_send_replay(&state, &connector, &text, &idempotency_key)?
+            };
             (connector, worker_generation, replay)
         };
-        if let Some(replay) = replay {
-            return Ok(replay);
+        match replay {
+            OwnerSendReplay::New => {}
+            OwnerSendReplay::Answered(envelope, delivery_queued) => {
+                return Ok((envelope, delivery_queued));
+            }
+            // Read with the state and lifecycle locks released.
+            OwnerSendReplay::FromHistory {
+                snapshot,
+                session_id,
+                reply_id,
+                delivery_queued,
+                store,
+            } => {
+                let reply = match store
+                    .get_message(&connector.agent_id, &session_id, &reply_id)
+                    .await
+                {
+                    Ok(Some(reply)) => reply.message.content,
+                    // Never run the turn again: the caller retries later.
+                    Ok(None) | Err(_) => return Err(ConnectorManagerError::Persistence),
+                };
+                return Ok((
+                    replay_envelope(&snapshot, TaskResult::success(reply, 0)),
+                    delivery_queued,
+                ));
+            }
         }
         // Only a unit of the agent's waiting budget is reserved here, without
         // waiting (spec §16). The run then waits for the Telegram room, an
         // agent slot, and a global permit, in that order (spec §4.3), and
         // gives the unit back once it holds the permit.
-        if !self.runs.has_available_permit() {
-            return Err(ConnectorManagerError::Backpressure);
-        }
-        let waiting = self
-            .runs
-            .try_take_waiting_unit(&connector.agent_id)
-            .ok_or(ConnectorManagerError::Backpressure)?;
+        // An accepted send is counted by the accepted queue's cap instead.
+        let waiting = if accepted.is_some() {
+            None
+        } else {
+            if !self.runs.has_available_permit() {
+                return Err(ConnectorManagerError::Backpressure);
+            }
+            Some(
+                self.runs
+                    .try_take_waiting_unit(&connector.agent_id)
+                    .ok_or(ConnectorManagerError::Backpressure)?,
+            )
+        };
         let commit_connector_id = connector.id.clone();
         let commit_agent_id = connector.agent_id.clone();
         let commit_room_id = connector.room_id.clone();
@@ -941,107 +1004,131 @@ impl ConnectorManager {
             source_ref: Some(connector.id.clone()),
             parent: None,
         };
-        let run = self
-            .runs
-            .run_budgeted_with_commit_waiting(
-                request,
-                waiting,
-                move |state, outcome| {
-                    let _lifecycle = commit_lifecycle_lock.try_lock().map_err(|_| {
-                        ApiError::service_unavailable("connector lifecycle changed during run")
-                    })?;
-                    let workers = commit_workers.try_lock().map_err(|_| {
-                        ApiError::service_unavailable("connector worker changed during run")
-                    })?;
-                    if workers
-                        .get(&commit_connector_id)
-                        .map(|worker| worker.generation)
-                        != connector_worker_generation
-                    {
-                        return Err(ApiError::service_unavailable(
-                            "connector worker changed during run",
-                        ));
-                    }
-                    let connector_unchanged = state
-                        .connectors
-                        .get(&commit_connector_id)
-                        .is_some_and(|current| {
-                            current.is_active()
-                                && current.agent_id == commit_agent_id
-                                && current.room_id == commit_room_id
-                                && current.approved_chat.as_ref().map(|chat| &chat.id)
-                                    == commit_chat_id.as_ref()
-                        });
-                    if !connector_unchanged {
-                        return Err(ApiError::not_found());
-                    }
-                    if outcome.result.status == TaskStatus::Error || commit_chat_id.is_none() {
-                        return Ok(());
-                    }
-                    if state
-                        .outbound
-                        .values()
-                        .filter(|record| {
-                            record.connector_id == commit_connector_id
-                                && record.delivery_state != OutboundDeliveryState::Delivered
-                        })
-                        .count()
-                        >= MAX_UNDELIVERED_OUTBOUND
-                    {
-                        return Err(ApiError::service_unavailable(
-                            "connector outbound capacity is exhausted",
-                        ));
-                    }
-                    let (Some(reply_id), Some(reply)) = (
-                        outcome.reply_message_id.clone(),
-                        outcome.result.data.as_ref(),
-                    ) else {
-                        return Err(ApiError::bad_request("agent produced no assistant message"));
-                    };
-                    let outbound_id =
-                        format!("telegram:{}:web:{}:outbound", commit_connector_id, reply_id);
-                    let outbound = TelegramOutboundRecord {
-                        id: outbound_id.clone(),
-                        connector_id: commit_connector_id.clone(),
-                        agent_id: commit_agent_id.clone(),
-                        room_id: commit_room_id.clone(),
-                        assistant_message_id: reply_id,
-                        text: reply.text.clone(),
-                        created_at_ms: now_ms(),
-                        delivered_at_ms: None,
-                        attempts: 0,
-                        delivery_state: OutboundDeliveryState::Pending,
-                        message_pruned: false,
-                    };
-                    if let Some(existing) = state.outbound.get(&outbound_id) {
-                        if existing != &outbound {
-                            return Err(ApiError::bad_request(
-                                "connector outbound conflicts with run",
-                            ));
-                        }
-                    } else {
-                        state.outbound.insert(outbound_id, outbound.clone());
-                        *commit_rollback_outbound
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(outbound);
-                    }
-                    Ok(())
+        let commit = move |state: &mut DaemonState, outcome: &RunOutcome| {
+            let _lifecycle = commit_lifecycle_lock.try_lock().map_err(|_| {
+                ApiError::service_unavailable("connector lifecycle changed during run")
+            })?;
+            let workers = commit_workers.try_lock().map_err(|_| {
+                ApiError::service_unavailable("connector worker changed during run")
+            })?;
+            if workers
+                .get(&commit_connector_id)
+                .map(|worker| worker.generation)
+                != connector_worker_generation
+            {
+                return Err(ApiError::service_unavailable(
+                    "connector worker changed during run",
+                ));
+            }
+            let connector_unchanged =
+                state
+                    .connectors
+                    .get(&commit_connector_id)
+                    .is_some_and(|current| {
+                        current.is_active()
+                            && current.agent_id == commit_agent_id
+                            && current.room_id == commit_room_id
+                            && current.approved_chat.as_ref().map(|chat| &chat.id)
+                                == commit_chat_id.as_ref()
+                    });
+            if !connector_unchanged {
+                return Err(ApiError::not_found());
+            }
+            if outcome.result.status == TaskStatus::Error || commit_chat_id.is_none() {
+                return Ok(());
+            }
+            if state
+                .outbound
+                .values()
+                .filter(|record| {
+                    record.connector_id == commit_connector_id
+                        && !record.delivery_state.is_settled()
+                })
+                .count()
+                >= MAX_UNDELIVERED_OUTBOUND
+            {
+                return Err(ApiError::service_unavailable(
+                    "connector outbound capacity is exhausted",
+                ));
+            }
+            let (Some(reply_id), Some(reply)) = (
+                outcome.reply_message_id.clone(),
+                outcome.result.data.as_ref(),
+            ) else {
+                return Err(ApiError::bad_request("agent produced no assistant message"));
+            };
+            let outbound_id = format!("telegram:{}:web:{}:outbound", commit_connector_id, reply_id);
+            // A stop saved while the run finished anyway: the reply is
+            // kept but never sent (spec §4.6).
+            let stopped = state
+                .runs
+                .get(&outcome.run_id)
+                .is_some_and(|record| record.stop.is_some());
+            let outbound = TelegramOutboundRecord {
+                id: outbound_id.clone(),
+                connector_id: commit_connector_id.clone(),
+                agent_id: commit_agent_id.clone(),
+                room_id: commit_room_id.clone(),
+                assistant_message_id: reply_id,
+                text: reply.text.clone(),
+                created_at_ms: now_ms(),
+                delivered_at_ms: None,
+                attempts: 0,
+                delivery_state: if stopped {
+                    OutboundDeliveryState::Suppressed
+                } else {
+                    OutboundDeliveryState::Pending
                 },
-                move |state| {
-                    if let Some(inserted) = rollback_outbound
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .as_ref()
-                    {
-                        if state.outbound.get(&inserted.id) == Some(inserted) {
-                            state.outbound.remove(&inserted.id);
-                        }
-                    }
-                    Ok(())
-                },
-            )
-            .await
-            .map_err(|_| ConnectorManagerError::Persistence)?;
+                message_pruned: false,
+            };
+            if let Some(existing) = state.outbound.get(&outbound_id) {
+                if existing != &outbound {
+                    return Err(ApiError::bad_request(
+                        "connector outbound conflicts with run",
+                    ));
+                }
+            } else {
+                state.outbound.insert(outbound_id, outbound.clone());
+                *commit_rollback_outbound
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(outbound);
+            }
+            Ok(())
+        };
+        let rollback = move |state: &mut DaemonState| {
+            if let Some(inserted) = rollback_outbound
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_ref()
+            {
+                if state.outbound.get(&inserted.id) == Some(inserted) {
+                    state.outbound.remove(&inserted.id);
+                }
+            }
+            Ok(())
+        };
+        let run = match accepted {
+            Some(run_id) => {
+                self.runs
+                    .run_accepted_with_commit(request, run_id, commit, rollback)
+                    .await
+            }
+            None => {
+                let waiting = waiting.expect("a direct owner send holds a waiting unit");
+                self.runs
+                    .run_budgeted_with_commit_waiting(request, waiting, commit, rollback)
+                    .await
+            }
+        }
+        .map_err(|error| {
+            // An accepted turn whose wait shutdown ended never started
+            // (final fix wave S2-A): its session queue leaves it queued.
+            if crate::agent_runs::is_shutting_down(&error) {
+                ConnectorManagerError::WorkerStopped
+            } else {
+                ConnectorManagerError::Persistence
+            }
+        })?;
         let delivery_queued = delivery_queued && run.result.status == "success";
         Ok((run, delivery_queued))
     }
@@ -1137,8 +1224,7 @@ impl ConnectorManager {
                     .outbound
                     .values()
                     .filter(|record| {
-                        record.connector_id == connector_id
-                            && record.delivery_state != OutboundDeliveryState::Delivered
+                        record.connector_id == connector_id && !record.delivery_state.is_settled()
                     })
                     .count()
                     >= MAX_UNDELIVERED_OUTBOUND
@@ -1244,11 +1330,29 @@ impl ConnectorManager {
                         .inbound
                         .get(&commit_key)
                         .ok_or_else(|| ApiError::bad_request("durable inbound disappeared"))?;
-                    if current.processing_state != InboundProcessingState::Processing
-                        || current.agent_id != commit_agent_id
-                        || current.room_id != commit_room_id
-                    {
+                    if current.agent_id != commit_agent_id || current.room_id != commit_room_id {
                         return Err(ApiError::bad_request("durable inbound changed during run"));
+                    }
+                    match current.processing_state {
+                        // The owner stopped this turn (spec §4.6): a finish with
+                        // no reply, never run again.
+                        InboundProcessingState::Stopped => return Ok(()),
+                        InboundProcessingState::Processing => {}
+                        _ => {
+                            return Err(ApiError::bad_request("durable inbound changed during run"))
+                        }
+                    }
+                    if outcome.status == RunStatus::Cancelled {
+                        let target = state
+                            .inbound
+                            .get_mut(&commit_key)
+                            .expect("inbound was prevalidated");
+                        target.processing_state = InboundProcessingState::Stopped;
+                        commit_rollback_delta
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .committed_target = Some(target.clone());
+                        return Ok(());
                     }
 
                     if outcome.result.status == TaskStatus::Error {
@@ -1517,6 +1621,8 @@ impl ConnectorManager {
         tokio::spawn(async move {
             let _lifecycle = manager.lifecycle_lock.lock().await;
             manager.ensure_open()?;
+            // New messages are refused while the deletion runs (spec §4.2).
+            let _deleting = manager.runs.begin_agent_deletion(&agent_id);
             {
                 let state = manager.state.read().await;
                 if state.get_agent(&agent_id).is_none() {
@@ -1577,7 +1683,7 @@ impl ConnectorManager {
             // protocol): a crash right after a successful save still replays
             // this deletion on restart.
             let deletion = HistoryDeletion::agent(&agent_id);
-            let (agent_snapshot, previous_connectors, previous_inbound, previous_outbound, previous_schedules, previous_runs, previous_sessions, persist) = {
+            let (agent_snapshot, previous_connectors, previous_inbound, previous_outbound, previous_schedules, cancelled_queued, previous_runs, previous_sessions, persist) = {
                 let mut state = manager.state.write().await;
                 let agent_snapshot = state.get_agent(&agent_id);
                 let previous_connectors = previous
@@ -1598,16 +1704,10 @@ impl ConnectorManager {
                         record.updated_at_ms = now;
                     }
                     state.inbound.retain(|(record_connector_id, _), record| {
-                        record_connector_id != &connector.id
-                            || matches!(
-                                record.processing_state,
-                                InboundProcessingState::Processed
-                                    | InboundProcessingState::Rejected
-                            )
+                        record_connector_id != &connector.id || record.processing_state.is_terminal()
                     });
                     state.outbound.retain(|_, record| {
-                        record.connector_id != connector.id
-                            || record.delivery_state == OutboundDeliveryState::Delivered
+                        record.connector_id != connector.id || record.delivery_state.is_settled()
                     });
                     compact_delivered_outbox(&mut state.outbound, &connector.id, now);
                     for schedule in state.schedules.values_mut() {
@@ -1627,6 +1727,9 @@ impl ConnectorManager {
                 // agents that no longer exist, so they would never be
                 // mirrored and never pruned (Controller ruling 2, M2
                 // pre-flight audit, carried forward from Task 6).
+                // Its queued messages never run (spec §4.4 item 6); cancelled
+                // first so they leave the ledger with its other terminal runs.
+                let cancelled_queued = state.runs.cancel_queued_for_agent(&agent_id, now);
                 let previous_runs = state.runs.remove_terminal_for_agent(&agent_id);
                 // Without this, a deleted agent's session records stay in the
                 // registry until a restart (fix round 1, M2 review).
@@ -1639,6 +1742,7 @@ impl ConnectorManager {
                     previous_inbound,
                     previous_outbound,
                     previous_schedules,
+                    cancelled_queued,
                     previous_runs,
                     previous_sessions,
                     persist,
@@ -1657,6 +1761,10 @@ impl ConnectorManager {
                     for run in previous_runs {
                         state.runs.insert(run);
                     }
+                    // The queued messages wait on, as they were.
+                    for (queued, _) in &cancelled_queued {
+                        state.runs.insert(queued.clone());
+                    }
                     for session in previous_sessions {
                         state.sessions.insert(session);
                     }
@@ -1670,6 +1778,21 @@ impl ConnectorManager {
                 manager.restore_agent_delete_configuration(&previous).await?;
                 drop(_transaction);
                 return Err(ConnectorManagerError::Persistence);
+            }
+            // Durable now: the cancelled messages stop waiting and are
+            // announced; their controls go with them.
+            {
+                let state = manager.state.read().await;
+                for (_, cancelled) in &cancelled_queued {
+                    if let Some(control) = state.live.runs().control(&cancelled.id) {
+                        control.cancel.cancel();
+                    }
+                    state.live.runs().remove(&cancelled.id);
+                    state.live.publish(run_status_event(cancelled), None);
+                }
+                // Its open streams end, after the events above (final fix
+                // wave S2-I); none can open again, the agent being gone.
+                state.live.close_agent(&agent_id);
             }
             // Durable now: the history rows may go (spec §3.3).
             let history = manager.state.read().await.history.clone();
@@ -1811,15 +1934,10 @@ impl ConnectorManager {
             connector.pending_pairing = None;
             connector.updated_at_ms = now;
             state.inbound.retain(|(record_connector_id, _), record| {
-                record_connector_id != &connector_id
-                    || matches!(
-                        record.processing_state,
-                        InboundProcessingState::Processed | InboundProcessingState::Rejected
-                    )
+                record_connector_id != &connector_id || record.processing_state.is_terminal()
             });
             state.outbound.retain(|_, record| {
-                record.connector_id != connector_id
-                    || record.delivery_state == OutboundDeliveryState::Delivered
+                record.connector_id != connector_id || record.delivery_state.is_settled()
             });
             compact_delivered_outbox(&mut state.outbound, &connector_id, now);
             for schedule in state.schedules.values_mut() {
@@ -2333,15 +2451,122 @@ impl ConnectorManager {
     }
 }
 
+/// What an owner send's key already answers (M1 F16; final fix wave S2-D).
+enum OwnerSendReplay {
+    /// No earlier send has this key: the send runs.
+    New,
+    /// The earlier send's answer, and whether its reply is queued for delivery.
+    Answered(AgentRunEnvelope, bool),
+    /// The earlier send completed, but its reply left the hot tail: read from
+    /// the history store once the locks are released.
+    FromHistory {
+        snapshot: anima_core::AgentRuntimeSnapshot,
+        session_id: String,
+        reply_id: String,
+        delivery_queued: bool,
+        store: Arc<dyn crate::history::HistoryStore>,
+    },
+}
+
+fn replay_envelope(
+    snapshot: &anima_core::AgentRuntimeSnapshot,
+    result: TaskResult<Content>,
+) -> AgentRunEnvelope {
+    AgentRunEnvelope {
+        agent: AgentRuntimeSnapshotResponse::from(snapshot),
+        result: TaskResultResponse::from(&result),
+    }
+}
+
+/// Whether the connector still has `reply_id` to deliver, or delivered it; a
+/// reply a stop suppressed is never sent (spec §4.6).
+fn reply_delivery_queued(
+    state: &DaemonState,
+    connector: &TelegramConnectorRecord,
+    reply_id: &str,
+) -> bool {
+    state.outbound.values().any(|outbound| {
+        outbound.connector_id == connector.id
+            && outbound.assistant_message_id == reply_id
+            && outbound.delivery_state != OutboundDeliveryState::Suppressed
+    })
+}
+
+/// The answer to an owner send whose key was already used: its run's ledger
+/// record when the ledger holds one, from its status and error (a stopped or
+/// failed run is not a success, and a completed run's reply is read from the
+/// history store once it left the hot tail); otherwise, for sends from
+/// before the ledger, the turn found in the transcript.
 fn owner_send_replay(
     state: &DaemonState,
     connector: &TelegramConnectorRecord,
     text: &str,
     idempotency_key: &str,
-) -> Result<Option<(AgentRunEnvelope, bool)>, ConnectorManagerError> {
+) -> Result<OwnerSendReplay, ConnectorManagerError> {
     let snapshot = state
         .get_agent(&connector.agent_id)
         .ok_or(ConnectorManagerError::AgentNotFound)?;
+    let session_id = crate::sessions::session_id_for_room(&connector.room_id);
+    let record = state
+        .runs
+        .for_session(&connector.agent_id, &session_id)
+        .into_iter()
+        .find(|record| record.idempotency_key.as_deref() == Some(idempotency_key));
+    let Some(record) = record else {
+        return transcript_owner_send_replay(state, connector, snapshot, text, idempotency_key);
+    };
+    if record.input.text != text {
+        return Err(ConnectorManagerError::IdempotencyConflict);
+    }
+    if !record.status.is_terminal() {
+        // Still queued or running: its answer is not known yet.
+        return Err(ConnectorManagerError::AgentBusy);
+    }
+    if record.status != RunStatus::Completed {
+        let message = record
+            .error
+            .as_ref()
+            .map(|error| error.message.clone())
+            .unwrap_or_else(|| format!("The run ended {}", record.status.as_str()));
+        return Ok(OwnerSendReplay::Answered(
+            replay_envelope(&snapshot, TaskResult::error(message, 0)),
+            false,
+        ));
+    }
+    let Some(reply_id) = record.reply_message_id.clone() else {
+        // A run completed before replies were saved with their runs.
+        return transcript_owner_send_replay(state, connector, snapshot, text, idempotency_key);
+    };
+    let delivery_queued = reply_delivery_queued(state, connector, &reply_id);
+    let reply = snapshot
+        .messages
+        .iter()
+        .find(|message| message.id == reply_id)
+        .map(|message| message.content.clone());
+    Ok(match reply {
+        Some(reply) => OwnerSendReplay::Answered(
+            replay_envelope(&snapshot, TaskResult::success(reply, 0)),
+            delivery_queued,
+        ),
+        None => OwnerSendReplay::FromHistory {
+            snapshot,
+            session_id,
+            reply_id,
+            delivery_queued,
+            store: state.history.store(),
+        },
+    })
+}
+
+/// A send from before the ledger: its turn in the transcript, and the first
+/// assistant message after it.
+fn transcript_owner_send_replay(
+    state: &DaemonState,
+    connector: &TelegramConnectorRecord,
+    snapshot: anima_core::AgentRuntimeSnapshot,
+    text: &str,
+    idempotency_key: &str,
+) -> Result<OwnerSendReplay, ConnectorManagerError> {
     let Some((user_index, user)) = snapshot.messages.iter().enumerate().find(|(_, message)| {
         message.room_id == connector.room_id
             && message.role == MessageRole::User
@@ -2355,7 +2580,7 @@ fn owner_send_replay(
                 )
             })
     }) else {
-        return Ok(None);
+        return Ok(OwnerSendReplay::New);
     };
     if user.content.text != text {
         return Err(ConnectorManagerError::IdempotencyConflict);
@@ -2368,19 +2593,14 @@ fn owner_send_replay(
             message.room_id == connector.room_id && message.role == MessageRole::Assistant
         })
     else {
-        return Ok(None);
+        return Ok(OwnerSendReplay::New);
     };
-    let delivery_queued = state.outbound.values().any(|outbound| {
-        outbound.connector_id == connector.id && outbound.assistant_message_id == assistant.id
-    });
+    let delivery_queued = reply_delivery_queued(state, connector, &assistant.id);
     let result = TaskResult::success(assistant.content.clone(), 0);
-    Ok(Some((
-        AgentRunEnvelope {
-            agent: AgentRuntimeSnapshotResponse::from(&snapshot),
-            result: TaskResultResponse::from(&result),
-        },
+    Ok(OwnerSendReplay::Answered(
+        replay_envelope(&snapshot, result),
         delivery_queued,
-    )))
+    ))
 }
 
 fn map_credential_error(error: CredentialStoreError) -> ConnectorManagerError {
@@ -2465,32 +2685,34 @@ fn compact_delivered_outbox(
     now: u64,
 ) {
     let cutoff = now.saturating_sub(DELIVERED_RETENTION_MS);
+    // Suppressed replies (spec §4.6) age out like delivered ones, by when
+    // they were committed.
+    let settled_at = |record: &TelegramOutboundRecord| match record.delivery_state {
+        OutboundDeliveryState::Delivered => record.delivered_at_ms,
+        OutboundDeliveryState::Suppressed => Some(record.created_at_ms),
+        OutboundDeliveryState::Pending | OutboundDeliveryState::Failed => None,
+    };
     outbox.retain(|_, record| {
         record.connector_id != connector_id
-            || record.delivery_state != OutboundDeliveryState::Delivered
-            || record
-                .delivered_at_ms
-                .is_none_or(|delivered_at_ms| delivered_at_ms >= cutoff)
+            || !record.delivery_state.is_settled()
+            || settled_at(record).is_none_or(|at| at >= cutoff)
     });
-    let mut delivered = outbox
+    let mut settled = outbox
         .values()
-        .filter(|record| {
-            record.connector_id == connector_id
-                && record.delivery_state == OutboundDeliveryState::Delivered
-        })
+        .filter(|record| record.connector_id == connector_id && record.delivery_state.is_settled())
         .map(|record| {
             (
-                record.delivered_at_ms.unwrap_or(record.created_at_ms),
+                settled_at(record).unwrap_or(record.created_at_ms),
                 record.id.clone(),
             )
         })
         .collect::<Vec<_>>();
-    let excess = delivered.len().saturating_sub(MAX_RETAINED_DELIVERED);
+    let excess = settled.len().saturating_sub(MAX_RETAINED_DELIVERED);
     if excess == 0 {
         return;
     }
-    delivered.sort();
-    for (_, id) in delivered.into_iter().take(excess) {
+    settled.sort();
+    for (_, id) in settled.into_iter().take(excess) {
         outbox.remove(&id);
     }
 }
@@ -2502,11 +2724,7 @@ fn compact_terminal_inbound(
     let mut terminal = inbound
         .iter()
         .filter(|((record_connector_id, _), record)| {
-            record_connector_id == connector_id
-                && matches!(
-                    record.processing_state,
-                    InboundProcessingState::Processed | InboundProcessingState::Rejected
-                )
+            record_connector_id == connector_id && record.processing_state.is_terminal()
         })
         .map(|(key, record)| (record.received_at_ms, record.update_id, key.clone()))
         .collect::<Vec<_>>();
@@ -2545,6 +2763,9 @@ async fn wait_or_stop(
         }
     }
 }
+
+#[cfg(test)]
+mod stop_tests;
 
 #[cfg(test)]
 mod tests {

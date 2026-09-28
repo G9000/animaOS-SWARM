@@ -10,8 +10,10 @@ import type { Session } from '@animaOS-SWARM/sdk';
 import { daemon } from '../lib/daemon-api';
 import { sessionKey } from '../lib/session-groups';
 
-/** The sidebar re-reads its sessions this often (the agent poll uses 5 s). */
+/** The sidebar re-reads its sessions this often without the event stream. */
 export const SESSION_LIST_POLL_MS = 10_000;
+/** With the stream open, session events refresh the list; this is a backstop. */
+export const SESSION_LIST_LIVE_POLL_MS = 60_000;
 /** Sessions per page of the daemon's listing. */
 export const SESSION_LIST_LIMIT = 200;
 /** Pages a refresh reads at most: `loadMore` adds one page up to this cap. */
@@ -20,6 +22,11 @@ export const SESSION_LIST_MAX_PAGES = 10;
 export interface CompanionSessionFilters {
   archived: boolean;
   query: string;
+}
+
+export interface CompanionSessionOptions {
+  /** The event stream is open: poll rarely, and let events call `refresh`. */
+  live?: boolean;
 }
 
 /** The SDK's `DaemonTooOldError`, by its stable code: the daemon has no
@@ -33,23 +40,51 @@ function isDaemonTooOld(error: unknown): boolean {
   );
 }
 
+/** A local change the daemon's listing may not show yet. */
+interface LocalChange {
+  /** The record to show, or null once removed. */
+  session: Session | null;
+  /** The mutation count when it was made. */
+  epoch: number;
+}
+
+/** A walk's result with the changes made while it ran on top. */
+function withLocalChanges(
+  listed: Session[],
+  changes: ReadonlyMap<string, LocalChange>,
+): Session[] {
+  if (changes.size === 0) return listed;
+  const kept = listed.filter((session) => !changes.has(sessionKey(session)));
+  const shown: Session[] = [];
+  for (const change of changes.values())
+    if (change.session) shown.push(change.session);
+  return [...shown, ...kept];
+}
+
 /**
  * The companion's sessions plus its helpers' (spec §3.3 `includeHelpers`).
  *
  * The list is the first `k` pages of the daemon's listing (residual round
- * R2). Every refresh (the 10 s poll, a manual `refresh()`, and the refreshes
- * after a rename, archive, or read mark) walks the cursor from page 1 through
- * page `k`, then replaces the list with what it read in one update, so a
- * session that moved between pages shows once and older pages stay current.
- * The newest walk wins; a superseded walk is discarded. `loadMore` raises `k`
- * by one, up to `SESSION_LIST_MAX_PAGES`, and walks again. A new agent or
- * filter starts over from one page but keeps the previous list on screen
- * until the new first page lands.
+ * R2). Every refresh (the poll, a manual `refresh()`, and the refreshes after
+ * a rename, archive, read mark, or session event) walks the cursor from page
+ * 1 through page `k`, then replaces the list with what it read in one
+ * update, so a session that moved between pages shows once and older pages
+ * stay current. The newest walk wins; a superseded walk is discarded.
+ * `loadMore` raises `k` by one, up to `SESSION_LIST_MAX_PAGES`, and walks
+ * again. A new agent or filter starts over from one page but keeps the
+ * previous list on screen until the new first page lands.
+ *
+ * Every walk reads the current agent and filters from a ref, so a refresh
+ * called from an older render never lists a previous filter, and an
+ * `upsert` or `remove` made while a walk ran stays on top of that walk's
+ * result (M2 residuals).
  */
 export function useCompanionSessions(
   agentId: string | null,
   filters: CompanionSessionFilters,
+  options: CompanionSessionOptions = {},
 ) {
+  const live = options.live ?? false;
   const [sessions, setSessions] = useState<Session[]>([]);
   const [loading, setLoading] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
@@ -76,8 +111,15 @@ export function useCompanionSessions(
   const resumePollRef = useRef<(() => void) | null>(null);
   const query = filters.query.trim();
   const { archived } = filters;
+  /** The listing every walk reads. */
+  const listingRef = useRef({ agentId, archived, query });
+  const changesRef = useRef(new Map<string, LocalChange>());
+  const mutationEpochRef = useRef(0);
 
   useLayoutEffect(() => {
+    listingRef.current = { agentId, archived, query };
+    // Local changes belonged to the previous listing.
+    changesRef.current.clear();
     // A new agent or filter starts over from one page: any walk in flight is
     // superseded, and a pending `loadMore` belonged to the old listing.
     generation.current += 1;
@@ -97,8 +139,14 @@ export function useCompanionSessions(
   }, [agentId, archived, query]);
 
   const refresh = useCallback(async () => {
-    if (!agentId) return;
+    const {
+      agentId: listedAgentId,
+      archived: listedArchived,
+      query: listedQuery,
+    } = listingRef.current;
+    if (!listedAgentId) return;
     const request = ++generation.current;
+    const startEpoch = mutationEpochRef.current;
     const pages = pagesRef.current;
     setLoading(true);
     try {
@@ -107,12 +155,12 @@ export function useCompanionSessions(
       let cursor: string | null = null;
       let read = 0;
       do {
-        const page = await daemon.listSessions(agentId, {
+        const page = await daemon.listSessions(listedAgentId, {
           includeHelpers: true,
-          archived,
+          archived: listedArchived,
           limit: SESSION_LIST_LIMIT,
           ...(cursor ? { cursor } : {}),
-          ...(query ? { q: query } : {}),
+          ...(listedQuery ? { q: listedQuery } : {}),
         });
         if (request !== generation.current) return; // superseded: discarded
         for (const session of page.sessions) {
@@ -124,10 +172,13 @@ export function useCompanionSessions(
         cursor = page.nextCursor;
         read += 1;
       } while (cursor !== null && read < pages);
+      // Changes made before this walk began are in what it read.
+      for (const [key, change] of changesRef.current)
+        if (change.epoch <= startEpoch) changesRef.current.delete(key);
       const more = cursor !== null && pages < SESSION_LIST_MAX_PAGES;
       shownPagesRef.current = pages;
       hasMoreRef.current = more;
-      setSessions(listed);
+      setSessions(withLocalChanges(listed, changesRef.current));
       setHasMore(more);
       setError(null);
       setDaemonTooOld(false);
@@ -158,7 +209,7 @@ export function useCompanionSessions(
     } finally {
       if (request === generation.current) setLoading(false);
     }
-  }, [agentId, archived, query]);
+  }, []);
 
   const loadMore = useCallback(async () => {
     if (
@@ -182,14 +233,16 @@ export function useCompanionSessions(
     let timer: number | undefined;
     const schedule = () => {
       // D3: once the daemon is flagged too old, stop polling rather than
-      // hammering its (missing) sessions routes every 10 s; a later walk that
-      // succeeds (a manual `refresh`) re-arms the poll through
-      // `resumePollRef` (R3).
+      // hammering its (missing) sessions routes; a later walk that succeeds
+      // (a manual `refresh`) re-arms the poll through `resumePollRef` (R3).
       if (!active || timer !== undefined || daemonTooOldRef.current) return;
-      timer = window.setTimeout(() => {
-        timer = undefined;
-        void refresh().finally(schedule);
-      }, SESSION_LIST_POLL_MS);
+      timer = window.setTimeout(
+        () => {
+          timer = undefined;
+          void refresh().finally(schedule);
+        },
+        live ? SESSION_LIST_LIVE_POLL_MS : SESSION_LIST_POLL_MS,
+      );
     };
     resumePollRef.current = schedule;
     void refresh().finally(schedule);
@@ -198,9 +251,13 @@ export function useCompanionSessions(
       if (resumePollRef.current === schedule) resumePollRef.current = null;
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [agentId, refresh]);
+  }, [agentId, archived, query, live, refresh]);
 
   const upsert = useCallback((session: Session) => {
+    changesRef.current.set(sessionKey(session), {
+      session,
+      epoch: ++mutationEpochRef.current,
+    });
     setSessions((current) => [
       session,
       ...current.filter((item) => sessionKey(item) !== sessionKey(session)),
@@ -208,6 +265,10 @@ export function useCompanionSessions(
   }, []);
 
   const remove = useCallback((session: Pick<Session, 'agentId' | 'id'>) => {
+    changesRef.current.set(sessionKey(session), {
+      session: null,
+      epoch: ++mutationEpochRef.current,
+    });
     setSessions((current) =>
       current.filter((item) => sessionKey(item) !== sessionKey(session)),
     );

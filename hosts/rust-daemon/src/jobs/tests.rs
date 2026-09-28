@@ -4,6 +4,21 @@ use crate::state::DaemonState;
 use tokio::sync::{RwLock, Semaphore};
 
 #[tokio::test]
+async fn a_jobs_own_status_is_never_stopped() {
+    let (service, agent, path) = setup();
+    let mut job = service
+        .create(&agent, "own-status", "prompt", "own-status")
+        .await
+        .unwrap();
+    job.status = AgentJobStatus::Stopped;
+    assert_eq!(
+        job.validate().unwrap_err(),
+        "A job's own status is never stopped"
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
 async fn job_timestamps_remain_valid_after_clock_moves_backwards() {
     let (service, agent, path) = setup();
     let mut job = service
@@ -498,6 +513,134 @@ async fn restart_recovers_queued_but_never_replays_running() {
         .jobs
         .iter()
         .any(|j| j.id == queued.id && j.status == AgentJobStatus::Completed));
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn a_stopped_job_attempt_is_marked_before_the_signal_and_needs_review() {
+    use crate::agent_runs::test_support::{companion_config, ScriptedModel, Step};
+
+    let path = std::env::temp_dir().join(format!("anima-job-stop-{}.json", uuid::Uuid::new_v4()));
+    let mut state =
+        DaemonState::with_model_adapter(ScriptedModel::new(vec![Step::Hold(vec!["Working"])]));
+    state.set_control_plane_store(Some(ControlPlaneStoreConfig::Json(path.clone())));
+    let agent = state
+        .create_agent(companion_config("worker"))
+        .unwrap()
+        .state
+        .id;
+    let state = Arc::new(RwLock::new(state));
+    let runs = AgentRunCoordinator::new(state.clone(), Arc::new(Semaphore::new(4)));
+    let service = JobService::new(state.clone(), runs.clone());
+    let job = service
+        .create(&agent, "Write", "write it", "key")
+        .await
+        .unwrap();
+    service.start().await.unwrap();
+
+    let mut run_id = None;
+    for _ in 0..500 {
+        {
+            let guard = state.read().await;
+            run_id = guard
+                .runs
+                .active_records()
+                .into_iter()
+                .find(|record| {
+                    record.source == RunSource::Job
+                        && guard
+                            .live
+                            .runs()
+                            .view(&record.id)
+                            .is_some_and(|view| view.text == "Working")
+                })
+                .map(|record| record.id.clone());
+        }
+        if run_id.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let run_id = run_id.expect("the job's run streams");
+
+    runs.stop_run(&agent, &run_id).await.unwrap();
+    let saved = load_control_plane_snapshot(&ControlPlaneStoreConfig::Json(path.clone()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        saved.jobs[0].stop_requested_at_ms.is_some(),
+        "the marker is saved before the signal"
+    );
+
+    let mut stopped = None;
+    for _ in 0..500 {
+        let current = service.list(&agent).await.unwrap().remove(0);
+        if current.status == AgentJobStatus::NeedsReview {
+            stopped = Some(current);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let stopped = stopped.expect("the job moves to needs review");
+    assert_eq!(stopped.error.as_deref(), Some(JOB_STOPPED_ERROR));
+    assert_eq!(
+        stopped.attempts.last().unwrap().status,
+        AgentJobStatus::Stopped
+    );
+    assert!(stopped.validate().is_ok());
+    assert!(matches!(
+        service
+            .retry(&agent, &job.id, stopped.revision, false)
+            .await,
+        Err(JobError::Conflict(_))
+    ));
+    let retried = service
+        .retry(&agent, &job.id, stopped.revision, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        retried.stop_requested_at_ms, None,
+        "a retry starts unstopped"
+    );
+    service.shutdown().await;
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn a_restart_keeps_a_stopped_attempt_stopped() {
+    let (service, agent, path) = setup();
+    let job = service
+        .create(&agent, "title", "prompt", "restart-stop")
+        .await
+        .unwrap();
+    {
+        let mut guard = service.state.write().await;
+        let record = guard.jobs.get_mut(&job.id).unwrap();
+        record.status = AgentJobStatus::Running;
+        record.attempt = 1;
+        advance(record);
+        record.started_at_ms = Some(record.updated_at_ms);
+        record.stop_requested_at_ms = Some(record.updated_at_ms);
+    }
+
+    service.start().await.unwrap();
+
+    let recovered = service
+        .list(&agent)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|candidate| candidate.id == job.id)
+        .unwrap();
+    assert_eq!(recovered.status, AgentJobStatus::NeedsReview);
+    assert_eq!(recovered.error.as_deref(), Some(JOB_STOPPED_ERROR));
+    assert_eq!(
+        recovered.attempts.last().unwrap().status,
+        AgentJobStatus::Stopped
+    );
+    assert!(recovered.validate().is_ok());
+    service.shutdown().await;
     let _ = std::fs::remove_file(path);
 }
 

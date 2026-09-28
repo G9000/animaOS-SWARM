@@ -3,7 +3,7 @@ use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use futures::future::join_all;
+use futures::future::{join_all, select, Either};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -25,6 +25,22 @@ use crate::runtime_serde::{
 #[path = "runtime/run_delta.rs"]
 mod run_delta;
 pub use run_delta::{new_room_id, RuntimeRunBase, RuntimeRunDelta, RuntimeRunUndo};
+
+#[path = "runtime/observer.rs"]
+mod observer;
+pub use observer::{
+    run_step_id, RunFrame, RunObserver, INCOMPLETE_METADATA_KEY, MODEL_STREAM_WITHOUT_FINAL,
+    REVISED_METADATA_KEY, RUN_ID_METADATA_KEY, STEP_ID_METADATA_KEY, TOOL_DURATION_METADATA_KEY,
+    TOOL_STATUS_METADATA_KEY,
+};
+use observer::{tool_result_text, StepSink};
+
+#[path = "runtime/control.rs"]
+mod control;
+pub use control::{
+    CancelSignal, CancelWait, RunControl, SteeringInbox, CANCELLED_TOOL_RESULT, RUN_STOPPED_ERROR,
+    STEER_METADATA_KEY, STOPPED_METADATA_KEY,
+};
 
 static NEXT_AGENT_ID: AtomicU64 = AtomicU64::new(0);
 static NEXT_EVENT_ID: AtomicU64 = AtomicU64::new(0);
@@ -68,6 +84,10 @@ pub struct AgentRuntime {
     /// Host run this runtime executes; scopes tool step keys (see
     /// `tool_step_idempotency_key`). Never persisted.
     run_id: Option<String>,
+    /// Receives this run's live frames (spec §4.5). Never persisted.
+    observer: Option<Arc<dyn RunObserver>>,
+    /// The host's stop signal and steering inbox for this run (spec §4.6–§4.7).
+    control: Option<RunControl>,
 }
 
 #[derive(Clone, Debug)]
@@ -113,6 +133,8 @@ impl AgentRuntime {
             persistence_agent_id: None,
             step_counter: 0,
             run_id: None,
+            observer: None,
+            control: None,
         }
     }
 
@@ -152,6 +174,8 @@ impl AgentRuntime {
             persistence_agent_id: None,
             step_counter: snapshot.step_count,
             run_id: None,
+            observer: None,
+            control: None,
         }
     }
 
@@ -176,6 +200,21 @@ impl AgentRuntime {
 
     pub fn run_id(&self) -> Option<&str> {
         self.run_id.as_deref()
+    }
+
+    /// Streams this runtime's model calls and tool steps to `observer` as they
+    /// happen (spec §4.5). Frames are never recorded.
+    pub fn set_run_observer(&mut self, observer: Arc<dyn RunObserver>) {
+        self.observer = Some(observer);
+    }
+
+    /// Lets the host stop this run and steer messages into it.
+    pub fn set_run_control(&mut self, control: RunControl) {
+        self.control = Some(control);
+    }
+
+    pub fn run_control(&self) -> Option<&RunControl> {
+        self.control.as_ref()
     }
 
     pub fn init(&mut self) {
@@ -396,6 +435,7 @@ impl AgentRuntime {
     {
         let start = now_millis();
         self.mark_running();
+        let input = self.tag_for_run(input, None, Vec::new());
         let user_message = self.record_message_in_room(room_id.clone(), MessageRole::User, input);
         let context_parts = match self.build_provider_context(&user_message).await {
             Ok(context_parts) => context_parts,
@@ -412,6 +452,7 @@ impl AgentRuntime {
         conversation.push(user_message.clone());
         let mut iterations = 0;
         let mut evaluator_retries = 0;
+        let mut model_calls = 0u64;
         let max_tool_iterations = self
             .state
             .config
@@ -421,6 +462,17 @@ impl AgentRuntime {
             .unwrap_or(MAX_TOOL_ITERATIONS);
 
         loop {
+            // Stop checkpoint before each model call (spec §4.6).
+            if self.stop_requested() {
+                return self.finish_stopped(start);
+            }
+            // Steering joins before each model call (spec §4.7).
+            self.drain_steering(&room_id, &mut conversation);
+            model_calls += 1;
+            let step_id = self.step_id_for(model_calls);
+            self.emit_frame(RunFrame::StepStarted {
+                step_id: step_id.clone(),
+            });
             let request = ModelGenerateRequest {
                 system: self.build_system_prompt(&context_parts),
                 messages: conversation.clone(),
@@ -437,39 +489,80 @@ impl AgentRuntime {
                     .as_ref()
                     .and_then(|settings| settings.max_tokens),
             };
+            // Every model call streams (spec §4.5); an adapter that only
+            // generates emits its final response through the default stream.
+            let sink = StepSink::new(self.observer.clone(), step_id.clone());
+            let cancel = self.control.as_ref().map(|control| control.cancel.clone());
+            let streamed = {
+                let call = self
+                    .model_adapter
+                    .stream(&self.state.config, &request, &sink);
+                match cancel {
+                    // Stop checkpoint while streaming: dropping the call drops
+                    // the in-flight request (spec §4.6).
+                    Some(cancel) => match select(call, cancel.cancelled()).await {
+                        Either::Left((streamed, _)) => Some(streamed),
+                        Either::Right(((), _)) => None,
+                    },
+                    None => Some(call.await),
+                }
+            };
+            let partial = sink.streamed_text();
+            let Some(streamed) = streamed else {
+                // The partial text stays, marked stopped (spec §4.6).
+                let message_id =
+                    self.record_unfinished_step(&room_id, &step_id, &partial, STOPPED_METADATA_KEY);
+                self.emit_frame(RunFrame::StepFinished {
+                    step_id,
+                    message_id,
+                });
+                return self.finish_stopped(start);
+            };
+            let outcome = match streamed {
+                Ok(()) => sink
+                    .take_response()
+                    .ok_or_else(|| MODEL_STREAM_WITHOUT_FINAL.to_string()),
+                Err(error) => Err(error),
+            };
 
-            match self
-                .model_adapter
-                .generate(&self.state.config, &request)
-                .await
-            {
+            match outcome {
                 Ok(response) => {
                     self.apply_token_usage(&response.usage);
+                    self.emit_frame(RunFrame::StepUsage {
+                        step_id: step_id.clone(),
+                        usage: response.usage.clone(),
+                    });
 
                     match response.stop_reason {
                         ModelStopReason::End | ModelStopReason::MaxTokens => {
-                            let evaluation = match self
-                                .run_evaluators(&user_message, &response.content)
-                                .await
-                            {
-                                Ok(decision) => decision,
-                                Err(error) => {
-                                    let duration_ms = now_millis().saturating_sub(start);
-                                    self.mark_failed(error, duration_ms);
-                                    return self.last_task.clone().unwrap_or_else(|| {
-                                        TaskResult::error("evaluator execution failed", duration_ms)
-                                    });
-                                }
-                            };
+                            let evaluation =
+                                match self.run_evaluators(&user_message, &response.content).await {
+                                    Ok(decision) => decision,
+                                    Err(error) => {
+                                        return self.fail_step(
+                                            &room_id,
+                                            &step_id,
+                                            &response.content.text,
+                                            INCOMPLETE_METADATA_KEY,
+                                            error,
+                                            start,
+                                        );
+                                    }
+                                };
 
                             match evaluation {
                                 EvaluatorDecision::Accept => {
                                     let duration_ms = now_millis().saturating_sub(start);
-                                    self.mark_completed_in_room(
+                                    let message_id = self.mark_completed_in_room(
                                         room_id.clone(),
                                         response.content.clone(),
                                         duration_ms,
+                                        Some(&step_id),
                                     );
+                                    self.emit_frame(RunFrame::StepFinished {
+                                        step_id: step_id.clone(),
+                                        message_id: Some(message_id),
+                                    });
                                     self.record_token_event();
                                     return self.last_task.clone().unwrap_or_else(|| {
                                         TaskResult::success(response.content, duration_ms)
@@ -477,55 +570,74 @@ impl AgentRuntime {
                                 }
                                 EvaluatorDecision::Retry { feedback } => {
                                     if evaluator_retries >= MAX_EVALUATOR_RETRIES {
-                                        let duration_ms = now_millis().saturating_sub(start);
-                                        self.mark_failed(
+                                        return self.fail_step(
+                                            &room_id,
+                                            &step_id,
+                                            &response.content.text,
+                                            REVISED_METADATA_KEY,
                                             "evaluator retry limit exceeded",
-                                            duration_ms,
+                                            start,
                                         );
-                                        return self.last_task.clone().unwrap_or_else(|| {
-                                            TaskResult::error(
-                                                "evaluator retry limit exceeded",
-                                                duration_ms,
-                                            )
-                                        });
                                     }
 
                                     evaluator_retries += 1;
+                                    // The earlier draft stays, marked revised:
+                                    // nothing streamed is retracted (spec §4.5).
+                                    let revised = self.tag_for_run(
+                                        response.content.clone(),
+                                        Some(&step_id),
+                                        vec![(REVISED_METADATA_KEY, DataValue::Bool(true))],
+                                    );
                                     let assistant_message = self.record_message_in_room(
                                         room_id.clone(),
                                         MessageRole::Assistant,
-                                        response.content.clone(),
+                                        revised,
                                     );
+                                    self.emit_frame(RunFrame::StepFinished {
+                                        step_id: step_id.clone(),
+                                        message_id: Some(assistant_message.id.clone()),
+                                    });
                                     conversation.push(assistant_message);
-                                    conversation.push(self.record_message_in_room(
-                                        room_id.clone(),
-                                        MessageRole::System,
+                                    let feedback = self.tag_for_run(
                                         Content {
                                             text: format!(
                                                 "Evaluator requested a revision: {feedback}\nRevise your previous answer and try again."
                                             ),
                                             ..Content::default()
                                         },
+                                        None,
+                                        Vec::new(),
+                                    );
+                                    conversation.push(self.record_message_in_room(
+                                        room_id.clone(),
+                                        MessageRole::System,
+                                        feedback,
                                     ));
                                     self.record_token_event();
                                     continue;
                                 }
                                 EvaluatorDecision::Abort { reason } => {
-                                    let duration_ms = now_millis().saturating_sub(start);
-                                    self.mark_failed(reason, duration_ms);
-                                    return self.last_task.clone().unwrap_or_else(|| {
-                                        TaskResult::error("evaluator aborted response", duration_ms)
-                                    });
+                                    return self.fail_step(
+                                        &room_id,
+                                        &step_id,
+                                        &response.content.text,
+                                        REVISED_METADATA_KEY,
+                                        reason,
+                                        start,
+                                    );
                                 }
                             }
                         }
                         ModelStopReason::ToolCall => {
                             if iterations >= max_tool_iterations {
-                                let duration_ms = now_millis().saturating_sub(start);
-                                self.mark_failed("tool iteration limit exceeded", duration_ms);
-                                return self.last_task.clone().unwrap_or_else(|| {
-                                    TaskResult::error("tool iteration limit exceeded", duration_ms)
-                                });
+                                return self.fail_step(
+                                    &room_id,
+                                    &step_id,
+                                    &response.content.text,
+                                    INCOMPLETE_METADATA_KEY,
+                                    "tool iteration limit exceeded",
+                                    start,
+                                );
                             }
 
                             let Some(tool_calls) = response
@@ -533,45 +645,71 @@ impl AgentRuntime {
                                 .clone()
                                 .filter(|calls| !calls.is_empty())
                             else {
-                                let duration_ms = now_millis().saturating_sub(start);
-                                self.mark_failed(
+                                return self.fail_step(
+                                    &room_id,
+                                    &step_id,
+                                    &response.content.text,
+                                    INCOMPLETE_METADATA_KEY,
                                     "model requested tools without tool calls",
-                                    duration_ms,
+                                    start,
                                 );
-                                return self.last_task.clone().unwrap_or_else(|| {
-                                    TaskResult::error(
-                                        "model requested tools without tool calls",
-                                        duration_ms,
-                                    )
-                                });
                             };
 
                             if let Some(denied) = tool_calls
                                 .iter()
                                 .find(|tool_call| !self.state.config.allows_tool(&tool_call.name))
                             {
-                                let duration_ms = now_millis().saturating_sub(start);
-                                self.mark_failed(
-                                    tool_not_configured_error(&denied.name),
-                                    duration_ms,
+                                let error = tool_not_configured_error(&denied.name);
+                                return self.fail_step(
+                                    &room_id,
+                                    &step_id,
+                                    &response.content.text,
+                                    INCOMPLETE_METADATA_KEY,
+                                    error,
+                                    start,
                                 );
-                                return self.last_task.clone().unwrap_or_else(|| {
-                                    TaskResult::error(
-                                        tool_not_configured_error(&denied.name),
-                                        duration_ms,
-                                    )
-                                });
                             }
 
                             iterations += 1;
-                            let assistant_content =
-                                content_with_tool_calls(response.content, &tool_calls);
+                            let assistant_content = self.tag_for_run(
+                                content_with_tool_calls(response.content, &tool_calls),
+                                Some(&step_id),
+                                Vec::new(),
+                            );
                             let assistant_message = self.record_message_in_room(
                                 room_id.clone(),
                                 MessageRole::Assistant,
                                 assistant_content,
                             );
+                            self.emit_frame(RunFrame::StepFinished {
+                                step_id: step_id.clone(),
+                                message_id: Some(assistant_message.id.clone()),
+                            });
                             conversation.push(assistant_message);
+
+                            // Stop checkpoint before the tool batch (spec §4.6):
+                            // every requested call still gets a result, so the
+                            // transcript never holds a call without one.
+                            if self.stop_requested() {
+                                for tool_call in &tool_calls {
+                                    let cancelled = self.tag_for_run(
+                                        content_from_tool_result(
+                                            tool_call,
+                                            TaskResult::error(CANCELLED_TOOL_RESULT, 0),
+                                            false,
+                                        ),
+                                        Some(&step_id),
+                                        self.tool_markers(TaskStatus::Error, 0),
+                                    );
+                                    self.record_message_in_room(
+                                        room_id.clone(),
+                                        MessageRole::Tool,
+                                        cancelled,
+                                    );
+                                }
+                                self.record_token_event();
+                                return self.finish_stopped(start);
+                            }
 
                             // Assign step indices by position (not by tool_call.id which may not be unique)
                             let step_indices: Vec<i32> = tool_calls
@@ -629,12 +767,21 @@ impl AgentRuntime {
                             }
 
                             let execute_tool = &execute_tool;
+                            let observer = self.observer.clone();
                             let tool_results =
                                 join_all(prepared_steps.into_iter().map(|prepared_step| {
                                     let tool_started = now_millis();
                                     let state = self.state.clone();
                                     let user_message = user_message.clone();
+                                    let observer = observer.clone();
+                                    let frame_step_id = step_id.clone();
                                     async move {
+                                        if let Some(observer) = &observer {
+                                            observer.on_frame(RunFrame::ToolStarted {
+                                                step_id: frame_step_id.clone(),
+                                                tool_call: prepared_step.tool_call.clone(),
+                                            });
+                                        }
                                         let recovered = prepared_step.recovered_result.is_some();
                                         let tool_result = match prepared_step.recovered_result {
                                             Some(tool_result) => tool_result,
@@ -652,6 +799,17 @@ impl AgentRuntime {
                                         } else {
                                             now_millis().saturating_sub(tool_started)
                                         };
+                                        if let Some(observer) = &observer {
+                                            observer.on_frame(RunFrame::ToolFinished {
+                                                step_id: frame_step_id,
+                                                tool_call_id: prepared_step.tool_call.id.clone(),
+                                                name: prepared_step.tool_call.name.clone(),
+                                                status: tool_result.status,
+                                                duration_ms: tool_duration,
+                                                result: tool_result_text(&tool_result),
+                                                recovered,
+                                            });
+                                        }
                                         (
                                             prepared_step.tool_call,
                                             prepared_step.step_index,
@@ -734,10 +892,16 @@ impl AgentRuntime {
                                         recovered,
                                     ),
                                 );
+                                let status = tool_result.status;
+                                let tool_content = self.tag_for_run(
+                                    content_from_tool_result(&tool_call, tool_result, recovered),
+                                    Some(&step_id),
+                                    self.tool_markers(status, tool_duration),
+                                );
                                 let tool_message = self.record_message_in_room(
                                     room_id.clone(),
                                     MessageRole::Tool,
-                                    content_from_tool_result(&tool_call, tool_result, recovered),
+                                    tool_content,
                                 );
                                 conversation.push(tool_message);
                             }
@@ -747,13 +911,173 @@ impl AgentRuntime {
                     }
                 }
                 Err(error) => {
-                    let duration_ms = now_millis().saturating_sub(start);
-                    self.mark_failed(error, duration_ms);
-                    return self.last_task.clone().unwrap_or_else(|| {
-                        TaskResult::error("model generation failed", duration_ms)
-                    });
+                    // Nothing streamed is retracted (spec §4.5): a call that
+                    // failed keeps the text it already showed.
+                    return self.fail_step(
+                        &room_id,
+                        &step_id,
+                        &partial,
+                        INCOMPLETE_METADATA_KEY,
+                        error,
+                        start,
+                    );
                 }
             }
+        }
+    }
+
+    /// `<runId>:<n>` for this run's `n`-th model call; `run:<n>` when the
+    /// host set no run id.
+    fn step_id_for(&self, step: u64) -> String {
+        run_step_id(self.run_id.as_deref().unwrap_or("run"), step)
+    }
+
+    fn emit_frame(&self, frame: RunFrame) {
+        if let Some(observer) = &self.observer {
+            observer.on_frame(frame);
+        }
+    }
+
+    /// `content` with `markers` added to its metadata and, when the host set
+    /// a run id, the run id (and the step id of a model call or tool result).
+    fn tag_for_run(
+        &self,
+        mut content: Content,
+        step_id: Option<&str>,
+        markers: Vec<(&str, DataValue)>,
+    ) -> Content {
+        let run_id = self.run_id.as_deref();
+        if run_id.is_none() && markers.is_empty() {
+            return content;
+        }
+        let metadata = content.metadata.get_or_insert_with(BTreeMap::new);
+        for (key, value) in markers {
+            metadata.insert(key.to_string(), value);
+        }
+        if let Some(run_id) = run_id {
+            metadata.insert(
+                RUN_ID_METADATA_KEY.to_string(),
+                DataValue::String(run_id.to_string()),
+            );
+            if let Some(step_id) = step_id {
+                metadata.insert(
+                    STEP_ID_METADATA_KEY.to_string(),
+                    DataValue::String(step_id.to_string()),
+                );
+            }
+        }
+        content
+    }
+
+    /// A tool result's status and duration, recorded for host runs only.
+    fn tool_markers(&self, status: TaskStatus, duration_ms: u64) -> Vec<(&'static str, DataValue)> {
+        if self.run_id.is_none() {
+            return Vec::new();
+        }
+        vec![
+            (
+                TOOL_STATUS_METADATA_KEY,
+                DataValue::String(status.as_str().to_string()),
+            ),
+            (
+                TOOL_DURATION_METADATA_KEY,
+                DataValue::Number(duration_ms as f64),
+            ),
+        ]
+    }
+
+    /// Records the text of a model call that cannot finish as an assistant
+    /// message marked `marker`; `None` when it has no text. Only the text is
+    /// kept, never a tool call, so the transcript never holds a call without
+    /// its result.
+    fn record_unfinished_step(
+        &mut self,
+        room_id: &str,
+        step_id: &str,
+        text: &str,
+        marker: &'static str,
+    ) -> Option<String> {
+        if text.is_empty() {
+            return None;
+        }
+        let content = self.tag_for_run(
+            Content {
+                text: text.to_string(),
+                ..Content::default()
+            },
+            Some(step_id),
+            vec![(marker, DataValue::Bool(true))],
+        );
+        Some(
+            self.record_message_in_room(room_id.to_string(), MessageRole::Assistant, content)
+                .id,
+        )
+    }
+
+    /// Ends the run on a model call that cannot continue: its text stays
+    /// (marked `marker`), the step finishes, and the run fails with `error`.
+    fn fail_step(
+        &mut self,
+        room_id: &str,
+        step_id: &str,
+        text: &str,
+        marker: &'static str,
+        error: impl Into<String>,
+        start: u64,
+    ) -> TaskResult<Content> {
+        let message_id = self.record_unfinished_step(room_id, step_id, text, marker);
+        self.emit_frame(RunFrame::StepFinished {
+            step_id: step_id.to_string(),
+            message_id,
+        });
+        let error = error.into();
+        let duration_ms = now_millis().saturating_sub(start);
+        self.mark_failed(error.clone(), duration_ms);
+        self.last_task
+            .clone()
+            .unwrap_or_else(|| TaskResult::error(error, duration_ms))
+    }
+
+    fn stop_requested(&self) -> bool {
+        self.control
+            .as_ref()
+            .is_some_and(|control| control.cancel.is_cancelled())
+    }
+
+    /// Ends a stopped run (spec §4.6): the result is the `stopped` error and
+    /// the agent goes back to `Idle`; a stop is never a failure.
+    fn finish_stopped(&mut self, start: u64) -> TaskResult<Content> {
+        let duration_ms = now_millis().saturating_sub(start);
+        let result = TaskResult::error(RUN_STOPPED_ERROR, duration_ms);
+        self.state.status = AgentStatus::Idle;
+        self.last_task = Some(result.clone());
+        self.record_event(
+            EventType::TaskFailed,
+            DataValue::String(RUN_STOPPED_ERROR.to_string()),
+        );
+        result
+    }
+
+    /// Records every steered message (spec §4.7) as a user message marked
+    /// `steer: true` and appends it to the conversation.
+    fn drain_steering(&mut self, room_id: &str, conversation: &mut Vec<Message>) {
+        let Some(control) = self.control.clone() else {
+            return;
+        };
+        for item in control.steering.drain() {
+            let content = self.tag_for_run(
+                item,
+                None,
+                vec![(STEER_METADATA_KEY, DataValue::Bool(true))],
+            );
+            let text = content.text.clone();
+            let message =
+                self.record_message_in_room(room_id.to_string(), MessageRole::User, content);
+            self.emit_frame(RunFrame::Steered {
+                message_id: message.id.clone(),
+                text,
+            });
+            conversation.push(message);
         }
     }
 
@@ -764,15 +1088,27 @@ impl AgentRuntime {
     }
 
     pub fn mark_completed(&mut self, content: Content, duration_ms: u64) {
-        self.mark_completed_in_room(next_id("room", &NEXT_ROOM_ID), content, duration_ms);
+        self.mark_completed_in_room(next_id("room", &NEXT_ROOM_ID), content, duration_ms, None);
     }
 
-    fn mark_completed_in_room(&mut self, room_id: String, content: Content, duration_ms: u64) {
+    /// Records the final reply (tagged for the host run) and the task result
+    /// (untagged); returns the reply's message id.
+    fn mark_completed_in_room(
+        &mut self,
+        room_id: String,
+        content: Content,
+        duration_ms: u64,
+        step_id: Option<&str>,
+    ) -> String {
         self.state.status = AgentStatus::Completed;
-        self.record_message_in_room(room_id, MessageRole::Assistant, content.clone());
+        let recorded = self.tag_for_run(content.clone(), step_id, Vec::new());
+        let message_id = self
+            .record_message_in_room(room_id, MessageRole::Assistant, recorded)
+            .id;
         self.last_task = Some(TaskResult::success(content.clone(), duration_ms));
         self.record_event(EventType::AgentCompleted, DataValue::String(content.text));
         self.record_event(EventType::TaskCompleted, DataValue::Null);
+        message_id
     }
 
     pub fn mark_failed(&mut self, error: impl Into<String>, duration_ms: u64) {
@@ -1138,3 +1474,11 @@ mod tests;
 #[cfg(test)]
 #[path = "runtime/run_tests.rs"]
 mod run_tests;
+
+#[cfg(test)]
+#[path = "runtime/observer_tests.rs"]
+mod observer_tests;
+
+#[cfg(test)]
+#[path = "runtime/control_tests.rs"]
+mod control_tests;

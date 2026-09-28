@@ -1,4 +1,11 @@
-import { Component, type ReactNode, useEffect, useRef, useState } from 'react';
+import {
+  Component,
+  memo,
+  type ReactNode,
+  useEffect,
+  useRef,
+  useState,
+} from 'react';
 import { Highlight, Prism, themes } from 'prism-react-renderer';
 import ReactMarkdown, {
   defaultUrlTransform,
@@ -284,7 +291,13 @@ const components: Components = {
   },
 };
 
-export function MarkdownMessage({ children }: { children: string }) {
+/** Memoized on its text: the same text is parsed once, however often the
+ *  message around it renders (a live run's bubbles are rebuilt per delta). */
+export const MarkdownMessage = memo(function MarkdownMessage({
+  children,
+}: {
+  children: string;
+}) {
   return (
     <div
       className="min-w-0 break-words text-sm leading-6 text-ink"
@@ -299,4 +312,4 @@ export function MarkdownMessage({ children }: { children: string }) {
       </ReactMarkdown>
     </div>
   );
-}
+});
