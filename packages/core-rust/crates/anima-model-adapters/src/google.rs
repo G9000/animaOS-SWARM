@@ -363,7 +363,10 @@ impl GoogleStreamAccumulator {
         Ok((!delta.is_empty()).then_some(delta))
     }
 
-    /// The whole response, parsed like a non-streamed one.
+    /// The whole response, parsed like a non-streamed one. A candidate's
+    /// `finishReason` is terminal; a stream that ends (EOF) after a candidate
+    /// but without any `finishReason` is a truncated reply, not a completed
+    /// one (S1-B did the same for Anthropic and OpenAI-compatible streams).
     pub(crate) fn finish(self) -> Result<ModelGenerateResponse, String> {
         if !self.saw_candidate {
             let feedback = self.prompt_feedback.unwrap_or(Value::Null);
@@ -371,10 +374,11 @@ impl GoogleStreamAccumulator {
                 &json!({ "promptFeedback": feedback }),
             ));
         }
+        let Some(reason) = self.finish_reason else {
+            return Err("Google stream ended before it was done".to_string());
+        };
         let mut candidate = json!({ "content": { "role": "model", "parts": self.parts } });
-        if let Some(reason) = self.finish_reason {
-            candidate["finishReason"] = Value::String(reason);
-        }
+        candidate["finishReason"] = Value::String(reason);
         let mut payload = json!({ "candidates": [candidate] });
         if let Some(usage) = self.usage {
             payload["usageMetadata"] = usage;

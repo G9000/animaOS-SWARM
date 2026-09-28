@@ -2083,6 +2083,48 @@ async fn a_google_stream_without_any_candidate_fails() {
     assert_eq!(error, "Google blocked the prompt: PROHIBITED_CONTENT");
 }
 
+#[tokio::test]
+async fn a_google_stream_without_a_finish_reason_is_incomplete() {
+    // A candidate arrived, but the stream ends (EOF) with no `finishReason` on
+    // any candidate: this is a truncated reply, not a completed one.
+    let base_url = sse_server(
+        "/v1beta/models/gemini-2.0-flash:streamGenerateContent",
+        "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Half\"}]}}]}\n\n".into(),
+    )
+    .await;
+    let (result, frames) = stream_frames(
+        &adapter_with(&[("google", Some("key"), &base_url)]),
+        &google_config(false),
+    )
+    .await;
+
+    assert_eq!(
+        result.unwrap_err(),
+        "Google stream ended before it was done"
+    );
+    assert_eq!(frames, vec![ModelStreamFrame::TextDelta("Half".into())]);
+}
+
+#[tokio::test]
+async fn a_google_stream_candidate_finish_reason_is_terminal() {
+    // Any `finishReason` on a candidate ends the reply, not only "STOP".
+    let base_url = sse_server(
+        "/v1beta/models/gemini-2.0-flash:streamGenerateContent",
+        "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Half\"}]},\"finishReason\":\"MAX_TOKENS\"}]}\n\n".into(),
+    )
+    .await;
+
+    let response = stream_final(
+        &adapter_with(&[("google", Some("key"), &base_url)]),
+        &google_config(false),
+    )
+    .await
+    .expect("a finishReason on the candidate completes the reply");
+
+    assert_eq!(response.content.text, "Half");
+    assert_eq!(response.stop_reason, ModelStopReason::MaxTokens);
+}
+
 // --- S1-C: OpenAI reasoning models reject a non-default temperature.
 
 #[test]
