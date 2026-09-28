@@ -6,7 +6,7 @@ import { emptyLiveRun } from '../../lib/session-events';
 import type { ToolStep } from '../../lib/transcript';
 import type { ChatMessage } from '../../lib/types';
 import { runFixture } from '../../test/live';
-import { RunActivity, ToolBlock } from './RunActivity';
+import { PendingMessage, RunActivity, ToolBlock } from './RunActivity';
 import { RunOutcomeCard } from './RunOutcomeCard';
 
 function renderMessage(message: ChatMessage) {
@@ -410,5 +410,44 @@ describe('RunOutcomeCard', () => {
       />,
     );
     expect(screen.getByText('This message wasn’t sent.')).toBeVisible();
+  });
+});
+
+describe('PendingMessage', () => {
+  it('offers Cancel while a message is unaccepted, but not for a steer (S3b-I)', async () => {
+    const user = userEvent.setup();
+    const onCancel = vi.fn();
+    const bubble = { key: 'k1', text: 'Book the train', createdAtMs: 1 };
+    const { rerender } = render(
+      <PendingMessage
+        pending={{ ...bubble, status: 'retrying' }}
+        onCancel={onCancel}
+        renderMessage={renderMessage}
+      />,
+    );
+    await user.click(screen.getByRole('button', { name: 'Cancel sending' }));
+    expect(onCancel).toHaveBeenCalledWith('k1');
+
+    rerender(
+      <PendingMessage
+        pending={{ ...bubble, status: 'sending' }}
+        onCancel={onCancel}
+        renderMessage={renderMessage}
+      />,
+    );
+    expect(
+      screen.getByRole('button', { name: 'Cancel sending' }),
+    ).toBeVisible();
+
+    rerender(
+      <PendingMessage
+        pending={{ ...bubble, status: 'steering' }}
+        onCancel={onCancel}
+        renderMessage={renderMessage}
+      />,
+    );
+    expect(
+      screen.queryByRole('button', { name: 'Cancel sending' }),
+    ).not.toBeInTheDocument();
   });
 });

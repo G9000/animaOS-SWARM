@@ -278,7 +278,11 @@ const TranscriptEntry = memo(function TranscriptEntry({
       );
     case 'pending':
       return (
-        <PendingMessage pending={item.pending} renderMessage={renderBubble} />
+        <PendingMessage
+          pending={item.pending}
+          onCancel={actions?.onCancelPending}
+          renderMessage={renderBubble}
+        />
       );
     case 'trimmed':
       return (

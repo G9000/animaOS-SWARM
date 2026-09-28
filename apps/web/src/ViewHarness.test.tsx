@@ -1511,6 +1511,43 @@ it('retries a message that did not reach the daemon with the same key', async ()
   ).not.toBeInTheDocument();
 });
 
+it('cancels a message that is still retrying and offers it back with its key', async () => {
+  const user = fakeClock();
+  vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+  vi.spyOn(daemon, 'listAgents').mockResolvedValue({
+    agents: [snapshot('agent-main', 'Nova', 1)],
+  });
+  mockProviders();
+  const startRun = vi.mocked(daemon.startRun);
+  startRun.mockRejectedValueOnce(
+    new DaemonConnectionError('', new TypeError('Failed to fetch')),
+  );
+  render(<ViewHarness />);
+  await openChat();
+  const input = await screen.findByPlaceholderText('Message Nova…');
+  await user.type(input, 'Plan the week');
+  await user.click(screen.getByRole('button', { name: 'Send' }));
+  expect(
+    await screen.findByText('Not delivered yet · retrying…'),
+  ).toBeVisible();
+
+  await user.click(screen.getByRole('button', { name: 'Cancel sending' }));
+  expect(
+    screen.queryByText('Not delivered yet · retrying…'),
+  ).not.toBeInTheDocument();
+  await elapse(SEND_RETRY_DELAYS_MS[0] * 2);
+  // Its retry never fires.
+  expect(startRun).toHaveBeenCalledTimes(1);
+  await user.click(
+    await screen.findByRole('button', { name: 'Restore message' }),
+  );
+  expect(input).toHaveValue('Plan the week');
+  await user.click(screen.getByRole('button', { name: 'Send' }));
+  await waitFor(() => expect(startRun).toHaveBeenCalledTimes(2));
+  // Resent unedited, it joins the first request rather than doubling it.
+  expect(startRun.mock.calls[1][3]).toBe(startRun.mock.calls[0][3]);
+});
+
 it('returns a message the daemon refused to the recovery panel without retrying', async () => {
   const user = userEvent.setup();
   vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });

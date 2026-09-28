@@ -967,6 +967,18 @@ export function ViewHarness() {
     liveRuns: live.state.runs,
     sessions: sessions.sessions,
     stopRun: (run) => void stopRun(run),
+    // Its text goes back to the recovery panel with its key, so a resend
+    // joins a request that did reach the daemon (S3b-I).
+    cancelPending: (key) => {
+      const item = sends.cancel(key);
+      if (!item) return;
+      updateChat(item.conversation, (current) => ({
+        failedDrafts: [
+          ...current.failedDrafts,
+          { requestId: item.key, text: item.text, idempotencyKey: item.key },
+        ],
+      }));
+    },
     sendAgain: commands.sendAgain,
     compact: (session) => void commands.compactSession(session),
     compacting: commands.compacting,

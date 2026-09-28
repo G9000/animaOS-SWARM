@@ -39,6 +39,8 @@ export interface TranscriptActionOptions {
   /** The listed sessions, where it finds a finished helper's session. */
   sessions: readonly Session[];
   stopRun: (run: Run) => void;
+  /** Takes back a send the daemon has not accepted (S3b-I). */
+  cancelPending: (key: string) => void;
   /** Sends a run's message again; false when it could not go. */
   sendAgain: (run: Run) => boolean;
   compact: (session: Session) => void;
@@ -64,14 +66,16 @@ export function useTranscriptActions({
   liveRuns,
   sessions,
   stopRun,
+  cancelPending,
   sendAgain,
   compact,
   compacting,
   openSession,
 }: TranscriptActionOptions): TranscriptActions {
-  const latestRef = useRef({ stopRun, sendAgain, compact, openSession });
+  const latest = { stopRun, cancelPending, sendAgain, compact, openSession };
+  const latestRef = useRef(latest);
   useEffect(() => {
-    latestRef.current = { stopRun, sendAgain, compact, openSession };
+    latestRef.current = latest;
   });
   // Read during render, so the cards rendered with it see this render's runs.
   const liveRunsRef = useRef(liveRuns);
@@ -88,6 +92,7 @@ export function useTranscriptActions({
       ...(cancellable
         ? { onCancelQueued: (run: Run) => latestRef.current.stopRun(run) }
         : {}),
+      onCancelPending: (key) => latestRef.current.cancelPending(key),
       ...(canResend
         ? {
             onSendAgain: (run: Run) => {

@@ -65,6 +65,8 @@ type ToolsItem = Extract<TranscriptItem, { kind: 'tools' }>;
 /** What the owner can do from the transcript. */
 export interface TranscriptActions {
   onCancelQueued?: (run: Run) => void;
+  /** Takes back a message the daemon has not accepted (S3b-I). */
+  onCancelPending?: (key: string) => void;
   onSendAgain?: (run: Run) => void;
   /** Runs already sent again from this page: their Retry or Send again is
    *  used up. */

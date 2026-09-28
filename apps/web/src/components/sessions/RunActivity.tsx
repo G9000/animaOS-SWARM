@@ -217,9 +217,12 @@ const PENDING_LABELS: Record<PendingBubble['status'], string> = {
 /** A message on its way to the daemon (spec §15.5). */
 export function PendingMessage({
   pending,
+  onCancel,
   renderMessage,
 }: {
   pending: PendingBubble;
+  /** Offered until the daemon accepts it: a steer it took is not (S3b-I). */
+  onCancel?: (key: string) => void;
   renderMessage: RenderMessage;
 }) {
   return (
@@ -230,7 +233,22 @@ export function PendingMessage({
         content: { text: pending.text },
         created_at_ms: pending.createdAtMs,
       })}
-      <p className="pending-message-label">{PENDING_LABELS[pending.status]}</p>
+      <p className="pending-message-label">
+        {PENDING_LABELS[pending.status]}
+        {onCancel && pending.status !== 'steering' ? (
+          <>
+            {' '}
+            <button
+              type="button"
+              className="studio-tool-button"
+              aria-label="Cancel sending"
+              onClick={() => onCancel(pending.key)}
+            >
+              Cancel
+            </button>
+          </>
+        ) : null}
+      </p>
     </div>
   );
 }

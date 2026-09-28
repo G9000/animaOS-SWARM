@@ -122,7 +122,8 @@ export class SendQueue {
   private sends: SessionSend[] = [];
   private readonly listeners = new Set<() => void>();
   private readonly busy = new Set<string>();
-  private readonly timers = new Map<number, string>();
+  /** Retries waiting to fire: each holds its send's lane busy. */
+  private readonly timers = new Map<number, { lane: string; key: string }>();
   private closed = false;
   private restored = false;
 
@@ -156,6 +157,30 @@ export class SendQueue {
       this.set(this.sends.filter((item) => item.key !== key));
   };
 
+  /** The owner takes back a send the daemon has not accepted (spec §15.3,
+   *  S3b-I): it leaves the queue, its retry with it, and is returned for the
+   *  recovery panel. A request already on its way may still land; its key,
+   *  kept with the text, makes a resend join rather than double it. A steer
+   *  the daemon took is not the page's to cancel. */
+  readonly cancel = (key: string): SessionSend | null => {
+    const send = this.current(key);
+    if (!send || send.steeringRunId !== null) return null;
+    const lane = laneOf(send);
+    let retryCleared = false;
+    for (const [timer, pending] of this.timers) {
+      if (pending.key !== key) continue;
+      window.clearTimeout(timer);
+      this.timers.delete(timer);
+      retryCleared = true;
+    }
+    this.settle(key);
+    if (retryCleared) {
+      this.busy.delete(lane);
+      this.pump(lane);
+    }
+    return send;
+  };
+
   /** Forgets a deleted companion's sends. */
   readonly forgetAgent = (agentId: string): void => {
     if (this.sends.some((item) => item.agentId === agentId))
@@ -180,7 +205,7 @@ export class SendQueue {
   /** Stops retrying; `open` resumes (React may close and reopen on mount). */
   close(): void {
     this.closed = true;
-    for (const [timer, lane] of this.timers) {
+    for (const [timer, { lane }] of this.timers) {
       window.clearTimeout(timer);
       this.busy.delete(lane);
     }
@@ -264,7 +289,7 @@ export class SendQueue {
         },
         SEND_RETRY_DELAYS_MS[failures - 1],
       );
-      this.timers.set(timer, lane);
+      this.timers.set(timer, { lane, key: send.key });
       return;
     }
     this.busy.delete(lane);
@@ -290,6 +315,7 @@ export function useSessionSends(callbacks: SessionSendCallbacks) {
     sends,
     send: queue.send,
     settle: queue.settle,
+    cancel: queue.cancel,
     forgetAgent: queue.forgetAgent,
   };
 }

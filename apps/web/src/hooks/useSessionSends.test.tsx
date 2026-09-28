@@ -305,6 +305,72 @@ describe('useSessionSends', () => {
     });
   });
 
+  it('cancels a retrying send: its retry never fires and the next one goes (S3b-I)', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const startRun = vi
+      .spyOn(daemon, 'startRun')
+      .mockRejectedValueOnce(new DaemonConnectionError('', new Error('down')))
+      .mockResolvedValue({ run: runFixture('run_2') });
+    const onAccepted = vi.fn();
+    const onFailed = vi.fn();
+    const { result } = renderHook(() =>
+      useSessionSends({ onAccepted, onFailed }),
+    );
+
+    act(() => {
+      result.current.send(message('a'));
+      result.current.send(message('b'));
+    });
+    await waitFor(() => expect(result.current.sends[0]?.failures).toBe(1));
+    let cancelled: ReturnType<typeof result.current.cancel> = null;
+    act(() => {
+      cancelled = result.current.cancel('a');
+    });
+    expect(cancelled).toMatchObject({ key: 'a', text: 'text a' });
+    await waitFor(() =>
+      expect(onAccepted.mock.calls.map(([send]) => send.key)).toEqual(['b']),
+    );
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000);
+    });
+    expect(startRun.mock.calls.map(([, , , key]) => key)).toEqual(['a', 'b']);
+    expect(onFailed).not.toHaveBeenCalled();
+    expect(result.current.sends).toEqual([]);
+    expect(sessionStorage.getItem('animaos.pendingSends')).toBeNull();
+  });
+
+  it('cancels a send waiting its turn without sending it, but not a steer (S3b-I)', async () => {
+    const first = deferred<Awaited<ReturnType<typeof daemon.startRun>>>();
+    const startRun = vi
+      .spyOn(daemon, 'startRun')
+      .mockReturnValueOnce(first.promise);
+    const { result } = renderHook(() =>
+      useSessionSends({ onAccepted: vi.fn(), onFailed: vi.fn() }),
+    );
+
+    act(() => {
+      result.current.send(message('a'));
+      result.current.send(message('b'));
+    });
+    act(() => {
+      expect(result.current.cancel('b')).toMatchObject({ key: 'b' });
+    });
+    expect(result.current.sends.map((item) => item.key)).toEqual(['a']);
+    await act(async () =>
+      first.resolve({
+        run: runFixture('run_1'),
+        steer: { status: 'pending' },
+      }),
+    );
+    expect(startRun).toHaveBeenCalledTimes(1);
+    // A steer the daemon took is no longer the page's to cancel.
+    act(() => {
+      expect(result.current.cancel('a')).toBeNull();
+    });
+    expect(result.current.sends.map((item) => item.key)).toEqual(['a']);
+    expect(result.current.cancel('missing')).toBeNull();
+  });
+
   it('stops retrying once the page closes', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     const startRun = vi
