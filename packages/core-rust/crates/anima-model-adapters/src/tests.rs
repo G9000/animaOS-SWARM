@@ -1074,9 +1074,9 @@ async fn deepseek_stream_falls_back_to_prompt_cache_hit_tokens() {
     let app = Router::new().route(
         "/v1/chat/completions",
         post(|Json(body): Json<Value>| async move {
-            assert_eq!(
-                body["stream_options"]["include_usage"], true,
-                "a custom DeepSeek endpoint asks for stream usage too"
+            assert!(
+                body.get("stream_options").is_none(),
+                "a custom DeepSeek endpoint gets no stream_options"
             );
             (
                 [("content-type", "text/event-stream")],
@@ -1279,8 +1279,7 @@ fn openai_request_shape_follows_the_provider_and_its_default_endpoint() {
     assert_eq!(shape("openai", "https://api.openai.com/v1/"), (true, true));
     assert_eq!(
         shape("openai", "https://my-proxy.example/v1"),
-        (true, false),
-        "the openai provider documents stream usage at any base URL"
+        (false, false)
     );
     assert_eq!(
         shape("deepseek", "https://api.deepseek.com/v1"),
@@ -1288,7 +1287,7 @@ fn openai_request_shape_follows_the_provider_and_its_default_endpoint() {
     );
     assert_eq!(
         shape("deepseek", "https://gateway.example/v1"),
-        (true, false)
+        (false, false)
     );
     assert_eq!(shape("vllm", "http://gpu-box:8000/v1"), (true, false));
     assert_eq!(shape("ollama", "http://gpu-box:11434/v1"), (true, false));
@@ -1303,11 +1302,11 @@ fn openai_request_shape_follows_the_provider_and_its_default_endpoint() {
 }
 
 #[tokio::test]
-async fn a_custom_openai_endpoint_keeps_max_tokens_and_asks_for_stream_usage() {
+async fn a_custom_openai_endpoint_keeps_max_tokens_and_no_stream_options() {
     let app = Router::new().route(
         "/v1/chat/completions",
         post(|Json(body): Json<Value>| async move {
-            assert_eq!(body["stream_options"]["include_usage"], true);
+            assert!(body.get("stream_options").is_none());
             assert_eq!(body["max_tokens"], 512);
             assert!(body.get("max_completion_tokens").is_none());
             (
