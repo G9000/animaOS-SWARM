@@ -91,13 +91,6 @@ export interface DaemonSnapshot {
   eventCount: number;
 }
 
-export interface DaemonRunResult {
-  status: 'success' | 'error';
-  durationMs: number;
-  error?: string | null;
-  data?: { text: string } | null;
-}
-
 export interface AgentUpdateInput {
   name?: string;
   model?: string;
@@ -445,25 +438,6 @@ export const daemon = {
       method: 'DELETE',
     }),
 
-  /** Run one agent chat turn: user text in, task result out. */
-  runAgent: (
-    id: string,
-    text: string,
-    metadata?: Record<string, unknown>,
-    roomId?: string,
-  ) =>
-    request<{ agent: DaemonSnapshot; result: DaemonRunResult }>(
-      `/agents/${id}/run`,
-      {
-        method: 'POST',
-        body: JSON.stringify({
-          text,
-          ...(metadata ? { metadata } : {}),
-          ...(roomId ? { roomId } : {}),
-        }),
-      },
-    ),
-
   listConnectors: (agentId: string) =>
     request<{ connectors: TelegramConnector[] }>(
       `/agents/${encodeURIComponent(agentId)}/connectors`,
@@ -514,24 +488,6 @@ export const daemon = {
       `/agents/${encodeURIComponent(agentId)}/connectors/${encodeURIComponent(connectorId)}/messages${suffix}`,
     );
   },
-  sendConnectorMessage: (
-    agentId: string,
-    connectorId: string,
-    text: string,
-    idempotencyKey: string,
-  ) =>
-    request<{
-      messages: ConnectorMessage[];
-      result: DaemonRunResult;
-      deliveryQueued: boolean;
-    }>(
-      `/agents/${encodeURIComponent(agentId)}/connectors/${encodeURIComponent(connectorId)}/messages`,
-      {
-        method: 'POST',
-        headers: { 'Idempotency-Key': idempotencyKey },
-        body: JSON.stringify({ text }),
-      },
-    ),
   listSchedules: (agentId: string) =>
     request<{ schedules: DaemonSchedule[] }>(
       `/agents/${encodeURIComponent(agentId)}/schedules`,

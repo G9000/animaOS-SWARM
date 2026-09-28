@@ -2534,7 +2534,6 @@ it('keeps each session’s own messages and draft when switching between them', 
 
 it('replies to a Telegram session through the runs route', async () => {
   const user = userEvent.setup();
-  const reply = vi.spyOn(daemon, 'sendConnectorMessage');
   const input = await openTelegramSession();
   await user.type(input, 'On my way');
   await user.click(screen.getByRole('button', { name: 'Send' }));
@@ -2545,7 +2544,6 @@ it('replies to a Telegram session through the runs route', async () => {
     { text: 'On my way', mode: 'queue' },
     expect.any(String),
   );
-  expect(reply).not.toHaveBeenCalled();
 });
 
 /** A Telegram session with its ready connector, opened in the harness. */
