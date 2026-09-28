@@ -546,7 +546,7 @@ fn retryable(status: reqwest::StatusCode) -> bool {
 /// fails, the call returns the second attempt's own error, marked as such.
 fn after_retry(retried: bool, error: String) -> String {
     if retried {
-        format!("after one retry: {error}")
+        format!("After one retry: {error}")
     } else {
         error
     }

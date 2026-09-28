@@ -1664,7 +1664,7 @@ async fn google_stream_retries_one_retryable_response_then_succeeds() {
 }
 
 // --- S1-E (reverses M14): a stream whose one retry also fails returns that second
-// attempt's own error, prefixed "after one retry: ", from every provider path.
+// attempt's own error, prefixed "After one retry: ", from every provider path.
 
 #[tokio::test]
 async fn google_stream_returns_the_second_error_after_one_retry() {
@@ -1691,7 +1691,7 @@ async fn google_stream_returns_the_second_error_after_one_retry() {
         .await
         .unwrap_err();
 
-    assert_eq!(error, "after one retry: Google API error (503): temporary");
+    assert_eq!(error, "After one retry: Google API error (503): temporary");
     assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 
@@ -2307,7 +2307,7 @@ async fn anthropic_and_openai_streams_return_the_second_error_after_one_retry() 
         .unwrap_err();
     assert_eq!(
         error,
-        "after one retry: Anthropic API error (429): second failure"
+        "After one retry: Anthropic API error (429): second failure"
     );
     assert_eq!(calls.load(Ordering::SeqCst), 2);
 
@@ -2326,7 +2326,7 @@ async fn anthropic_and_openai_streams_return_the_second_error_after_one_retry() 
         .unwrap_err();
     assert_eq!(
         error,
-        "after one retry: OpenAI API error (400): second failure"
+        "After one retry: OpenAI API error (400): second failure"
     );
     assert_eq!(calls.load(Ordering::SeqCst), 2);
 
