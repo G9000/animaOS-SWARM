@@ -27,6 +27,8 @@ export interface DaemonBootstrap {
   providersError: string | null;
   workspace: DaemonWorkspaceState | null;
   refreshAgents(): Promise<void>;
+  /** Reads every agent's summary, keeping each one's last messages. */
+  refreshSummaries(): Promise<void>;
   retryProviders(): Promise<void>;
   refreshWorkspace(): Promise<void>;
   acceptAgentSnapshot(snapshot: DaemonSnapshot): void;
@@ -304,6 +306,7 @@ export function useDaemonBootstrap(
     providersError,
     workspace,
     refreshAgents,
+    refreshSummaries,
     retryProviders,
     refreshWorkspace,
     acceptAgentSnapshot,

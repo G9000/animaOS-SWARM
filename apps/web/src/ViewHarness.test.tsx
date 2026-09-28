@@ -3095,6 +3095,44 @@ it('opens a helper session by its agent and credits its task to the companion', 
   );
 });
 
+it('reads a new helper’s summary once to name its session', async () => {
+  const helper = snapshot('helper-7', 'Researcher', 2);
+  helper.state.config.settings = { additional: { workspaceRole: 'helper' } };
+  const summaries = vi.spyOn(daemon, 'listAgentSummaries').mockResolvedValue(
+    [snapshot('agent-main', 'Nova', 1), helper].map((item) => ({
+      state: item.state,
+      messageCount: 0,
+      eventCount: 0,
+      lastTask: null,
+    })),
+  );
+  // The helper was spawned after the bootstrap's read.
+  routes.sessions.push(
+    sessionFixture('room-9', {
+      agentId: 'helper-7',
+      kind: 'helper',
+      origin: 'delegation',
+      title: 'Compare vendors',
+      parentAgentId: 'agent-main',
+      parentRunId: 'run_1',
+      capabilities: readOnly,
+      lastActivityAtMs: Date.now(),
+    }),
+  );
+  vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+  vi.spyOn(daemon, 'listAgents').mockResolvedValue({
+    agents: [snapshot('agent-main', 'Nova', 1)],
+  });
+  mockProviders();
+  window.history.replaceState(null, '', '/#/s/helper-7/room-9');
+  render(<ViewHarness />);
+
+  expect(
+    await screen.findByLabelText('Conversation with Researcher'),
+  ).toBeVisible();
+  expect(summaries).toHaveBeenCalledTimes(1);
+});
+
 it('refreshes the sidebar when the stream reports a session change', async () => {
   const { stream } = await openLiveSession();
   routes.sessions.push(
@@ -3762,6 +3800,17 @@ it('says it is reconnecting once while its retries keep failing', async () => {
 
 it('opens a helper’s session from its card', async () => {
   const user = userEvent.setup();
+  const helper = snapshot('helper-7', 'Researcher', 2);
+  helper.state.config.settings = { additional: { workspaceRole: 'helper' } };
+  // The helper is new: opening its session reads the summaries for it.
+  vi.spyOn(daemon, 'listAgentSummaries').mockResolvedValue(
+    [snapshot('agent-main', 'Nova', 1), helper].map((item) => ({
+      state: item.state,
+      messageCount: 0,
+      eventCount: 0,
+      lastTask: null,
+    })),
+  );
   routes.sessions.push(
     sessionFixture('room-9', {
       agentId: 'helper-7',
@@ -3796,6 +3845,9 @@ it('opens a helper’s session from its card', async () => {
   await waitFor(() => expect(window.location.hash).toBe('#/s/helper-7/room-9'));
   expect(
     await screen.findByRole('heading', { name: 'Compare vendors' }),
+  ).toBeVisible();
+  expect(
+    await screen.findByLabelText('Conversation with Researcher'),
   ).toBeVisible();
   // The helper's session is read through the companion's one stream.
   expect(daemon.agentEvents).toHaveBeenCalledTimes(1);

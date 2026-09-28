@@ -191,6 +191,7 @@ export function ViewHarness() {
     providersError,
     workspace,
     refreshAgents,
+    refreshSummaries,
     retryProviders,
     refreshWorkspace,
     acceptAgentSnapshot,
@@ -236,6 +237,18 @@ export function ViewHarness() {
     conversationRoute.kind === 'session'
       ? (conversationRoute.agentId ?? agentId)
       : null;
+  // A helper spawned since the last agents read would show the companion's
+  // name until the next poll: a route naming an unknown agent reads the
+  // summaries once for it (S3b-H).
+  const summaryReadsRef = useRef(new Set<string>());
+  const routeAgentKnown =
+    routeAgentId === null || agents.some((item) => item.id === routeAgentId);
+  useEffect(() => {
+    if (!loaded || routeAgentKnown || !routeAgentId) return;
+    if (summaryReadsRef.current.has(routeAgentId)) return;
+    summaryReadsRef.current.add(routeAgentId);
+    void refreshSummaries();
+  }, [loaded, routeAgentId, routeAgentKnown, refreshSummaries]);
   const listedSession =
     routeSessionId && routeAgentId
       ? (sessions.sessions.find(
