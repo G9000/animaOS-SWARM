@@ -214,7 +214,11 @@ export class SendQueue {
 
   private set(next: SessionSend[]): void {
     this.sends = next;
-    savePendingSends(next.map(toPersisted));
+    // A steer the daemon already holds (`steeringRunId`) is not saved: a
+    // reload must never offer it again as if it were never delivered.
+    savePendingSends(
+      next.filter((item) => item.steeringRunId === null).map(toPersisted),
+    );
     for (const listener of this.listeners) listener();
   }
 

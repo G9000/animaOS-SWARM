@@ -263,6 +263,24 @@ describe('useSessionSends', () => {
     expect(sessionStorage.getItem('animaos.pendingSends')).toBeNull();
   });
 
+  it('does not save a steer the daemon already accepted, so a reload never offers it again', async () => {
+    vi.spyOn(daemon, 'startRun').mockResolvedValue({
+      run: runFixture('run_1', { status: 'running' }),
+      steer: { status: 'pending' },
+    });
+    const { result } = renderHook(() =>
+      useSessionSends({ onAccepted: vi.fn(), onFailed: vi.fn() }),
+    );
+
+    act(() => result.current.send({ ...message('s'), mode: 'steer' }));
+    await waitFor(() =>
+      expect(result.current.sends[0]?.steeringRunId).toBe('run_1'),
+    );
+    // The bubble stays on the page until the run applies it, but the daemon
+    // holds the steer now, so nothing is saved for a reload to restore.
+    expect(sessionStorage.getItem('animaos.pendingSends')).toBeNull();
+  });
+
   it('restores a send left over from a previous load to the recovery panel, its key reused (S3b-A)', () => {
     sessionStorage.setItem(
       'animaos.pendingSends',
