@@ -120,31 +120,60 @@ describe('buildTranscript', () => {
     ]);
   });
 
+  // A result can arrive detached from its call's block: a recovered or
+  // delayed result recorded after the run moved on (spec §4.6's restart
+  // recovery), here after an unrelated later run's own turn closed the
+  // block. Within the same run it answers its call's earlier card, rather
+  // than leaving that card stuck at ✗ beside a second card (T17).
+  it('merges a recovered result into its call’s earlier card in the same run', () => {
+    const messages = [
+      message('a0', 'Assistant', 'On it.', {
+        runId: 'run_1',
+        toolCalls: [{ id: 'call_9', name: 'search', args: {} }],
+      }),
+      message('a1', 'Assistant', 'Retrying separately.', {
+        runId: 'run_2',
+      }),
+      message(
+        't0',
+        'Tool',
+        '{"status":"error","data":null,"error":"timed out"}',
+        { runId: 'run_1', toolCallId: 'call_9', toolStatus: 'error' },
+      ),
+    ];
+    const items = buildTranscript({ messages });
+
+    expect(kinds(items)).toEqual(['message', 'tools', 'message']);
+    const block = items[1];
+    expect(block.kind === 'tools' && block.steps).toEqual([
+      expect.objectContaining({
+        toolCallId: 'call_9',
+        name: 'search',
+        status: 'error',
+        result: 'timed out',
+      }),
+    ]);
+    expect(block.kind === 'tools' && block.messageIds).toEqual(['a0', 't0']);
+    // The run's last item is still its card, not the later run's turn.
+    expect(buildHistory({ messages }).lastOfRun.get('run_1')).toBe(1);
+  });
+
   // Ruling 3 (web part): an orphan card — a tool result whose call is not
-  // in the same block — takes its name from the matching assistant
-  // message's `toolCalls` (found anywhere in the loaded history), never
-  // from a `toolName` metadata key the daemon does not write. A user turn
-  // can't land between a call and its own result (the run is mid-tool);
-  // the realistic way a result arrives detached from its call's block is
-  // a recovered/delayed result recorded after the run moved on (spec
-  // §4.6's restart recovery) — here, after an unrelated later run's own
-  // turn closed the block.
-  it('names a recovered orphan card from the assistant message that made its call', () => {
+  // in the same block, and not known to be of the same run — takes its
+  // name from the matching assistant message's `toolCalls` (found anywhere
+  // in the loaded history), never from a `toolName` metadata key the
+  // daemon does not write.
+  it('names an orphan card from the assistant message that made its call', () => {
     const items = buildTranscript({
       messages: [
         message('a0', 'Assistant', 'On it.', {
-          runId: 'run_1',
           toolCalls: [{ id: 'call_9', name: 'search', args: {} }],
         }),
-        message('a1', 'Assistant', 'Retrying separately.', {
-          runId: 'run_2',
+        message('a1', 'Assistant', 'Retrying separately.'),
+        message('t0', 'Tool', '{"status":"success","data":"found"}', {
+          toolCallId: 'call_9',
+          toolStatus: 'success',
         }),
-        message(
-          't0',
-          'Tool',
-          '{"status":"error","data":null,"error":"timed out"}',
-          { runId: 'run_1', toolCallId: 'call_9', toolStatus: 'error' },
-        ),
       ],
     });
 
@@ -154,8 +183,7 @@ describe('buildTranscript', () => {
       expect.objectContaining({
         toolCallId: 'call_9',
         name: 'search',
-        status: 'error',
-        result: 'timed out',
+        status: 'success',
       }),
     ]);
   });

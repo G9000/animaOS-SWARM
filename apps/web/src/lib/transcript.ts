@@ -431,25 +431,38 @@ export function buildHistory(input: HistoryInput): TranscriptHistory {
   for (const message of input.messages) {
     const runId = messageRunId(message);
     const metadata = metadataOf(message);
+    // Set when a result answers a card placed earlier: its run's last item
+    // stays where it was.
+    let answeredEarlier = false;
     if (message.role === 'Tool') {
       const callId = stringField(metadata, 'toolCallId');
       const stepId = stringField(metadata, 'stepId');
       const status = resultStatus(message, metadata);
       const result = resultText(message, status);
-      const current = openBlockFor(runId);
+      const open = openBlockFor(runId);
       // A result answers the call of its own step: a provider may reuse a
       // call id in every step of a run.
-      const step = current
-        ? current.steps.find(
-            (item) =>
-              item.toolCallId === callId &&
-              item.result === null &&
-              (stepId === null ||
-                item.stepId === null ||
-                item.stepId === stepId),
-          )
-        : undefined;
-      if (current && step) {
+      const answers = (item: ToolStep) =>
+        item.toolCallId === callId &&
+        item.result === null &&
+        (stepId === null || item.stepId === null || item.stepId === stepId);
+      let owner: ToolsItem | null = open;
+      let step = open?.steps.find(answers);
+      // A recovered or delayed result, recorded after its run moved on,
+      // answers its call's earlier card in the same run (T17).
+      if (!step && callId !== null && runId !== null)
+        for (let index = items.length - 1; index >= 0 && !step; index -= 1) {
+          const item = items[index];
+          if (item.kind !== 'tools' || item === open) continue;
+          step = item.steps.find(
+            (candidate) => candidate.runId === runId && answers(candidate),
+          );
+          if (step) {
+            owner = item;
+            answeredEarlier = true;
+          }
+        }
+      if (owner && step) {
         step.status = status;
         step.durationMs = resultDuration(metadata);
         step.result = result;
@@ -458,7 +471,7 @@ export function buildHistory(input: HistoryInput): TranscriptHistory {
             ...step.helper,
             agentId: stringField(parsedFields(message.content.text), 'agentId'),
           };
-        current.messageIds.push(message.id);
+        owner.messageIds.push(message.id);
       } else {
         // A result whose call is on an older page, or not in this block,
         // still gets its own card.
@@ -474,9 +487,9 @@ export function buildHistory(input: HistoryInput): TranscriptHistory {
           runId,
           helper: null,
         };
-        if (current) {
-          current.steps.push(orphan);
-          current.messageIds.push(message.id);
+        if (open) {
+          open.steps.push(orphan);
+          open.messageIds.push(message.id);
         } else {
           block = {
             kind: 'tools',
@@ -532,7 +545,7 @@ export function buildHistory(input: HistoryInput): TranscriptHistory {
       }
     }
     if (runId) {
-      lastOfRun.set(runId, items.length - 1);
+      if (!answeredEarlier) lastOfRun.set(runId, items.length - 1);
       if (metadata.stopped === true) stoppedRuns.add(runId);
     }
     if (message.id === trimmed) {
