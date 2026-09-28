@@ -122,7 +122,15 @@ export class AgentEventsClient {
       const data = event.data;
       if (data !== null && typeof data === 'object' && 'type' in data) {
         yield data as AgentEvent;
+        continue;
       }
+      // Not JSON, or JSON without a type: skipped, but said, so a daemon
+      // and console that disagree about the wire show it (T15).
+      console.warn('Skipped a malformed agent event', {
+        event: event.event,
+        id: event.id,
+        data: typeof data === 'string' ? data.slice(0, 200) : data,
+      });
     }
   }
 }

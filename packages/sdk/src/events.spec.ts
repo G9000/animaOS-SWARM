@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   createDaemonClient,
@@ -50,4 +50,32 @@ describe('agent events client', () => {
     expect(isRunLifecycleEvent(received[2])).toBe(true);
     expect(isRunLifecycleEvent(received[1])).toBe(false);
   });
+
+  it('warns about a malformed payload instead of dropping it silently', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const client = createDaemonClient({
+      baseUrl: '',
+      fetch: async () =>
+        sseResponse([
+          'id: 1\nevent: step.delta\ndata: {"type":"step.delta",\n\n',
+          'id: 2\nevent: run.completed\ndata: {"agentId":"agent/a"}\n\n',
+          'id: 3\nevent: stream.snapshot\ndata: {"type":"stream.snapshot","agentId":"agent/a","seq":3,"at":5,"runs":[],"approvals":[]}\n\n',
+        ]),
+    });
+
+    const received: AgentEvent[] = [];
+    for await (const event of client.events.stream('agent/a'))
+      received.push(event);
+
+    expect(received.map((event) => event.type)).toEqual(['stream.snapshot']);
+    expect(warn).toHaveBeenCalledTimes(2);
+    expect(warn.mock.calls.map(([, detail]) => detail)).toEqual([
+      expect.objectContaining({ event: 'step.delta', id: '1' }),
+      expect.objectContaining({ event: 'run.completed', id: '2' }),
+    ]);
+  });
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
 });
