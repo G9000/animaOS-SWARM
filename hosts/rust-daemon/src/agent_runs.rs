@@ -1729,6 +1729,10 @@ impl AgentRunCoordinator {
                 if let Some(record) = guard.runs.get(&run_id) {
                     live_run.publish_record(record);
                 }
+                let orphaned =
+                    guard.stop_orphaned_approvals(&run_id, anima_core::primitives::now_millis());
+                drop(guard);
+                self.save_stopped_approvals(orphaned).await;
                 return Err(ApiError::not_found());
             }
             // Controller ruling m2: settled `stopped` in this run's own save.

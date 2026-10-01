@@ -139,9 +139,14 @@ impl DaemonState {
             .publish(run_status_event(record), parent.as_deref());
     }
 
-    /// `approval.resolved`, then `run.started` when the run resumed.
+    /// `approval.resolved`, then `run.started` when the run resumed. A
+    /// `stopped` settlement is always followed by its run's terminal event,
+    /// so it announces the resolution alone (no running flicker, ruling m6).
     pub(crate) fn publish_settled(&self, settled: &SettledApproval) {
         self.publish_approval(&settled.approval);
+        if settled.approval.status == ApprovalStatus::Stopped {
+            return;
+        }
         if let Some(run) = &settled.run {
             self.publish_run_status(run);
         }

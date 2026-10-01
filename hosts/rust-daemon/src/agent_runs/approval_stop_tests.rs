@@ -184,6 +184,8 @@ async fn a_cancel_without_a_saved_stop_still_resolves_the_approval() {
     ]);
     let (coordinator, agent_id) =
         approving_coordinator(model, ask_before_writes(), patient()).await;
+    let hub = coordinator.state.read().await.live.clone();
+    let mut subscription = hub.subscribe(&agent_id).unwrap();
     let running = {
         let coordinator = coordinator.clone();
         let request = chat_request(&agent_id, "chat:cancel", "remember");
@@ -215,6 +217,19 @@ async fn a_cancel_without_a_saved_stop_still_resolves_the_approval() {
             .unwrap(),
     );
     assert!(tool_results(&coordinator, &agent_id).await[0].contains(CANCELLED_TOOL_RESULT));
+
+    let events = events_until(&mut subscription, "run.cancelled").await;
+    let resolved_at = events
+        .iter()
+        .position(|event| event["type"] == "approval.resolved")
+        .expect("the cancel announces the approval");
+    assert_eq!(events[resolved_at]["approval"]["status"], "stopped");
+    assert!(
+        !events[resolved_at + 1..]
+            .iter()
+            .any(|event| event["type"] == "run.started"),
+        "a stopped settlement never flickers the run back to running"
+    );
 }
 
 #[tokio::test]
