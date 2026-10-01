@@ -1020,6 +1020,11 @@ git commit -m "feat(daemon): classify every tool by risk and judge calls against
 
 Recommended implementer tier: standard (pure code, but the matcher edge cases are security-relevant).
 
+#### Controller rulings from the pre-flight audit (binding)
+
+1. (m9) Rename `no_tool_can_change_approval_state` to `no_tool_is_named_after_approvals` and keep it as a tripwire. Its doc comment says it checks tool names only, not reachability (the owner routes are reachable only through an exec call; see Task 7's Limits paragraph).
+2. (m14) `command_suggestion` may return an empty prefix (a command that starts with an operator). Keep that behavior. The web disables the scoped decisions for an empty non-`any` suggestion (Task 11). Do not fall back to `any`: an `any` exec suggestion is exactly the broad rule I2 warns about.
+
 ---
 
 ### Task 2: Approval records in the control plane: registry, snapshot version 7, and restart expiry
@@ -2281,6 +2286,11 @@ git commit -m "feat(daemon): keep approvals, policies, rules, and session allowa
 
 Recommended implementer tier: standard (mechanical snapshot plumbing plus a registry with clear unit tests).
 
+#### Controller rulings from the pre-flight audit (binding)
+
+1. (I4) Add a rollback bullet to `hosts/rust-daemon/README.md`, next to the M2/M3 bullets (README.md:358-359 at HEAD) and modelled on M3's: "Rolling back from M4 to an M3 daemon: stop the daemon and restore `<file>.pre-approvals.bak` over the control-plane file (JSON store) or the `control_plane.backup.6` row over the current one (Postgres). Control-plane changes made since the upgrade are lost, including approval policies and rules, sessions, and runs. The history store stays in place; an M3 daemon ignores its `approvals` rows." Stage the README with this task's commit; it is not under `docs/`.
+2. Add a one-line comment at `pre_upgrade_backup_path`: a future version 8 must add its own branch, or `.pre-approvals.bak` would be overwritten.
+
 ---
 
 ### Task 3: Settling approvals: decisions, rules, session allowances, and the run's status
@@ -3287,6 +3297,10 @@ git commit -m "feat(daemon): open and settle approvals with rules, session allow
 
 Recommended implementer tier: standard (synchronous state logic with exhaustive unit tests; the revert paths are where a reviewer should look hardest).
 
+#### Controller rulings from the pre-flight audit (binding)
+
+1. No audit finding changes this task. The settlement methods it adds are reused by Task 6's orphan sweep (m2), so keep `settle_approval` callable for a run whose waiter is gone.
+
 ---
 
 ### Task 4: Decided approvals in the history store and the outbox
@@ -4014,6 +4028,11 @@ git commit -m "feat(daemon): move decided approvals to the history store through
 ```
 
 Recommended implementer tier: standard (follows the terminal-run mirroring pattern closely; the Postgres SQL is hand-checked only).
+
+#### Controller rulings from the pre-flight audit (binding)
+
+1. (m11) In the Postgres conformance case, filter the "every agent" decided query with `since_ms = base` (the test's own start time), so other runs' newer rows on a shared database cannot page this run's rows out. The test stays `#[ignore]`.
+2. (m1) Task 5's `decide_approval` uses this task's `HistoryStore::get_approval`. Run tasks strictly in order 1 → 14; Tasks 4 and 5 are not independent.
 
 ---
 
@@ -5829,6 +5848,21 @@ git commit -m "feat(daemon): wait for the owner's approval before risky tool cal
 
 Recommended implementer tier: most capable (async waiting, transaction ordering, and exactly-once settlement across three racing sources).
 
+#### Controller rulings from the pre-flight audit (binding)
+
+1. (Split, audit §8) Run this task as two commits by two implementers:
+   - **5a:** the constants, `routes/contracts/approvals.rs` and the `ApprovalResponse` export, the `LiveEventBody` approval variants and `approval_json`, the `publish_*` helpers, the `ApprovalTimeouts`/`ApprovalWaiters` types with a small unit test, and the test_support fixtures (including ruling 3's).
+   - **5b:** the gate, `agent_runs/approvals.rs`, the `execute_tool`/live-checks refactor, the `run_locked` wiring, the stop_tests edit, and the 16 tests.
+   - 5a may carry temporary `allow(dead_code)` on items 5b consumes; Task 8 removes them as planned.
+2. (I1) Rewrite `a_timeout_that_queued_first_beats_a_later_decision` and `a_decision_that_queued_first_beats_the_timeout` without timers:
+   - Mark both `#[tokio::test(flavor = "current_thread")]` explicitly and use `patient()` timeouts, so the real timer never fires during the test.
+   - Hold `control_plane_transaction()`. Spawn the exact timeout path, `coordinator.settle_approval(&id, Settlement::TimedOut)`, then `tokio::task::yield_now().await`, so on current-thread the spawned task queues on the fair mutex before the test resumes. Then spawn `decide_approval`, `yield_now()`, and drop the guard. Reverse the two spawns for the other test.
+   - Keep `a_timeout_denies_the_call_and_a_late_decision_conflicts` (with `quick()`, no race) as the coverage for the timer branch.
+   - No tokio `test-util` and no paused time (no new dependency features; paused time would also fire the 5 s helper timeouts).
+3. (m7) Put `ask_before_writes()` and `patient()` in `agent_runs/test_support.rs`, plus `config()`/`remember()` where the approval test files share them. Task 6's `approval_stop_tests.rs` imports them; nothing is defined twice.
+4. (m5) Keep `ApprovalTimeouts::for_source` as written: 15 minutes only for runs whose source is `RunSource::Telegram`. A schedule run in a `telegram:` room and a Telegram run's delegated child get 30 minutes. That matches the spec's text.
+5. (m10) Accepted: a call that waited and was denied still appears in `toolsStarted`, because anima-core emits `ToolStarted` before `execute_tool`. anima-core stays untouched. Task 7's README notes it.
+
 ---
 
 ### Task 6: Stop while awaiting approval, abandoned waits, and steers that wait
@@ -6311,6 +6345,12 @@ git commit -m "feat(daemon): resolve a stopped run's approvals with its stop"
 ```
 
 Recommended implementer tier: most capable (the stop's save-then-signal protocol, revert on a failed save, and the drop guard).
+
+#### Controller rulings from the pre-flight audit (binding)
+
+1. (m2) Sweep orphaned pending approvals. When a run finishes through a path that already saves the control plane (its commit and its rollback), settle any of the run's approvals that are still `pending` as `stopped` (`resolvedBy: stop`) in that same save, and publish `approval.resolved` for each after the save. A drop path that cannot save (for example `InFlightRunGuard`'s drop) settles in memory only; the next save carries it, and a restart expires it anyway. Keep the lock order: control-plane transaction → state lock → waiters mutex. Add one test: a run whose gate future was dropped while its approval was pending ends with that approval `stopped`, and a later decision on it is 409.
+2. (m6) In `stop_run`, do not publish `run.started` for `plan.resumed`. The run's terminal event follows, so the console no longer flickers to "running". Keep the ledger change; only the publish loop goes. Update any test that expects that event.
+3. (m7) `approval_stop_tests.rs` uses Task 5's shared fixtures from `test_support`.
 
 ---
 
@@ -7047,6 +7087,16 @@ git commit -m "feat(daemon): list pending and decided approvals and show them in
 ```
 
 Recommended implementer tier: standard (route and read-path plumbing with a merge whose paging edge cases are tested).
+
+#### Controller rulings from the pre-flight audit (binding)
+
+1. The README Approvals section added by this task also states these limits (one short paragraph each, plain language):
+   - (I2) **Limits.** A rule for an HTTP client, interpreter, shell, package runner, or git (or an `any` exec rule) lets the companion act as the owner on this machine, including changing its own approval policy and rules through the loopback API. Workspace writes are allowed by default, so `.git/config` or `package.json` can turn "Always allow `git status`" or "`npm test`" into arbitrary code. Keep exec rules narrow. Owner decision: README note plus UI warning (Tasks 11 and 12), no per-approval token.
+   - (I3) **Runs started elsewhere wait too.** With the default `exec: ask`, check-ins, jobs, Telegram, and CLI/API runs that call `bash`, `bg_start`, or `bg_stop` wait for a decision in the web console: 30 minutes (15 for Telegram-started runs), holding that automation, job lane, or chat meanwhile. The legacy `POST /api/agents/{id}/run` answers 408 after `ANIMAOS_RS_RUN_REQUEST_TIMEOUT` (600 s by default) while the approval keeps waiting, so a later Allow runs the command with nobody watching. For unattended shell work, set that agent's `exec` to `allow` or add a narrow rule.
+   - (m8) A decided approval can read "Allowed" for a tool that never ran (allowed, then the run was stopped before the call ran).
+   - (m13) A delegated specialist or peer is judged only by its own policy and rules. A companion with `exec: deny` can still have `bash` run by a specialist whose policy allows it; set the specialist's policy too.
+   - (m10) After a restart during a run, a call that was waiting for approval is listed among the tools that may have started, although it did not run.
+2. Post-M4 follow-up, recorded in the ledger and not built here (I3): tell Telegram and CLI users that an approval is waiting in the web console (not approving from Telegram, which is a non-goal).
 
 ---
 
@@ -8158,6 +8208,10 @@ git commit -m "feat(daemon): decide approvals and manage approval policies and r
 
 Recommended implementer tier: standard (route plumbing over tested state; the security surface is the owner check on every route, which the tests pin).
 
+#### Controller rulings from the pre-flight audit (binding)
+
+1. (I5) Replace the two `cargo check` runs in the dead-code step with `CARGO_INCREMENTAL=0 cargo test -p anima-daemon --no-run 2>&1 | grep -n "approvals/\|approval_state\|agent_runs/approvals\|routes/approvals"`. Expected: no output. This reuses the test profile's artifacts (disk), building the integration tests also builds the non-test lib so dead-code warnings show, and the match is on file paths, not the word "approval".
+
 ---
 
 ### Task 9: SDK approvals client and typed approval events
@@ -8745,6 +8799,10 @@ git commit -m "feat(sdk): add the approvals client and typed approval events"
 
 Recommended implementer tier: cheap (typed wrappers over routes with request-shape tests).
 
+#### Controller rulings from the pre-flight audit (binding)
+
+1. No audit finding changes this task. It ends with `bun x nx run @animaOS-SWARM/sdk:build` as planned.
+
 ---
 
 ### Task 10: Web live state: pending approvals per run
@@ -9171,6 +9229,10 @@ git commit -m "feat(web): track pending approvals per run from the event stream"
 ```
 
 Recommended implementer tier: standard (a pure reducer with tolerant ordering rules).
+
+#### Controller rulings from the pre-flight audit (binding)
+
+1. No audit finding changes this task.
 
 ---
 
@@ -9904,6 +9966,15 @@ git commit -m "feat(web): decide approvals from inline cards in the transcript"
 ```
 
 Recommended implementer tier: standard (a self-contained component with its own tests; the untrusted-text rendering is the part to review).
+
+#### Controller rulings from the pre-flight audit (binding)
+
+1. (I6) `ApprovalCard` takes a `canPersist` prop, true only when `approval.agentId` is the companion shown. When false, hide "Always allow" and show one line: "Rules for other agents are not managed here yet." Allow once, Allow for this session, and Deny stay.
+2. (I2) `lib/approvals.ts` exports `isBroadExecMatcher(riskClass, matcher)`: true for an exec-class matcher of kind `any`, or a `command_prefix` whose first word is on this list (a `*` suffix matches any version suffix, e.g. `python3`): `curl wget python* node bun deno ruby perl php sh bash zsh env sudo xargs npx bunx npm pnpm yarn make git cargo go docker ssh`. When the matcher a scoped decision would save is broad, the card shows one line next to the scoped buttons: "A rule this broad lets your companion run almost anything, including changing its own approval settings." Test the helper once in `lib/approvals.test.ts` and the warning once in the card test.
+3. (m3) Arguments render through a `revealHiddenCharacters` helper (in `lib/approvals.ts`, tested once) that turns U+200B–U+200F, U+202A–U+202E, U+2066–U+2069, and U+FEFF into visible `\u{…}` escapes. The output is still a text node inside `<pre>`.
+4. (m4) When `argumentsTruncated` is true, disable "Allow for this session" and "Always allow" with the hint "Arguments were cut; only Allow once or Deny." The owner cannot scope a rule on arguments they cannot fully see.
+5. (m14) Disable the same two buttons when the suggested matcher's kind is not `any` and its value is empty, so the card never reads 'starting with “”' and never sends a matcher the daemon rejects.
+6. (m7) Export one constant for `'Could not reach your companion. Try again.'` from `lib/approvals.ts`; Task 12's `useApprovals` imports it rather than repeating the literal.
 
 ---
 
@@ -11003,6 +11074,12 @@ git commit -m "feat(web): add the Approvals page with pending cards, rules, poli
 
 Recommended implementer tier: standard (a page over a hook with mocked daemon calls; watch for act() warnings from the async reads).
 
+#### Controller rulings from the pre-flight audit (binding)
+
+1. (I2) The Add-rule form shows the same one-line warning as the card when `isBroadExecMatcher` is true for the rule being added (Task 11's helper; no second list).
+2. (I6) The Rules section stays companion-only, consistent with Task 11 hiding "Always allow" for other agents' approvals. Listing every agent's rules is not built.
+3. (m7) `useApprovals` imports Task 11's unreachable-companion constant.
+
 ---
 
 ### Task 13: Web shell: the Approvals destination, badges, ⌘K additions, and wiring
@@ -11445,6 +11522,11 @@ git commit -m "feat(web): add the Approvals destination, approval badges, and th
 
 Recommended implementer tier: most capable (integration across the shell, the harness, and the shared stream, with the harness's large test suite to keep quiet).
 
+#### Controller rulings from the pre-flight audit (binding)
+
+1. (m12) If the sessions list already refetches on run lifecycle events through one event-type list or predicate, add `approval.requested` and `approval.resolved` to it, so a second approval in the same batch updates the row badge. If that needs more than a one-line change, leave it: the badge catches up within 30 s. Record which in the report.
+2. (m14) The ⌘K entry reads "Review tool approvals", so it isn't confused with a job's "Awaiting approval" status in Work.
+
 ---
 
 ### Task 14: M4 verification
@@ -11508,6 +11590,11 @@ git commit -m "docs: mark the M4 approvals milestone complete"
 
 Recommended implementer tier: the controller runs this task.
 
+#### Controller rulings from the pre-flight audit (binding)
+
+1. This machine runs Windows. Check disk with `df -h .` instead of `df -h /System/Volumes/Data`.
+2. Before the gate, confirm every ruling above is reflected in the code. List them in the final review's brief.
+
 ---
 
 ## Notes for the controller
@@ -11517,7 +11604,7 @@ Recommended implementer tier: the controller runs this task.
 - T4.1 (risk table, policy, rules, gate, waiter, timeouts, helper denial, restart expiry) → Tasks 1 (table, matchers, evaluation), 2 (records, registry, snapshot v7, restart expiry), 3 (settling: decisions, rules, allowances, run status), 5 (the gate and the waiting call in `execute_tool`, timeouts, helpers, live re-check), and 6 (Stop, abandoned waits, steers). T4.2 (routes and history) → Tasks 4 (history store and outbox), 7 (reads: snapshot, `pendingApprovals`, `GET /api/approvals`), and 8 (decision, policy, and rule routes). T4.3 (SDK, card, page, badges) → Tasks 9 (SDK), 10 (reducer), 11 (inline card), 12 (page), and 13 (destination, badges, ⌘K, wiring). Task 14 is the gate.
 - Master names kept: `hosts/rust-daemon/src/approvals/{mod.rs,policy.rs,gate.rs}`, `tools.rs`, `routes/approvals.rs`, `packages/sdk/src/approvals.ts`, `ApprovalCard.tsx` (in `components/sessions/`, next to the other transcript cards), `pages/ApprovalsPage.tsx` (a new `apps/web/src/pages/` folder later milestones' pages can share).
 - Files the master plan did not list: `approvals/registry.rs`, `state/approval_state.rs`, `agent_runs/{approvals.rs,approval_tests.rs,approval_stop_tests.rs}`, `routes/contracts/approvals.rs`, `routes/tests/approvals.rs`; web `lib/approvals.ts`, `hooks/useApprovals.ts` (spec §15.5 names it), `approvals.css`.
-- Order: 1 → 2 → 3 → 4 (4 needs 2's registry) → 5 (needs 3) → 6 (needs 5) → 7 (needs 4 and 5) → 8 (needs 7's module) → 9 (needs 7–8's JSON) → 10 → 11 → 12 → 13 → 14. Tasks 4 and 5 are independent of each other once 3 is in.
+- Order: 1 → 2 → 3 → 4 (4 needs 2's registry) → 5 (needs 3) → 6 (needs 5) → 7 (needs 4 and 5) → 8 (needs 7's module) → 9 (needs 7–8's JSON) → 10 → 11 → 12 → 13 → 14. Run strictly in this order: Task 5's `decide_approval` uses Task 4's `get_approval` (audit m1).
 
 **Carry-forwards (every item of `.superpowers/sdd/2026-09-23-companion-console-m4/carry-forwards.md`).**
 
@@ -11564,7 +11651,7 @@ Recommended implementer tier: the controller runs this task.
 
 - Concurrency (Tasks 5 and 6): the waiter's `select!`, the transaction ordering between a decision, the timeout, and a Stop, the oneshot fallback (`try_recv` after a settle that found the record already mirrored), and the stop's settle-then-save-then-wake-then-cancel order. The race tests hold the control-plane transaction to force each order; they rely on tokio's fair mutex and on 250 ms / 500 ms timings.
 - Self-approval through a broad rule: an owner who "always allows" `curl` (or any HTTP client) lets the model POST to the daemon's decision route from the same machine with a forged `Origin` header, since loopback owner authorization is origin-based. Approvals are the control for shell access (spec §1), so the plan does not add a decision nonce; the audit may want one (for example a per-approval token shown only in the UI) or a note in the README.
-- Behavior change for existing clients: `exec: ask` by default means a CLI, API, Telegram, schedule, or job run that calls `bash` now waits up to 30 (or 15) minutes for a web approval; a legacy `POST /run` caller with its own HTTP timeout may give up first (the run still waits). The one M3 test that runs `bash` is updated; others use read, write, or delegate tools. Telegram's connector handles one message at a time, so a pending approval also holds that chat for up to 15 minutes.
-- Rollback: an M3 binary refuses the version-7 snapshot; downgrading needs `.pre-approvals.bak` (or the `control_plane.backup.6` row), and M10's upgrade notes should say so.
+- Behavior change for existing clients: `exec: ask` by default means a CLI, API, Telegram, schedule, or job run that calls `bash` now waits up to 30 (or 15) minutes for a web approval; the legacy `POST /api/agents/{id}/run` route itself answers 408 after `run_request_timeout` (600 s) while the approval still waits (audit I3; documented in Task 7's README copy). The one M3 test that runs `bash` is updated; others use read, write, or delegate tools. Telegram's connector handles one message at a time, so a pending approval also holds that chat for up to 15 minutes.
+- Rollback: an M3 binary refuses the version-7 snapshot; downgrading needs `.pre-approvals.bak` (or the `control_plane.backup.6` row); Task 2 documents this in the daemon README (audit I4).
 - Size: Task 5 is the largest (about 1,800 plan lines, 16 tests); Task 13 touches `ViewHarness.tsx` with four props and adds one harness test.
 - The Postgres approval SQL (`$1::text IS NULL`, `$3::bigint IS NULL`) is only hand-checked.
