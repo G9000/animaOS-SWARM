@@ -862,41 +862,54 @@ async fn a_decision_whose_caller_leaves_is_still_saved_announced_and_woken() {
 
 #[tokio::test]
 async fn a_lost_wake_up_is_not_a_timeout() {
-    let model = ScriptedModel::new(vec![
-        Step::Tools(vec![remember_call("call-1", "the plan")]),
-        Step::Text(vec!["ok"]),
-    ]);
+    // A deadline no test machine reaches: the wait is ended by the stop.
     let timeouts = ApprovalTimeouts {
-        default: Duration::from_secs(2),
-        telegram: Duration::from_secs(2),
+        default: Duration::from_secs(60),
+        telegram: Duration::from_secs(60),
     };
-    let (coordinator, agent_id) = approving_coordinator(model, ask_before_writes(), timeouts).await;
-    let running = spawn_run(
-        &coordinator,
-        chat_request(&agent_id, "chat:ask", "remember"),
-    );
+    let (coordinator, agent_id) =
+        approving_coordinator(ScriptedModel::new(vec![]), ask_before_writes(), timeouts).await;
+    let agent = coordinator
+        .state
+        .read()
+        .await
+        .get_agent(&agent_id)
+        .unwrap()
+        .state;
+    let run = ledger_run(&coordinator, &agent_id, "room-woken").await;
+    let cancel = CancelSignal::new();
+    let context = gated_context(&coordinator, &run, cancel.clone()).await;
+    let calling = tokio::spawn(async move {
+        let input = tool_input(&agent.id, "room-woken");
+        context
+            .execute_tool(agent, input, remember_call("call-1", "x"))
+            .await
+    });
     let pending = pending_approvals(&coordinator, 1).await.remove(0);
 
-    // The wake-up is dropped unsent; the call keeps waiting.
+    // The wake-up is dropped unsent; the call keeps waiting rather than
+    // settling the request as timed out.
     coordinator.forget_approval_waiter(&pending.id);
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_still_waiting(&coordinator, &agent_id, &pending).await;
-    assert!(!running.is_finished());
+    assert!(!calling.is_finished());
 
-    // Nobody hears this allow, so the deadline finds it and the call runs.
-    coordinator
-        .decide_approval(&pending.id, decision(ApprovalDecisionKind::AllowOnce, 1))
+    // The stop still ends the wait, and settles it as stopped.
+    cancel.cancel();
+    let result = tokio::time::timeout(Duration::from_secs(5), calling)
         .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), running)
-        .await
-        .expect("the deadline ends the wait")
-        .unwrap()
+        .expect("the stop ends the wait")
         .unwrap();
     assert_eq!(
-        tool_results(&coordinator, &agent_id).await,
-        ["stored memory: the plan"]
+        result.error.as_deref(),
+        Some(anima_core::CANCELLED_TOOL_RESULT)
     );
+    let guard = coordinator.state.read().await;
+    assert_eq!(
+        guard.approvals.get(&pending.id).unwrap().status,
+        ApprovalStatus::Stopped
+    );
+    assert!(guard.approvals.rules_for(&agent_id).is_empty());
 }
 
 #[tokio::test]
@@ -937,6 +950,80 @@ async fn a_tool_the_agent_lost_during_the_wait_does_not_run() {
             },
         )
         .unwrap();
+    coordinator
+        .decide_approval(&pending.id, decision(ApprovalDecisionKind::AllowOnce, 1))
+        .await
+        .unwrap();
+
+    let result = calling.await.unwrap();
+    assert_eq!(
+        result.error.as_deref(),
+        Some(anima_core::tool_not_configured_error("memory_add").as_str())
+    );
+}
+
+#[tokio::test]
+async fn an_approved_tool_the_run_added_to_the_agent_runs() {
+    // `broadcast_message` is not in the companion's own configuration; every
+    // run that is not delegated adds it.
+    let broadcast = anima_core::ToolCall {
+        id: "call-1".into(),
+        name: "broadcast_message".into(),
+        args: std::collections::BTreeMap::from([(
+            "message".to_string(),
+            anima_core::DataValue::String("hello".into()),
+        )]),
+    };
+    let model = ScriptedModel::new(vec![Step::Tools(vec![broadcast]), Step::Text(vec!["Sent"])]);
+    let ask_before_delegating =
+        ApprovalPolicy::default().with(RiskClass::Delegate, PolicyAction::Ask);
+    let (coordinator, agent_id) =
+        approving_coordinator(model, ask_before_delegating, patient()).await;
+    assert!(!coordinator.state.read().await.agents[&agent_id]
+        .config()
+        .allows_tool("broadcast_message"));
+    let running = spawn_run(
+        &coordinator,
+        chat_request(&agent_id, "chat:ask", "say hello"),
+    );
+    let pending = pending_approvals(&coordinator, 1).await.remove(0);
+    assert_eq!(pending.tool, "broadcast_message");
+
+    coordinator
+        .decide_approval(&pending.id, decision(ApprovalDecisionKind::AllowOnce, 1))
+        .await
+        .unwrap();
+
+    running.await.unwrap().unwrap();
+    assert_eq!(
+        only_result(&coordinator, &agent_id).await,
+        r#"{"deliveries":[]}"#
+    );
+}
+
+#[tokio::test]
+async fn an_agent_removed_during_the_wait_does_not_run_its_tool() {
+    let (coordinator, agent_id) =
+        approving_coordinator(ScriptedModel::new(vec![]), ask_before_writes(), patient()).await;
+    let agent = coordinator
+        .state
+        .read()
+        .await
+        .get_agent(&agent_id)
+        .unwrap()
+        .state;
+    let run = ledger_run(&coordinator, &agent_id, "room-removed").await;
+    let context = gated_context(&coordinator, &run, CancelSignal::new()).await;
+    let calling = tokio::spawn(async move {
+        let input = tool_input(&agent.id, "room-removed");
+        context
+            .execute_tool(agent, input, remember_call("call-1", "x"))
+            .await
+    });
+    let pending = pending_approvals(&coordinator, 1).await.remove(0);
+
+    // While the call waits, the owner deletes the agent.
+    coordinator.state.write().await.remove_agent(&agent_id);
     coordinator
         .decide_approval(&pending.id, decision(ApprovalDecisionKind::AllowOnce, 1))
         .await

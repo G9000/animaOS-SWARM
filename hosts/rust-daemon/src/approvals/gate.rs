@@ -106,6 +106,17 @@ pub(crate) fn denial_text(note: Option<&str>) -> String {
     }
 }
 
+/// Whether an approved call lost its permission while it waited: the agent
+/// is gone, or its own configuration listed the tool when it asked and no
+/// longer does. A tool its configuration never listed was added for the run
+/// (the peer and team tools); the run's live checks judge that one.
+fn lost_during_wait(configured_then: Option<bool>, configured_now: Option<bool>) -> bool {
+    match configured_now {
+        None => true,
+        Some(now) => configured_then == Some(true) && !now,
+    }
+}
+
 /// What `execute_tool` does with a call once the gate has judged it.
 pub(crate) enum GateOutcome {
     /// Allowed without asking: dispatch.
@@ -171,6 +182,12 @@ impl ApprovalGate {
             call: call.clone(),
             timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
         };
+        // What the agent's own configuration said when it asked, for the
+        // check after an approval.
+        let configured = self
+            .coordinator
+            .configured_tool(&agent.id, &call.name)
+            .await;
         let pending = match self.coordinator.open_approval(ask).await {
             Ok(pending) => pending,
             Err(refused) => return GateOutcome::Refuse(refused),
@@ -182,10 +199,12 @@ impl ApprovalGate {
         // The owner may have changed the agent during the wait: what runs is
         // what the agent allows now, not what it allowed when it asked.
         if matches!(outcome, GateOutcome::Approved)
-            && !self
-                .coordinator
-                .agent_still_allows(&agent.id, &call.name)
-                .await
+            && lost_during_wait(
+                configured,
+                self.coordinator
+                    .configured_tool(&agent.id, &call.name)
+                    .await,
+            )
         {
             return GateOutcome::Refuse(TaskResult::error(
                 tool_not_configured_error(&call.name),
@@ -327,6 +346,22 @@ mod tests {
         waiters.forget("apr_2");
         waiters.wake(&approval("apr_2"));
         assert!(forgotten.try_recv().is_err());
+    }
+
+    #[test]
+    fn an_approval_is_lost_with_the_agent_or_with_a_configured_tool_only() {
+        assert!(lost_during_wait(Some(true), None), "the agent is gone");
+        assert!(lost_during_wait(Some(false), None), "the agent is gone");
+        assert!(
+            lost_during_wait(Some(true), Some(false)),
+            "the tool was removed"
+        );
+        assert!(!lost_during_wait(Some(true), Some(true)));
+        assert!(
+            !lost_during_wait(Some(false), Some(false)),
+            "a tool added for the run"
+        );
+        assert!(!lost_during_wait(Some(false), Some(true)));
     }
 
     #[test]

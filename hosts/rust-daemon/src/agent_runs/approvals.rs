@@ -44,16 +44,16 @@ impl AgentRunCoordinator {
             .approval_verdict(agent, session_id, call)
     }
 
-    /// Whether `agent_id` still exists and may use `tool` as it is configured
-    /// now. An approval can take minutes, and the owner may change or remove
-    /// the agent meanwhile.
-    pub(crate) async fn agent_still_allows(&self, agent_id: &str, tool: &str) -> bool {
+    /// Whether `agent_id`'s own configuration lists `tool`, or `None` once the
+    /// agent is gone. A run uses a copy of it that may add tools (the peer and
+    /// team tools), so this alone does not say whether the run may call one.
+    pub(crate) async fn configured_tool(&self, agent_id: &str, tool: &str) -> Option<bool> {
         self.state
             .read()
             .await
             .agents
             .get(agent_id)
-            .is_some_and(|runtime| runtime.config().allows_tool(tool))
+            .map(|runtime| runtime.config().allows_tool(tool))
     }
 
     /// How long a run from `source` waits for the owner (spec §7.3).
