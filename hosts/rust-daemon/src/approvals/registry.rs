@@ -471,6 +471,12 @@ impl ApprovalRegistry {
                     approval.id
                 ));
             }
+            if approval.revision == 0 || approval.is_pending() != approval.resolution.is_none() {
+                return Err(format!(
+                    "approval '{}' has a revision or resolution that does not fit its status",
+                    approval.id
+                ));
+            }
         }
         let mut agents = HashSet::new();
         for entry in policies {
@@ -483,10 +489,10 @@ impl ApprovalRegistry {
         }
         let mut rule_ids = HashSet::new();
         for rule in rules {
-            if rule.id.trim().is_empty()
-                || rule.agent_id.trim().is_empty()
-                || !rule_ids.insert(rule.id.as_str())
-            {
+            if rule.agent_id.trim().is_empty() {
+                return Err(format!("approval rule '{}' has an empty agent id", rule.id));
+            }
+            if rule.id.trim().is_empty() || !rule_ids.insert(rule.id.as_str()) {
                 return Err(format!(
                     "duplicate or empty approval rule id in snapshot: {}",
                     rule.id
@@ -840,6 +846,20 @@ mod tests {
         let duplicate = rule("rule_1", "agent-1", 1);
         assert!(ApprovalRegistry::validate(&[], &[], &[duplicate.clone(), duplicate]).is_err());
         assert!(ApprovalRegistry::validate(&[one], &[], &[rule("rule_1", "agent-1", 1)]).is_ok());
+    }
+
+    #[test]
+    fn validation_rejects_a_status_its_revision_or_resolution_does_not_fit() {
+        let mut no_revision = request("apr_1", "agent-1", "chat:a", "run_1", 1);
+        no_revision.revision = 0;
+        assert!(ApprovalRegistry::validate(&[no_revision], &[], &[]).is_err());
+        let mut allowed_without_resolution = request("apr_2", "agent-1", "chat:a", "run_1", 1);
+        allowed_without_resolution.status = ApprovalStatus::Allowed;
+        assert!(ApprovalRegistry::validate(&[allowed_without_resolution], &[], &[]).is_err());
+        let mut ownerless = rule("rule_1", "agent-1", 1);
+        ownerless.agent_id = " ".into();
+        let error = ApprovalRegistry::validate(&[], &[], &[ownerless]).unwrap_err();
+        assert!(error.contains("empty agent id"), "{error}");
     }
 
     #[test]

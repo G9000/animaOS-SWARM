@@ -2008,6 +2008,10 @@ impl DaemonState {
             &self.live_agent_ids(),
             anima_core::primitives::now_millis(),
         );
+        // A deleted session's approvals never reach the history store.
+        let sessions = &self.sessions;
+        self.approvals
+            .retain_decided(|approval| sessions.contains(&approval.agent_id, &approval.session_id));
 
         if relabelled_messages > 0 || relabelled_runs > 0 || mapped_runs > 0 {
             info!(
