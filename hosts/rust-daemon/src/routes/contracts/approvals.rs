@@ -3,7 +3,10 @@
 use serde::Serialize;
 use utoipa::ToSchema;
 
-use crate::approvals::{matcher_kinds, ApprovalMatcher, ApprovalRequest, ApprovalResolution};
+use crate::approvals::{
+    matcher_kinds, ApprovalMatcher, ApprovalPolicy, ApprovalRequest, ApprovalResolution,
+    ApprovalRule,
+};
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -117,4 +120,87 @@ pub(crate) struct ApprovalsEnvelope {
     pub(crate) approvals: Vec<ApprovalResponse>,
     /// `decided` only: pass it as `cursor` for the next, older page.
     pub(crate) next_cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ApprovalEnvelope {
+    pub(crate) approval: ApprovalResponse,
+}
+
+/// What each class does: `allow`, `ask`, or `deny` (spec §7.2).
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ApprovalPolicyResponse {
+    pub(crate) write: String,
+    pub(crate) exec: String,
+    pub(crate) network: String,
+    pub(crate) delegate: String,
+}
+
+impl From<&ApprovalPolicy> for ApprovalPolicyResponse {
+    fn from(policy: &ApprovalPolicy) -> Self {
+        Self {
+            write: policy.write.as_str().into(),
+            exec: policy.exec.as_str().into(),
+            network: policy.network.as_str().into(),
+            delegate: policy.delegate.as_str().into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ApprovalPolicyEnvelope {
+    pub(crate) policy: ApprovalPolicyResponse,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ApprovalRuleResponse {
+    pub(crate) id: String,
+    pub(crate) agent_id: String,
+    pub(crate) tool: String,
+    pub(crate) matcher: ApprovalMatcherResponse,
+    pub(crate) created_at_ms: u64,
+    /// The approval whose "Always allow" created it; `null` for one the
+    /// owner added on the Approvals page.
+    pub(crate) from_approval_id: Option<String>,
+}
+
+impl From<&ApprovalRule> for ApprovalRuleResponse {
+    fn from(rule: &ApprovalRule) -> Self {
+        Self {
+            id: rule.id.clone(),
+            agent_id: rule.agent_id.clone(),
+            tool: rule.tool.clone(),
+            matcher: ApprovalMatcherResponse::from(&rule.matcher),
+            created_at_ms: rule.created_at_ms,
+            from_approval_id: rule.from_approval_id.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ApprovalRuleEnvelope {
+    pub(crate) rule: ApprovalRuleResponse,
+}
+
+/// A tool a rule can cover.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ApprovalToolResponse {
+    pub(crate) name: String,
+    /// `write`, `exec`, `network`, or `delegate`.
+    pub(crate) class: String,
+    pub(crate) matcher_kinds: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ApprovalRulesEnvelope {
+    pub(crate) rules: Vec<ApprovalRuleResponse>,
+    /// Every registered tool that is not read class, by name.
+    pub(crate) tools: Vec<ApprovalToolResponse>,
 }

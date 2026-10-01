@@ -173,7 +173,9 @@ use crate::runtime_model::provider_summaries;
         sessions::compact_session,
         events::agent_events,
         runs::start_session_run, runs::list_session_runs, runs::get_run, runs::stop_run,
-        approvals::list_approvals,
+        approvals::list_approvals, approvals::decide_approval, approvals::get_approval_policy,
+        approvals::put_approval_policy, approvals::list_approval_rules, approvals::create_approval_rule,
+        approvals::delete_approval_rule,
     ),
     components(schemas(self::contracts::AgentSummariesEnvelope)),
     tags(
@@ -518,6 +520,22 @@ fn router_with_services_with_policies(
             axum::routing::post(runs::stop_run),
         )
         .route("/api/approvals", get(approvals::list_approvals))
+        .route(
+            "/api/approvals/{approval_id}/decision",
+            axum::routing::post(approvals::decide_approval),
+        )
+        .route(
+            "/api/agents/{agent_id}/approval-policy",
+            get(approvals::get_approval_policy).put(approvals::put_approval_policy),
+        )
+        .route(
+            "/api/agents/{agent_id}/approval-rules",
+            get(approvals::list_approval_rules).post(approvals::create_approval_rule),
+        )
+        .route(
+            "/api/agents/{agent_id}/approval-rules/{rule_id}",
+            axum::routing::delete(approvals::delete_approval_rule),
+        )
         .route("/api/ready", get(ready_entry))
         .route(
             "/api/workspace",

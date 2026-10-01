@@ -1,7 +1,6 @@
 //! Approval state changes (spec §7.3), made under the control-plane
 //! transaction and the state write lock: opening a request, settling it,
 //! and putting either back when its save fails. Nothing here awaits.
-#![allow(dead_code)] // M4 Task 8 removes this once the gate and the routes use every item.
 
 use anima_core::{AgentState, Content, TaskResult, ToolCall, CANCELLED_TOOL_RESULT};
 

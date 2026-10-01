@@ -19,7 +19,6 @@ use crate::state::{ApprovalAsk, OwnerDecision, SettleRefusal, Settlement};
 
 /// A decided approval: the same owner decision again is answered with it
 /// (spec §7.3, idempotent); anything else conflicts.
-#[allow(dead_code)] // M4 Task 8's decision route calls `decide_approval`.
 fn replay_or_conflict(
     record: ApprovalRequest,
     decision: &OwnerDecision,
@@ -191,7 +190,6 @@ impl AgentRunCoordinator {
     /// The owner's decision (spec §7.3): saved before its waiter is woken; a
     /// failed save changes nothing (503). The same decision again answers
     /// with the record, from the history store once it moved there.
-    #[allow(dead_code)] // M4 Task 8's decision route calls it.
     pub(crate) async fn decide_approval(
         &self,
         id: &str,
@@ -215,7 +213,6 @@ impl AgentRunCoordinator {
         }
     }
 
-    #[allow(dead_code)] // M4 Task 8's decision route calls `decide_approval`.
     async fn decide_approval_to_the_end(
         &self,
         id: &str,

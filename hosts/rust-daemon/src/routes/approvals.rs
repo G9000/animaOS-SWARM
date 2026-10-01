@@ -5,19 +5,31 @@
 use std::collections::HashMap;
 
 use anima_core::primitives::now_millis;
-use axum::extract::{Request, State};
+use axum::extract::{Path, Request, State};
 use axum::http::{StatusCode, Uri};
 use axum::response::Response;
 
-use super::contracts::{ApprovalResponse, ApprovalsEnvelope, ErrorBody};
+use super::contracts::{
+    ApprovalEnvelope, ApprovalPolicyEnvelope, ApprovalPolicyResponse, ApprovalResponse,
+    ApprovalRuleEnvelope, ApprovalRuleResponse, ApprovalRulesEnvelope, ApprovalToolResponse,
+    ApprovalsEnvelope, DeleteResponse, ErrorBody,
+};
 use super::http::{json_response, request_query};
-use super::jobs::{authorize, no_store};
+use super::jobs::{authorize, body, no_store};
 use super::sessions::rejected;
 use super::{ApiError, AppState};
+use crate::agent_runs::{config_helper_parent, is_helper_config};
 use crate::approvals::{
-    ApprovalRequest, DECIDED_APPROVAL_WINDOW_MS, DEFAULT_APPROVAL_PAGE, MAX_APPROVAL_PAGE,
+    matcher_kinds, risk_class, validate_matcher, ApprovalDecisionKind, ApprovalMatcher,
+    ApprovalPolicy, ApprovalRequest, ApprovalRule, MatcherKind, PolicyAction, RiskClass,
+    DECIDED_APPROVAL_WINDOW_MS, DEFAULT_APPROVAL_PAGE, HELPERS_USE_COMPANION_APPROVALS,
+    MAX_APPROVAL_PAGE, READ_TOOLS_NEED_NO_RULE, UNKNOWN_RULE_TOOL,
 };
 use crate::history::ApprovalPageQuery;
+use crate::state::OwnerDecision;
+use crate::tools::ToolRegistry;
+use serde::Deserialize;
+use utoipa::ToSchema;
 
 const STATUS_INVALID: &str = "status must be pending or decided";
 const CURSOR_INVALID: &str = "cursor is not valid";
@@ -180,5 +192,364 @@ pub(super) async fn list_approvals(State(state): State<AppState>, request: Reque
             approvals: approvals.iter().map(ApprovalResponse::from).collect(),
             next_cursor,
         },
+    ))
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub(super) struct MatcherRequest {
+    kind: MatcherKind,
+    /// Ignored for `any`.
+    #[serde(default)]
+    value: String,
+}
+
+impl From<MatcherRequest> for ApprovalMatcher {
+    fn from(matcher: MatcherRequest) -> Self {
+        Self {
+            kind: matcher.kind,
+            value: matcher.value,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct DecisionRequest {
+    decision: ApprovalDecisionKind,
+    /// At most 1,000 characters; a denial's reaches the model.
+    #[serde(default)]
+    note: Option<String>,
+    /// For `allow_session` and `allow_always`; the suggestion when absent.
+    #[serde(default)]
+    matcher: Option<MatcherRequest>,
+    /// The approval's current revision.
+    revision: u64,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub(super) struct PolicyRequest {
+    write: PolicyAction,
+    exec: PolicyAction,
+    network: PolicyAction,
+    delegate: PolicyAction,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RuleRequest {
+    tool: String,
+    matcher: MatcherRequest,
+}
+
+#[utoipa::path(post, path = "/api/approvals/{approval_id}/decision", tag = "approvals",
+    params(("approval_id" = String, Path)),
+    request_body = DecisionRequest,
+    responses(
+        (status = 200, description = "The approval as decided; the same decision again returns it unchanged", body = ApprovalEnvelope),
+        (status = 400, description = "An invalid body, a note over 1,000 characters, or a matcher that does not fit the tool", body = ErrorBody),
+        (status = 403, description = "Local owner required", body = ErrorBody),
+        (status = 404, description = "No such approval", body = ErrorBody),
+        (status = 409, description = "Resolved another way already (another decision, the timeout, a Stop, or a restart), a stale revision, a full rule or allowance list, or a session that no longer exists", body = ErrorBody),
+        (status = 503, description = "The decision could not be saved, or the history store cannot be read", body = ErrorBody)
+    ))]
+pub(super) async fn decide_approval(
+    State(state): State<AppState>,
+    Path(approval_id): Path<String>,
+    request: Request,
+) -> Response {
+    if let Err(response) = authorize(&state, &request, false) {
+        return response;
+    }
+    let input: DecisionRequest = match body(&state, request).await {
+        Ok(input) => input,
+        Err(response) => return response,
+    };
+    let decision = OwnerDecision {
+        kind: input.decision,
+        note: input.note,
+        matcher: input.matcher.map(ApprovalMatcher::from),
+        revision: input.revision,
+    };
+    match state
+        .agent_runs
+        .decide_approval(&approval_id, decision)
+        .await
+    {
+        Ok(approval) => no_store(json_response(
+            StatusCode::OK,
+            &ApprovalEnvelope {
+                approval: ApprovalResponse::from(&approval),
+            },
+        )),
+        Err(error) => rejected(error),
+    }
+}
+
+#[utoipa::path(get, path = "/api/agents/{agent_id}/approval-policy", tag = "approvals",
+    params(("agent_id" = String, Path)),
+    responses(
+        (status = 200, description = "The agent's policy (a helper's is its companion's)", body = ApprovalPolicyEnvelope),
+        (status = 403, description = "Local owner required", body = ErrorBody),
+        (status = 404, description = "Agent not found", body = ErrorBody)
+    ))]
+pub(super) async fn get_approval_policy(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+    request: Request,
+) -> Response {
+    if let Err(response) = authorize(&state, &request, true) {
+        return response;
+    }
+    let guard = state.daemon.read().await;
+    let Some(runtime) = guard.agents.get(&agent_id) else {
+        return rejected(ApiError::not_found());
+    };
+    let owner = config_helper_parent(runtime.config())
+        .unwrap_or(&agent_id)
+        .to_string();
+    let policy = guard.approvals.policy(&owner);
+    no_store(json_response(
+        StatusCode::OK,
+        &ApprovalPolicyEnvelope {
+            policy: ApprovalPolicyResponse::from(&policy),
+        },
+    ))
+}
+
+#[utoipa::path(put, path = "/api/agents/{agent_id}/approval-policy", tag = "approvals",
+    params(("agent_id" = String, Path)),
+    request_body = PolicyRequest,
+    responses(
+        (status = 200, description = "The policy, saved", body = ApprovalPolicyEnvelope),
+        (status = 400, description = "An invalid body: all four classes are required", body = ErrorBody),
+        (status = 403, description = "Local owner required", body = ErrorBody),
+        (status = 404, description = "Agent not found", body = ErrorBody),
+        (status = 409, description = "A helper, which uses its companion's policy", body = ErrorBody),
+        (status = 503, description = "The policy could not be saved; the old one stays", body = ErrorBody)
+    ))]
+pub(super) async fn put_approval_policy(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+    request: Request,
+) -> Response {
+    if let Err(response) = authorize(&state, &request, false) {
+        return response;
+    }
+    let input: PolicyRequest = match body(&state, request).await {
+        Ok(input) => input,
+        Err(response) => return response,
+    };
+    let policy = ApprovalPolicy {
+        write: input.write,
+        exec: input.exec,
+        network: input.network,
+        delegate: input.delegate,
+    };
+    let transaction = state.agent_runs.control_plane_transaction().await;
+    let (previous, persist) = {
+        let mut guard = state.daemon.write().await;
+        match guard.agents.get(&agent_id) {
+            None => return rejected(ApiError::not_found()),
+            Some(runtime) if is_helper_config(runtime.config()) => {
+                return rejected(ApiError::conflict(HELPERS_USE_COMPANION_APPROVALS))
+            }
+            Some(_) => {}
+        }
+        let previous = guard.approvals.set_policy(&agent_id, policy);
+        (previous, guard.control_plane_persist_request())
+    };
+    if let Err(error) = persist.save().await {
+        state
+            .daemon
+            .write()
+            .await
+            .approvals
+            .restore_policy(&agent_id, previous);
+        return rejected(ApiError::service_unavailable(error.to_string()));
+    }
+    drop(transaction);
+    no_store(json_response(
+        StatusCode::OK,
+        &ApprovalPolicyEnvelope {
+            policy: ApprovalPolicyResponse::from(&policy),
+        },
+    ))
+}
+
+/// Every registered tool a rule can cover (all but the read class), by name.
+fn rule_tools(registry: &ToolRegistry) -> Vec<ApprovalToolResponse> {
+    registry
+        .tool_names()
+        .into_iter()
+        .filter(|name| risk_class(name) != RiskClass::Read)
+        .map(|name| ApprovalToolResponse {
+            class: risk_class(&name).as_str().into(),
+            matcher_kinds: matcher_kinds(&name)
+                .iter()
+                .map(|kind| kind.as_str().to_string())
+                .collect(),
+            name,
+        })
+        .collect()
+}
+
+#[utoipa::path(get, path = "/api/agents/{agent_id}/approval-rules", tag = "approvals",
+    params(("agent_id" = String, Path)),
+    responses(
+        (status = 200, description = "The agent's rules, oldest first (a helper's are its companion's), and the tools a rule can cover", body = ApprovalRulesEnvelope),
+        (status = 403, description = "Local owner required", body = ErrorBody),
+        (status = 404, description = "Agent not found", body = ErrorBody)
+    ))]
+pub(super) async fn list_approval_rules(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+    request: Request,
+) -> Response {
+    if let Err(response) = authorize(&state, &request, true) {
+        return response;
+    }
+    let guard = state.daemon.read().await;
+    let Some(runtime) = guard.agents.get(&agent_id) else {
+        return rejected(ApiError::not_found());
+    };
+    let owner = config_helper_parent(runtime.config())
+        .unwrap_or(&agent_id)
+        .to_string();
+    no_store(json_response(
+        StatusCode::OK,
+        &ApprovalRulesEnvelope {
+            rules: guard
+                .approvals
+                .rules_for(&owner)
+                .into_iter()
+                .map(ApprovalRuleResponse::from)
+                .collect(),
+            tools: rule_tools(&guard.tool_registry),
+        },
+    ))
+}
+
+#[utoipa::path(post, path = "/api/agents/{agent_id}/approval-rules", tag = "approvals",
+    params(("agent_id" = String, Path)),
+    request_body = RuleRequest,
+    responses(
+        (status = 201, description = "The rule, saved", body = ApprovalRuleEnvelope),
+        (status = 200, description = "The agent already had this exact rule", body = ApprovalRuleEnvelope),
+        (status = 400, description = "An invalid body, an unknown or read-class tool, or a matcher that does not fit the tool", body = ErrorBody),
+        (status = 403, description = "Local owner required", body = ErrorBody),
+        (status = 404, description = "Agent not found", body = ErrorBody),
+        (status = 409, description = "A helper, or the agent already has 100 rules", body = ErrorBody),
+        (status = 503, description = "The rule could not be saved", body = ErrorBody)
+    ))]
+pub(super) async fn create_approval_rule(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+    request: Request,
+) -> Response {
+    if let Err(response) = authorize(&state, &request, false) {
+        return response;
+    }
+    let input: RuleRequest = match body(&state, request).await {
+        Ok(input) => input,
+        Err(response) => return response,
+    };
+    let tool = input.tool.trim().to_string();
+    let transaction = state.agent_runs.control_plane_transaction().await;
+    let (rule, persist) = {
+        let mut guard = state.daemon.write().await;
+        match guard.agents.get(&agent_id) {
+            None => return rejected(ApiError::not_found()),
+            Some(runtime) if is_helper_config(runtime.config()) => {
+                return rejected(ApiError::conflict(HELPERS_USE_COMPANION_APPROVALS))
+            }
+            Some(_) => {}
+        }
+        if guard.tool_registry.lookup(&tool).is_none() {
+            return rejected(ApiError::bad_request_static(UNKNOWN_RULE_TOOL));
+        }
+        if risk_class(&tool) == RiskClass::Read {
+            return rejected(ApiError::bad_request_static(READ_TOOLS_NEED_NO_RULE));
+        }
+        let matcher = match validate_matcher(&tool, &ApprovalMatcher::from(input.matcher)) {
+            Ok(matcher) => matcher,
+            Err(message) => return rejected(ApiError::bad_request_static(message)),
+        };
+        if let Some(existing) = guard.approvals.find_rule(&agent_id, &tool, &matcher) {
+            return no_store(json_response(
+                StatusCode::OK,
+                &ApprovalRuleEnvelope {
+                    rule: ApprovalRuleResponse::from(existing),
+                },
+            ));
+        }
+        let rule = ApprovalRule {
+            id: format!("rule_{}", uuid::Uuid::new_v4()),
+            agent_id: agent_id.clone(),
+            tool,
+            matcher,
+            created_at_ms: now_millis(),
+            from_approval_id: None,
+        };
+        if let Err(message) = guard.approvals.add_rule(rule.clone()) {
+            return rejected(ApiError::conflict(message));
+        }
+        (rule, guard.control_plane_persist_request())
+    };
+    if let Err(error) = persist.save().await {
+        state
+            .daemon
+            .write()
+            .await
+            .approvals
+            .remove_rule(&agent_id, &rule.id);
+        return rejected(ApiError::service_unavailable(error.to_string()));
+    }
+    drop(transaction);
+    no_store(json_response(
+        StatusCode::CREATED,
+        &ApprovalRuleEnvelope {
+            rule: ApprovalRuleResponse::from(&rule),
+        },
+    ))
+}
+
+#[utoipa::path(delete, path = "/api/agents/{agent_id}/approval-rules/{rule_id}", tag = "approvals",
+    params(("agent_id" = String, Path), ("rule_id" = String, Path)),
+    responses(
+        (status = 200, description = "The rule is gone", body = DeleteResponse),
+        (status = 403, description = "Local owner required", body = ErrorBody),
+        (status = 404, description = "Agent or rule not found", body = ErrorBody),
+        (status = 503, description = "The removal could not be saved; the rule stays", body = ErrorBody)
+    ))]
+pub(super) async fn delete_approval_rule(
+    State(state): State<AppState>,
+    Path((agent_id, rule_id)): Path<(String, String)>,
+    request: Request,
+) -> Response {
+    if let Err(response) = authorize(&state, &request, false) {
+        return response;
+    }
+    let transaction = state.agent_runs.control_plane_transaction().await;
+    let (removed, persist) = {
+        let mut guard = state.daemon.write().await;
+        if !guard.agents.contains_key(&agent_id) {
+            return rejected(ApiError::not_found());
+        }
+        let Some(removed) = guard.approvals.remove_rule(&agent_id, &rule_id) else {
+            return rejected(ApiError::not_found());
+        };
+        (removed, guard.control_plane_persist_request())
+    };
+    if let Err(error) = persist.save().await {
+        // The removal left room, so putting it back cannot hit the cap.
+        let _ = state.daemon.write().await.approvals.add_rule(removed);
+        return rejected(ApiError::service_unavailable(error.to_string()));
+    }
+    drop(transaction);
+    no_store(json_response(
+        StatusCode::OK,
+        &DeleteResponse { deleted: true },
     ))
 }

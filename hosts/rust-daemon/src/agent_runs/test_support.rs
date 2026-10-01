@@ -425,7 +425,6 @@ pub(crate) async fn quiet_for(subscription: &mut LiveSubscription) -> Vec<serde_
 }
 
 /// A `memory_add` call (write class, spec §7.1) storing `text`.
-#[allow(dead_code)] // M4 Task 8 removes this.
 pub(crate) fn remember_call(id: &str, text: &str) -> ToolCall {
     ToolCall {
         id: id.into(),
@@ -485,7 +484,6 @@ pub(crate) async fn gated_context(
 
 /// Waits (up to five seconds) until at least `count` approvals are pending;
 /// returns them oldest first.
-#[allow(dead_code)] // M4 Task 8 removes this.
 pub(crate) async fn pending_approvals(
     coordinator: &AgentRunCoordinator,
     count: usize,
@@ -509,7 +507,6 @@ pub(crate) async fn pending_approvals(
 }
 
 /// The owner's `kind` at `revision`, without a note or a matcher.
-#[allow(dead_code)] // M4 Task 8 removes this.
 pub(crate) fn decision(kind: ApprovalDecisionKind, revision: u64) -> OwnerDecision {
     OwnerDecision {
         kind,
@@ -520,7 +517,6 @@ pub(crate) fn decision(kind: ApprovalDecisionKind, revision: u64) -> OwnerDecisi
 }
 
 /// The texts of `agent_id`'s committed tool results, oldest first.
-#[allow(dead_code)] // M4 Task 8 removes this.
 pub(crate) async fn tool_results(coordinator: &AgentRunCoordinator, agent_id: &str) -> Vec<String> {
     coordinator.state.read().await.agents[agent_id]
         .messages()
@@ -532,7 +528,6 @@ pub(crate) async fn tool_results(coordinator: &AgentRunCoordinator, agent_id: &s
 
 /// A running ledger run of `agent_id` in a new chat `session_id`, for tool
 /// calls made outside a coordinator run.
-#[allow(dead_code)] // M4 Task 8 removes this.
 pub(crate) async fn ledger_run(
     coordinator: &AgentRunCoordinator,
     agent_id: &str,
@@ -563,7 +558,6 @@ pub(crate) async fn ledger_run(
 }
 
 /// The user message a direct tool call is made for.
-#[allow(dead_code)] // M4 Task 8 removes this.
 pub(crate) fn tool_input(agent_id: &str, room_id: &str) -> Message {
     Message {
         id: "msg-tool-input".into(),
@@ -578,13 +572,11 @@ pub(crate) fn tool_input(agent_id: &str, room_id: &str) -> Message {
     }
 }
 
-#[allow(dead_code)] // M4 Task 8 removes this.
 pub(crate) fn ask_before_writes() -> ApprovalPolicy {
     ApprovalPolicy::default().with(RiskClass::Write, PolicyAction::Ask)
 }
 
 /// Timeouts that never fire during a test.
-#[allow(dead_code)] // M4 Task 8 removes this.
 pub(crate) fn patient() -> ApprovalTimeouts {
     ApprovalTimeouts {
         default: Duration::from_secs(30),

@@ -2,7 +2,6 @@
 //! policy and rules, and how a call is judged against them. Later M4 tasks
 //! add the approval records (`registry`) and the gate in `execute_tool`
 //! (`gate`).
-#![allow(dead_code)] // M4 Task 8 removes this once the gate and the routes use every item.
 
 pub(crate) mod gate;
 pub(crate) mod policy;
@@ -11,15 +10,12 @@ pub(crate) mod registry;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-#[allow(unused_imports)] // M4 Tasks 6 and 8 use the rest.
 pub(crate) use gate::{
     ApprovalGate, ApprovalTimeouts, ApprovalWaiters, GateOutcome, PendingApproval,
 };
-#[allow(unused_imports)] // M4 Tasks 3, 5, and 8 use the rest.
 pub(crate) use policy::{
     evaluate, matcher_kinds, risk_class, suggested_matcher, validate_matcher, Verdict,
 };
-#[allow(unused_imports)] // M4 Tasks 3–8 use the rest.
 pub(crate) use registry::{
     AgentApprovalPolicy, ApprovalDecisionKind, ApprovalRegistry, ApprovalRequest,
     ApprovalResolution, ApprovalSnapshot, ApprovalStatus, PendingApprovalStart, ResolvedBy,
@@ -74,6 +70,12 @@ pub(crate) const DECIDED_APPROVAL_WINDOW_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 /// Decided approvals per page, by default and at most.
 pub(crate) const DEFAULT_APPROVAL_PAGE: usize = 50;
 pub(crate) const MAX_APPROVAL_PAGE: usize = 100;
+/// A rule for a read-class tool would never be consulted.
+pub(crate) const READ_TOOLS_NEED_NO_RULE: &str = "Read-class tools never ask, so they need no rule";
+/// Helpers are judged by their companion's policy and rules.
+pub(crate) const HELPERS_USE_COMPANION_APPROVALS: &str =
+    "Helpers use their companion's approval policy and rules";
+pub(crate) const UNKNOWN_RULE_TOOL: &str = "unknown tool";
 
 /// How much a tool can change (spec §7.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
