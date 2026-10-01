@@ -1,5 +1,5 @@
-//! History outbox (spec §13.1): committed messages and terminal runs reach the
-//! history store within about a second, in batches, idempotently by id, with
+//! History outbox (spec §13.1): committed messages, terminal runs, and decided
+//! approvals reach the history store within about a second, in batches, idempotently by id, with
 //! retries and backoff. Records stay in the control plane until mirrored, and
 //! only saved state is mirrored: the outbox reads the control plane under the
 //! control-plane transaction. Deletions stay saved in the control plane
@@ -29,6 +29,8 @@ pub(crate) const HISTORY_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 pub(crate) const HISTORY_FLUSH_BATCH: usize = 500;
 /// Terminal runs per store write.
 pub(crate) const HISTORY_RUN_BATCH: usize = 200;
+/// Decided approvals per store write.
+pub(crate) const HISTORY_APPROVAL_BATCH: usize = 200;
 /// The longest wait between retries while the store fails.
 pub(crate) const HISTORY_MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// Failing this long is a readiness issue (spec §13.1).
@@ -88,6 +90,7 @@ enum Batch {
 pub(crate) struct FlushReport {
     pub(crate) messages: usize,
     pub(crate) runs: usize,
+    pub(crate) approvals: usize,
     pub(crate) deletions: usize,
     pub(crate) reconciled: usize,
 }
@@ -323,7 +326,8 @@ impl HistoryService {
             report.reconciled = self.reconcile(state, transactions).await?;
         }
         self.write_queue(state, transactions, report).await?;
-        self.write_runs(state, transactions, report).await
+        self.write_runs(state, transactions, report).await?;
+        self.write_approvals(state, transactions, report).await
     }
 
     /// Writes queued items in order until the queue is empty. Each applied
@@ -408,6 +412,35 @@ impl HistoryService {
             let marked = state.write().await.runs.mark_mirrored(&runs);
             report.runs += marked;
             if marked == 0 || runs.len() < HISTORY_RUN_BATCH {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Writes decided approvals in batches, read under the control-plane
+    /// transaction so only saved decisions are mirrored; each one the store
+    /// then holds unchanged leaves the control plane (spec §7.3).
+    async fn write_approvals(
+        &self,
+        state: &SharedDaemonState,
+        transactions: &Mutex<()>,
+        report: &mut FlushReport,
+    ) -> Result<(), HistoryError> {
+        loop {
+            let approvals = {
+                let _transaction = transactions.lock().await;
+                state
+                    .write()
+                    .await
+                    .unmirrored_decided_approvals(HISTORY_APPROVAL_BATCH)
+            };
+            if approvals.is_empty() {
+                return Ok(());
+            }
+            self.store.upsert_approvals(&approvals).await?;
+            let removed = state.write().await.approvals.mark_mirrored(&approvals);
+            report.approvals += removed;
+            if removed == 0 || approvals.len() < HISTORY_APPROVAL_BATCH {
                 return Ok(());
             }
         }
@@ -702,6 +735,7 @@ mod tests {
             FlushReport {
                 messages: 2,
                 runs: 1,
+                approvals: 0,
                 deletions: 0,
                 reconciled: 0
             }
@@ -1191,6 +1225,94 @@ mod tests {
             state.read().await.pending_history_deletions.is_empty(),
             "cleared once the store applied it"
         );
+    }
+
+    /// `agent_id`'s chat `session_id` with one decided and one pending approval.
+    async fn with_approvals(state: &SharedDaemonState, agent_id: &str, session_id: &str) -> String {
+        use crate::history::conformance::decided_approval;
+        let mut guard = state.write().await;
+        guard.sessions.insert(crate::sessions::SessionRecord::new(
+            agent_id,
+            session_id,
+            crate::sessions::SessionKind::Chat,
+            crate::sessions::SessionOrigin::Web,
+            "Chat".into(),
+            crate::sessions::TitleSource::Owner,
+            1,
+        ));
+        let decided = decided_approval(&format!("apr_done_{session_id}"), agent_id, session_id, 10);
+        let mut pending =
+            decided_approval(&format!("apr_wait_{session_id}"), agent_id, session_id, 20);
+        pending.status = crate::approvals::ApprovalStatus::Pending;
+        pending.resolution = None;
+        guard.approvals.insert(decided.clone());
+        guard.approvals.insert(pending);
+        decided.id
+    }
+
+    #[tokio::test]
+    async fn decided_approvals_move_to_the_store_and_leave_the_control_plane() {
+        let store = Arc::new(MemoryHistoryStore::new());
+        let (state, coordinator, agent_id) = state_with(HistoryService::new(store.clone())).await;
+        let transactions = coordinator.control_plane_transactions();
+        let decided = with_approvals(&state, &agent_id, "chat:one").await;
+        let history = state.read().await.history.clone();
+
+        let report = history
+            .flush_once(&state, &transactions, now_millis())
+            .await
+            .unwrap();
+
+        assert_eq!(report.approvals, 1);
+        assert_eq!(
+            store.get_approval(&decided).await.unwrap().unwrap().id,
+            decided
+        );
+        let guard = state.read().await;
+        assert!(
+            guard.approvals.get(&decided).is_none(),
+            "the store holds it now"
+        );
+        assert!(
+            guard.approvals.get("apr_wait_chat:one").is_some(),
+            "a pending approval is never written"
+        );
+        assert!(store
+            .get_approval("apr_wait_chat:one")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn a_failing_store_keeps_decided_approvals_and_a_deleted_session_drops_its_own() {
+        let store = Arc::new(FlakyHistoryStore::new());
+        let (state, coordinator, agent_id) = state_with(HistoryService::new(store.clone())).await;
+        let transactions = coordinator.control_plane_transactions();
+        let kept = with_approvals(&state, &agent_id, "chat:kept").await;
+        let orphan = with_approvals(&state, &agent_id, "chat:gone").await;
+        state.write().await.sessions.remove(&agent_id, "chat:gone");
+        let history = state.read().await.history.clone();
+        store.set_failing(true);
+
+        assert!(history
+            .flush_once(&state, &transactions, now_millis())
+            .await
+            .is_err());
+        assert!(state.read().await.approvals.get(&kept).is_some());
+
+        store.set_failing(false);
+        let report = history
+            .flush_once(&state, &transactions, now_millis())
+            .await
+            .unwrap();
+        assert_eq!(report.approvals, 1);
+        assert!(store.get_approval(&kept).await.unwrap().is_some());
+        assert!(
+            store.get_approval(&orphan).await.unwrap().is_none(),
+            "a deleted session's approval is never written"
+        );
+        assert!(state.read().await.approvals.get(&orphan).is_none());
     }
 
     // The hand-simulated agent-delete test that used to live here (Task 12) is

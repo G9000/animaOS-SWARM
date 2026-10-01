@@ -112,6 +112,20 @@ fn normalized_note(note: Option<&str>) -> Result<Option<String>, SettleRefusal> 
 }
 
 impl DaemonState {
+    /// Decided approvals for the history store (spec §13.1), the `limit`
+    /// oldest resolutions first. Those of deleted agents or sessions are
+    /// dropped first: their history went with them, and writing them would
+    /// bring it back. The snapshot never saves them, so nothing needs saving.
+    pub(crate) fn unmirrored_decided_approvals(&mut self, limit: usize) -> Vec<ApprovalRequest> {
+        let live_agents = self.live_agent_ids();
+        let sessions = &self.sessions;
+        self.approvals.retain_decided(|approval| {
+            live_agents.contains(&approval.agent_id)
+                && sessions.contains(&approval.agent_id, &approval.session_id)
+        });
+        self.approvals.unmirrored_decided(limit)
+    }
+
     /// What `call` needs in `session_id` (spec §7.2). A helper answers to
     /// its companion's policy and rules and has no session allowances.
     pub(crate) fn approval_verdict(

@@ -1,14 +1,21 @@
 //! Behaviour every history store shares (memory, SQLite, Postgres).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use anima_core::{Content, Message, MessageRole};
+use anima_core::{Content, DataValue, Message, MessageRole, ToolCall};
 use async_trait::async_trait;
 use tokio::sync::Semaphore;
 
-use super::{HistoryError, HistoryMessage, HistoryStore, MemoryHistoryStore, MessagePageQuery};
+use super::{
+    ApprovalPageQuery, HistoryError, HistoryMessage, HistoryStore, MemoryHistoryStore,
+    MessagePageQuery,
+};
+use crate::approvals::{
+    ApprovalDecisionKind, ApprovalRequest, ApprovalResolution, ApprovalStatus,
+    PendingApprovalStart, ResolvedBy,
+};
 use crate::runs::{RunRecord, RunSource, RunStart, RunStatus};
 
 pub(crate) fn history_message(
@@ -54,6 +61,147 @@ pub(crate) fn terminal_run(agent_id: &str, session_id: &str) -> RunRecord {
     );
     run.finish(RunStatus::Completed, None, 110);
     run
+}
+
+/// An approval the owner allowed once, created at `created_at_ms`.
+pub(crate) fn decided_approval(
+    id: &str,
+    agent_id: &str,
+    session_id: &str,
+    created_at_ms: u64,
+) -> ApprovalRequest {
+    let call = ToolCall {
+        id: format!("call-{id}"),
+        name: "memory_add".into(),
+        args: BTreeMap::from([("content".to_string(), DataValue::String("the plan".into()))]),
+    };
+    let mut approval = ApprovalRequest::pending(
+        PendingApprovalStart {
+            agent_id,
+            session_id,
+            run_id: "run_conformance",
+            call: &call,
+            timeout_ms: 1_000,
+        },
+        created_at_ms,
+    );
+    approval.id = id.to_string();
+    approval.resolve(
+        ApprovalStatus::Allowed,
+        ApprovalResolution {
+            decision: Some(ApprovalDecisionKind::AllowOnce),
+            note: None,
+            matcher: None,
+            rule_id: None,
+            resolved_by: ResolvedBy::Owner,
+            resolved_at_ms: created_at_ms + 5,
+        },
+    );
+    approval
+}
+
+/// Every store keeps decided approvals by id, pages them newest first
+/// within a window, and removes them with their session or agent. Ids and
+/// timestamps are unique per call, so a shared Postgres database can run it
+/// repeatedly.
+pub(crate) async fn assert_history_store_approval_conformance(store: &dyn HistoryStore) {
+    let agent = format!("agent-{}", uuid::Uuid::new_v4());
+    let other = format!("agent-{}", uuid::Uuid::new_v4());
+    let base = (uuid::Uuid::new_v4().as_u128() % 1_000_000_000) as u64 * 1_000;
+    let id = |n: u32| format!("apr_{base}_{n}");
+    let first = decided_approval(&id(1), &agent, "chat:a", base + 100);
+    let second = decided_approval(&id(2), &agent, "chat:b", base + 200);
+    // Same time as `second`: the id breaks the tie.
+    let third = decided_approval(&id(3), &agent, "chat:a", base + 200);
+    let elsewhere = decided_approval(&id(4), &other, "chat:a", base + 300);
+    store
+        .upsert_approvals(&[
+            first.clone(),
+            second.clone(),
+            third.clone(),
+            elsewhere.clone(),
+        ])
+        .await
+        .unwrap();
+
+    let mut changed = first.clone();
+    changed.resolution.as_mut().unwrap().note = Some("rewritten".into());
+    store.upsert_approvals(&[changed.clone()]).await.unwrap();
+    assert_eq!(store.get_approval(&first.id).await.unwrap(), Some(changed));
+    assert_eq!(store.get_approval(&id(99)).await.unwrap(), None);
+
+    let page = |agent_id: Option<&str>, since_ms: u64, before: Option<&ApprovalRequest>, limit| {
+        ApprovalPageQuery {
+            agent_id: agent_id.map(str::to_string),
+            since_ms,
+            before: before.map(|approval| (approval.created_at_ms, approval.id.clone())),
+            limit,
+        }
+    };
+    let ids = |rows: Vec<ApprovalRequest>| {
+        rows.into_iter()
+            .map(|approval| approval.id)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        ids(store
+            .page_approvals(&page(Some(&agent), base, None, 10))
+            .await
+            .unwrap()),
+        [third.id.clone(), second.id.clone(), first.id.clone()]
+    );
+    let first_page = store
+        .page_approvals(&page(Some(&agent), base, None, 2))
+        .await
+        .unwrap();
+    assert_eq!(
+        ids(first_page.clone()),
+        [third.id.clone(), second.id.clone()]
+    );
+    assert_eq!(
+        ids(store
+            .page_approvals(&page(Some(&agent), base, first_page.last(), 2))
+            .await
+            .unwrap()),
+        [first.id.clone()]
+    );
+    assert_eq!(
+        ids(store
+            .page_approvals(&page(Some(&agent), base + 150, None, 10))
+            .await
+            .unwrap()),
+        [third.id.clone(), second.id.clone()],
+        "only approvals created inside the window"
+    );
+    // `since_ms = base` keeps other runs' older rows out of a shared database;
+    // the filter keeps this run's rows if newer ones from other runs exist.
+    let everyone = store
+        .page_approvals(&page(None, base, None, 1_000))
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|approval| approval.agent_id == agent || approval.agent_id == other)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ids(everyone),
+        [
+            elsewhere.id.clone(),
+            third.id.clone(),
+            second.id.clone(),
+            first.id.clone()
+        ]
+    );
+
+    store.delete_session(&agent, "chat:b").await.unwrap();
+    assert_eq!(store.get_approval(&second.id).await.unwrap(), None);
+    assert!(store.get_approval(&first.id).await.unwrap().is_some());
+    store.delete_agent(&agent).await.unwrap();
+    assert_eq!(store.get_approval(&first.id).await.unwrap(), None);
+    assert_eq!(store.get_approval(&third.id).await.unwrap(), None);
+    assert_eq!(
+        store.get_approval(&elsewhere.id).await.unwrap(),
+        Some(elsewhere)
+    );
 }
 
 fn ids(rows: &[HistoryMessage]) -> Vec<String> {
@@ -731,6 +879,27 @@ impl HistoryStore for FlakyHistoryStore {
     async fn upsert_runs(&self, runs: &[RunRecord]) -> Result<(), HistoryError> {
         self.check()?;
         self.inner.upsert_runs(runs).await
+    }
+
+    async fn upsert_approvals(&self, approvals: &[ApprovalRequest]) -> Result<(), HistoryError> {
+        self.check()?;
+        self.inner.upsert_approvals(approvals).await
+    }
+
+    async fn get_approval(
+        &self,
+        approval_id: &str,
+    ) -> Result<Option<ApprovalRequest>, HistoryError> {
+        self.check()?;
+        self.inner.get_approval(approval_id).await
+    }
+
+    async fn page_approvals(
+        &self,
+        query: &ApprovalPageQuery,
+    ) -> Result<Vec<ApprovalRequest>, HistoryError> {
+        self.check()?;
+        self.inner.page_approvals(query).await
     }
 
     async fn existing_message_ids(&self, ids: &[String]) -> Result<HashSet<String>, HistoryError> {

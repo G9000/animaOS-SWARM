@@ -7,9 +7,10 @@ use async_trait::async_trait;
 use sqlx::{PgPool, Row};
 
 use super::{
-    message_ordinal, role_name, search_tokens, searchable_text, to_i64, HistoryError,
-    HistoryMessage, HistoryStore, MessagePageQuery,
+    message_ordinal, role_name, search_tokens, searchable_text, to_i64, ApprovalPageQuery,
+    HistoryError, HistoryMessage, HistoryStore, MessagePageQuery,
 };
+use crate::approvals::ApprovalRequest;
 use crate::runs::RunRecord;
 
 const UPSERT_MESSAGE: &str = "
@@ -35,6 +36,22 @@ ON CONFLICT (id) DO UPDATE SET
     created_at_ms = EXCLUDED.created_at_ms,
     finished_at_ms = EXCLUDED.finished_at_ms,
     record = EXCLUDED.record";
+
+const UPSERT_APPROVAL: &str = "
+INSERT INTO history_approvals (id, agent_id, session_id, created_at_ms, record)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (id) DO UPDATE SET
+    agent_id = EXCLUDED.agent_id,
+    session_id = EXCLUDED.session_id,
+    created_at_ms = EXCLUDED.created_at_ms,
+    record = EXCLUDED.record";
+
+const PAGE_APPROVALS: &str = "
+SELECT record FROM history_approvals
+WHERE ($1::text IS NULL OR agent_id = $1) AND created_at_ms >= $2
+  AND ($3::bigint IS NULL OR created_at_ms < $3 OR (created_at_ms = $3 AND id < $4))
+ORDER BY created_at_ms DESC, id DESC
+LIMIT $5";
 
 impl From<sqlx::Error> for HistoryError {
     fn from(error: sqlx::Error) -> Self {
@@ -130,6 +147,64 @@ impl HistoryStore for PostgresHistoryStore {
         }
         transaction.commit().await?;
         Ok(())
+    }
+
+    async fn upsert_approvals(&self, approvals: &[ApprovalRequest]) -> Result<(), HistoryError> {
+        if approvals.is_empty() {
+            return Ok(());
+        }
+        let mut transaction = self.pool.begin().await?;
+        for approval in approvals {
+            sqlx::query(UPSERT_APPROVAL)
+                .bind(&approval.id)
+                .bind(&approval.agent_id)
+                .bind(&approval.session_id)
+                .bind(to_i64(approval.created_at_ms)?)
+                .bind(serde_json::to_value(approval)?)
+                .execute(&mut *transaction)
+                .await?;
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn get_approval(
+        &self,
+        approval_id: &str,
+    ) -> Result<Option<ApprovalRequest>, HistoryError> {
+        let row = sqlx::query("SELECT record FROM history_approvals WHERE id = $1")
+            .bind(approval_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|row| -> Result<ApprovalRequest, HistoryError> {
+            let record: serde_json::Value = row.try_get("record")?;
+            Ok(serde_json::from_value(record)?)
+        })
+        .transpose()
+    }
+
+    async fn page_approvals(
+        &self,
+        query: &ApprovalPageQuery,
+    ) -> Result<Vec<ApprovalRequest>, HistoryError> {
+        let (before_at, before_id) = match &query.before {
+            Some((at_ms, id)) => (Some(to_i64(*at_ms)?), id.clone()),
+            None => (None, String::new()),
+        };
+        let rows = sqlx::query(PAGE_APPROVALS)
+            .bind(query.agent_id.as_deref())
+            .bind(to_i64(query.since_ms)?)
+            .bind(before_at)
+            .bind(before_id)
+            .bind(i64::try_from(query.limit).unwrap_or(i64::MAX))
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter()
+            .map(|row| -> Result<ApprovalRequest, HistoryError> {
+                let record: serde_json::Value = row.try_get("record")?;
+                Ok(serde_json::from_value(record)?)
+            })
+            .collect()
     }
 
     async fn existing_message_ids(&self, ids: &[String]) -> Result<HashSet<String>, HistoryError> {
@@ -302,7 +377,12 @@ impl HistoryStore for PostgresHistoryStore {
 
     async fn delete_session(&self, agent_id: &str, session_id: &str) -> Result<(), HistoryError> {
         let mut transaction = self.pool.begin().await?;
-        for table in ["history_messages", "history_runs", "history_attachments"] {
+        for table in [
+            "history_messages",
+            "history_runs",
+            "history_attachments",
+            "history_approvals",
+        ] {
             sqlx::query(&format!(
                 "DELETE FROM {table} WHERE agent_id = $1 AND session_id = $2"
             ))
@@ -317,8 +397,13 @@ impl HistoryStore for PostgresHistoryStore {
 
     async fn delete_agent(&self, agent_id: &str) -> Result<(), HistoryError> {
         let mut transaction = self.pool.begin().await?;
-        // Usage rows stay (spec §3.3).
-        for table in ["history_messages", "history_runs", "history_attachments"] {
+        // Usage rows stay (spec §3.3); approvals go with their agent.
+        for table in [
+            "history_messages",
+            "history_runs",
+            "history_attachments",
+            "history_approvals",
+        ] {
             sqlx::query(&format!("DELETE FROM {table} WHERE agent_id = $1"))
                 .bind(agent_id)
                 .execute(&mut *transaction)
@@ -333,8 +418,8 @@ impl HistoryStore for PostgresHistoryStore {
 mod tests {
     use super::*;
     use crate::history::conformance::{
-        assert_history_store_checkin_text_conformance, assert_history_store_conformance,
-        assert_history_store_diacritics_conformance,
+        assert_history_store_approval_conformance, assert_history_store_checkin_text_conformance,
+        assert_history_store_conformance, assert_history_store_diacritics_conformance,
         assert_history_store_indexed_text_cap_conformance,
         assert_history_store_session_search_conformance,
     };
@@ -356,6 +441,7 @@ mod tests {
         assert_history_store_checkin_text_conformance(&store).await;
         assert_history_store_indexed_text_cap_conformance(&store).await;
         assert_history_store_diacritics_conformance(&store).await;
+        assert_history_store_approval_conformance(&store).await;
         assert_eq!(store.label(), "postgres");
     }
 }

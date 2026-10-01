@@ -7,9 +7,10 @@ use std::sync::{Mutex, MutexGuard};
 use async_trait::async_trait;
 
 use super::{
-    search_tokens, searchable_text, text_matches, HistoryError, HistoryMessage, HistoryStore,
-    MessagePageQuery, EPHEMERAL_HISTORY_MAX_ROWS,
+    search_tokens, searchable_text, text_matches, ApprovalPageQuery, HistoryError, HistoryMessage,
+    HistoryStore, MessagePageQuery, EPHEMERAL_HISTORY_MAX_ROWS,
 };
+use crate::approvals::ApprovalRequest;
 use crate::runs::RunRecord;
 
 pub(crate) struct MemoryHistoryStore {
@@ -24,6 +25,8 @@ struct Tables {
     message_seqs: BTreeMap<u64, String>,
     runs: HashMap<String, (u64, RunRecord)>,
     run_seqs: BTreeMap<u64, String>,
+    approvals: HashMap<String, (u64, ApprovalRequest)>,
+    approval_seqs: BTreeMap<u64, String>,
 }
 
 impl MemoryHistoryStore {
@@ -125,6 +128,61 @@ impl HistoryStore for MemoryHistoryStore {
             );
         }
         Ok(())
+    }
+
+    async fn upsert_approvals(&self, approvals: &[ApprovalRequest]) -> Result<(), HistoryError> {
+        let mut guard = self.tables();
+        let tables = &mut *guard;
+        for approval in approvals {
+            upsert(
+                &mut tables.approvals,
+                &mut tables.approval_seqs,
+                &mut tables.next_seq,
+                approval.id.clone(),
+                approval.clone(),
+                self.max_rows,
+            );
+        }
+        Ok(())
+    }
+
+    async fn get_approval(
+        &self,
+        approval_id: &str,
+    ) -> Result<Option<ApprovalRequest>, HistoryError> {
+        Ok(self
+            .tables()
+            .approvals
+            .get(approval_id)
+            .map(|(_, approval)| approval.clone()))
+    }
+
+    async fn page_approvals(
+        &self,
+        query: &ApprovalPageQuery,
+    ) -> Result<Vec<ApprovalRequest>, HistoryError> {
+        let tables = self.tables();
+        let mut rows = tables
+            .approvals
+            .values()
+            .map(|(_, approval)| approval)
+            .filter(|approval| {
+                query
+                    .agent_id
+                    .as_deref()
+                    .is_none_or(|agent_id| approval.agent_id == agent_id)
+                    && approval.created_at_ms >= query.since_ms
+                    && query.before.as_ref().is_none_or(|(at_ms, id)| {
+                        (approval.created_at_ms, approval.id.as_str()) < (*at_ms, id.as_str())
+                    })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        rows.sort_by(|left, right| {
+            (right.created_at_ms, &right.id).cmp(&(left.created_at_ms, &left.id))
+        });
+        rows.truncate(query.limit);
+        Ok(rows)
     }
 
     async fn existing_message_ids(&self, ids: &[String]) -> Result<HashSet<String>, HistoryError> {
@@ -264,6 +322,11 @@ impl HistoryStore for MemoryHistoryStore {
         remove_where(&mut tables.runs, &mut tables.run_seqs, |run| {
             run.agent_id == agent_id && run.session_id == session_id
         });
+        remove_where(
+            &mut tables.approvals,
+            &mut tables.approval_seqs,
+            |approval| approval.agent_id == agent_id && approval.session_id == session_id,
+        );
         Ok(())
     }
 
@@ -276,6 +339,11 @@ impl HistoryStore for MemoryHistoryStore {
         remove_where(&mut tables.runs, &mut tables.run_seqs, |run| {
             run.agent_id == agent_id
         });
+        remove_where(
+            &mut tables.approvals,
+            &mut tables.approval_seqs,
+            |approval| approval.agent_id == agent_id,
+        );
         Ok(())
     }
 }
@@ -284,8 +352,8 @@ impl HistoryStore for MemoryHistoryStore {
 mod tests {
     use super::*;
     use crate::history::conformance::{
-        assert_history_store_checkin_text_conformance, assert_history_store_conformance,
-        assert_history_store_diacritics_conformance,
+        assert_history_store_approval_conformance, assert_history_store_checkin_text_conformance,
+        assert_history_store_conformance, assert_history_store_diacritics_conformance,
         assert_history_store_indexed_text_cap_conformance,
         assert_history_store_session_search_conformance, history_message,
     };
@@ -299,6 +367,7 @@ mod tests {
         assert_history_store_checkin_text_conformance(&store).await;
         assert_history_store_indexed_text_cap_conformance(&store).await;
         assert_history_store_diacritics_conformance(&store).await;
+        assert_history_store_approval_conformance(&store).await;
     }
 
     #[tokio::test]
