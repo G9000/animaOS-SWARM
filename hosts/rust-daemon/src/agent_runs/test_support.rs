@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use anima_core::{
-    AgentConfig, AgentSettings, Content, DataValue, Message, MessageRole, ModelAdapter,
-    ModelGenerateRequest, ModelGenerateResponse, ModelStopReason, ModelStreamFrame,
+    AgentConfig, AgentSettings, CancelSignal, Content, DataValue, Message, MessageRole,
+    ModelAdapter, ModelGenerateRequest, ModelGenerateResponse, ModelStopReason, ModelStreamFrame,
     ModelStreamSink, TokenUsage, ToolCall,
 };
 use async_trait::async_trait;
@@ -17,13 +17,14 @@ use super::{
     AcceptRun, AcceptedRun, AgentRunCoordinator, AgentRunRequest, RunRoom, SessionRunMode,
 };
 use crate::approvals::{
-    ApprovalDecisionKind, ApprovalPolicy, ApprovalRequest, ApprovalTimeouts, PolicyAction,
-    RiskClass,
+    ApprovalDecisionKind, ApprovalGate, ApprovalPolicy, ApprovalRequest, ApprovalTimeouts,
+    PolicyAction, RiskClass,
 };
 use crate::live::{LiveDelivery, LiveEvent, LiveSubscription};
 use crate::runs::{RunLink, RunRecord, RunSource, RunStart, RunStatus};
 use crate::sessions::{SessionKind, SessionOrigin, SessionRecord, TitleSource};
 use crate::state::{DaemonState, OwnerDecision};
+use crate::tools::ToolExecutionContext;
 
 /// One scripted model call.
 #[derive(Clone, Debug)]
@@ -431,6 +432,55 @@ pub(crate) fn remember_call(id: &str, text: &str) -> ToolCall {
         name: "memory_add".into(),
         args: BTreeMap::from([("content".to_string(), DataValue::String(text.into()))]),
     }
+}
+
+/// A coordinator whose one agent may use `calculate` and `memory_add`,
+/// under `policy`, waiting at most `timeouts` for the owner.
+pub(crate) async fn approving_coordinator(
+    model: Arc<dyn ModelAdapter>,
+    policy: ApprovalPolicy,
+    timeouts: ApprovalTimeouts,
+) -> (AgentRunCoordinator, String) {
+    let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(model)));
+    let agent_id = {
+        let mut guard = state.write().await;
+        let mut config = companion_config("companion");
+        config.tools = Some(
+            crate::tools::ToolRegistry::new()
+                .resolve_descriptors(["calculate", "memory_add"])
+                .unwrap(),
+        );
+        let agent_id = guard.create_agent(config).unwrap().state.id;
+        guard.approvals.set_policy(&agent_id, policy);
+        agent_id
+    };
+    (
+        AgentRunCoordinator::new(state, Arc::new(Semaphore::new(8)))
+            .with_approval_timeouts(timeouts),
+        agent_id,
+    )
+}
+
+/// A tool context for `run` with its approval gate, as `run_locked` builds one.
+pub(crate) async fn gated_context(
+    coordinator: &AgentRunCoordinator,
+    run: &RunLink,
+    cancel: CancelSignal,
+) -> ToolExecutionContext {
+    coordinator
+        .state
+        .read()
+        .await
+        .tool_execution_context()
+        .with_team(coordinator.clone(), false)
+        .with_run_link(Some(run.clone()))
+        .with_cancel(Some(cancel.clone()))
+        .with_approvals(Some(ApprovalGate::new(
+            coordinator.clone(),
+            run.clone(),
+            RunSource::Web,
+            cancel,
+        )))
 }
 
 /// Waits (up to five seconds) until at least `count` approvals are pending;

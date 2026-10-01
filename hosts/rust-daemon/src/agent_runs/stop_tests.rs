@@ -958,7 +958,16 @@ async fn a_stop_kills_the_bash_command_its_run_waits_for() {
                 .resolve_descriptors(["bash"])
                 .unwrap(),
         );
-        guard.create_agent(config).unwrap().state.id
+        let agent_id = guard.create_agent(config).unwrap().state.id;
+        // `exec` asks by default (spec §7.2); this owner lets it run.
+        guard.approvals.set_policy(
+            &agent_id,
+            crate::approvals::ApprovalPolicy::default().with(
+                crate::approvals::RiskClass::Exec,
+                crate::approvals::PolicyAction::Allow,
+            ),
+        );
+        agent_id
     };
     let running = {
         let coordinator = coordinator.clone();

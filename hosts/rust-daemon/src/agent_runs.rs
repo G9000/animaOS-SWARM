@@ -21,6 +21,7 @@ use crate::runs::{
 };
 use crate::state::DaemonState;
 
+mod approvals;
 mod compact;
 mod conversations;
 mod queue;
@@ -359,6 +360,10 @@ pub(crate) struct AgentRunCoordinator {
     /// call (controller ruling, M3 pre-flight audit): the model adapter has
     /// no request timeout of its own.
     title_timeout: std::time::Duration,
+    /// Calls waiting for the owner, by approval id (spec §7.3).
+    approval_waiters: crate::approvals::ApprovalWaiters,
+    /// How long a call waits for the owner (spec §7.3).
+    approval_timeouts: crate::approvals::ApprovalTimeouts,
 }
 
 impl AgentRunCoordinator {
@@ -621,6 +626,8 @@ impl AgentRunCoordinator {
             title_timeout: std::time::Duration::from_millis(
                 crate::sessions::titles::TITLE_TIMEOUT_MS,
             ),
+            approval_waiters: crate::approvals::ApprovalWaiters::default(),
+            approval_timeouts: crate::approvals::ApprovalTimeouts::default(),
         }
     }
 
@@ -635,6 +642,16 @@ impl AgentRunCoordinator {
     #[cfg(test)]
     pub(crate) fn with_title_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.title_timeout = timeout;
+        self
+    }
+
+    /// Shorter approval waits, so tests need not wait thirty minutes.
+    #[cfg(test)]
+    pub(crate) fn with_approval_timeouts(
+        mut self,
+        timeouts: crate::approvals::ApprovalTimeouts,
+    ) -> Self {
+        self.approval_timeouts = timeouts;
         self
     }
 
@@ -1576,7 +1593,18 @@ impl AgentRunCoordinator {
                 session_id: session_id.clone(),
                 agent_id: agent_id.clone(),
             }))
-            .with_cancel(Some(live_run.control().cancel));
+            .with_cancel(Some(live_run.control().cancel))
+            // Spec §7.3: the gate between the live checks and dispatch.
+            .with_approvals(Some(crate::approvals::ApprovalGate::new(
+                self.clone(),
+                crate::runs::RunLink {
+                    run_id: run_id.clone(),
+                    session_id: session_id.clone(),
+                    agent_id: agent_id.clone(),
+                },
+                source,
+                live_run.control().cancel,
+            )));
         let history = runtime.messages().to_vec();
         let execution = async {
             runtime
@@ -2107,6 +2135,8 @@ async fn persist_task_result_memory(
     }
 }
 
+#[cfg(test)]
+mod approval_tests;
 #[cfg(test)]
 mod compaction_tests;
 #[cfg(test)]

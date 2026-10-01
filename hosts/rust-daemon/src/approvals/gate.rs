@@ -8,10 +8,17 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
 use std::time::Duration;
 
+use anima_core::{AgentState, CancelSignal, Content, TaskResult, ToolCall, CANCELLED_TOOL_RESULT};
 use tokio::sync::oneshot;
 
-use super::{ApprovalRequest, APPROVAL_TIMEOUT_MS, DENIED_BY_OWNER, TELEGRAM_APPROVAL_TIMEOUT_MS};
-use crate::runs::RunSource;
+use super::{
+    risk_class, ApprovalRequest, ApprovalStatus, RiskClass, Verdict, APPROVAL_LOST,
+    APPROVAL_TIMEOUT_MS, DENIED_BY_OWNER, DENIED_BY_POLICY, HELPER_NEEDS_APPROVAL,
+    TELEGRAM_APPROVAL_TIMEOUT_MS,
+};
+use crate::agent_runs::{is_helper_config, AgentRunCoordinator};
+use crate::runs::{RunLink, RunSource};
+use crate::state::{ApprovalAsk, Settlement};
 
 /// How long a call waits for the owner (spec §7.3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,6 +100,132 @@ pub(crate) fn denial_text(note: Option<&str>) -> String {
     match note {
         Some(note) => format!("{DENIED_BY_OWNER}: {note}"),
         None => DENIED_BY_OWNER.to_string(),
+    }
+}
+
+/// What `execute_tool` does with a call once the gate has judged it.
+pub(crate) enum GateOutcome {
+    /// Allowed without asking: dispatch.
+    Proceed,
+    /// The owner allowed it after a wait: check again, then dispatch.
+    Approved,
+    /// Answer the model with this instead of running the tool.
+    Refuse(TaskResult<Content>),
+}
+
+/// One coordinator run's gate (spec §7.3).
+#[derive(Clone)]
+pub(crate) struct ApprovalGate {
+    coordinator: AgentRunCoordinator,
+    run: RunLink,
+    source: RunSource,
+    cancel: CancelSignal,
+}
+
+impl ApprovalGate {
+    pub(crate) fn new(
+        coordinator: AgentRunCoordinator,
+        run: RunLink,
+        source: RunSource,
+        cancel: CancelSignal,
+    ) -> Self {
+        Self {
+            coordinator,
+            run,
+            source,
+            cancel,
+        }
+    }
+
+    pub(crate) async fn check(&self, agent: &AgentState, call: &ToolCall) -> GateOutcome {
+        // Read-class tools never ask (spec §7.2), so they never wait for the
+        // state lock either: a read tool runs while the lock is held (M3).
+        if risk_class(&call.name) == RiskClass::Read {
+            return GateOutcome::Proceed;
+        }
+        match self
+            .coordinator
+            .approval_verdict(agent, &self.run.session_id, call)
+            .await
+        {
+            Verdict::Allow => GateOutcome::Proceed,
+            Verdict::Deny => GateOutcome::Refuse(TaskResult::error(DENIED_BY_POLICY, 0)),
+            // Helpers never wait (spec §7.3).
+            Verdict::Ask if is_helper_config(&agent.config) => {
+                GateOutcome::Refuse(TaskResult::error(HELPER_NEEDS_APPROVAL, 0))
+            }
+            Verdict::Ask => self.ask(call).await,
+        }
+    }
+
+    async fn ask(&self, call: &ToolCall) -> GateOutcome {
+        let timeout = self.coordinator.approval_timeout(self.source);
+        let ask = ApprovalAsk {
+            run: self.run.clone(),
+            call: call.clone(),
+            timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+        };
+        let pending = match self.coordinator.open_approval(ask).await {
+            Ok(pending) => pending,
+            Err(refused) => return GateOutcome::Refuse(refused),
+        };
+        match self.wait(pending, timeout).await {
+            Some(approval) => self.outcome(&approval),
+            None => GateOutcome::Refuse(TaskResult::error(APPROVAL_LOST, 0)),
+        }
+    }
+
+    /// The approval as it was settled, by whoever settled it first. Holds no
+    /// lock while it waits.
+    async fn wait(&self, pending: PendingApproval, timeout: Duration) -> Option<ApprovalRequest> {
+        let PendingApproval { id, mut woken } = pending;
+        let deadline = tokio::time::Instant::now() + timeout;
+        let settled = tokio::select! {
+            biased;
+            settled = &mut woken => settled.ok(),
+            () = self.cancel.cancelled() => None,
+            () = tokio::time::sleep_until(deadline) => None,
+        };
+        if settled.is_some() {
+            return settled;
+        }
+        let settlement = if self.cancel.is_cancelled() {
+            Settlement::Stopped
+        } else {
+            Settlement::TimedOut
+        };
+        let settled = match self.coordinator.settle_approval(&id, settlement).await {
+            Some(approval) => Some(approval),
+            // Settled first by someone whose record already left the control
+            // plane; that settlement sent it here before it let go of the
+            // transaction this settle waited for.
+            None => woken.try_recv().ok(),
+        };
+        // Whoever won has woken (and so removed) this waiter, or nobody will.
+        self.coordinator.forget_approval_waiter(&id);
+        settled
+    }
+
+    fn outcome(&self, approval: &ApprovalRequest) -> GateOutcome {
+        match approval.status {
+            ApprovalStatus::Allowed if !self.cancel.is_cancelled() => GateOutcome::Approved,
+            ApprovalStatus::Denied => GateOutcome::Refuse(TaskResult::error(
+                denial_text(
+                    approval
+                        .resolution
+                        .as_ref()
+                        .and_then(|resolution| resolution.note.as_deref()),
+                ),
+                0,
+            )),
+            // Allowed, but the run is being stopped: nothing new starts.
+            ApprovalStatus::Allowed | ApprovalStatus::Stopped => {
+                GateOutcome::Refuse(TaskResult::error(CANCELLED_TOOL_RESULT, 0))
+            }
+            ApprovalStatus::Pending | ApprovalStatus::Expired => {
+                GateOutcome::Refuse(TaskResult::error(APPROVAL_LOST, 0))
+            }
+        }
     }
 }
 

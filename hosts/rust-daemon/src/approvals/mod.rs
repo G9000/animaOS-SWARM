@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 #[allow(unused_imports)] // M4 Tasks 6 and 8 use the rest.
-pub(crate) use gate::{ApprovalTimeouts, ApprovalWaiters, PendingApproval};
+pub(crate) use gate::{
+    ApprovalGate, ApprovalTimeouts, ApprovalWaiters, GateOutcome, PendingApproval,
+};
 #[allow(unused_imports)] // M4 Tasks 3, 5, and 8 use the rest.
 pub(crate) use policy::{
     evaluate, matcher_kinds, risk_class, suggested_matcher, validate_matcher, Verdict,
