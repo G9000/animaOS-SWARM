@@ -1,5 +1,6 @@
 mod agent_runs;
 mod app;
+mod approvals;
 mod components;
 mod connectors;
 mod control_plane_store;
