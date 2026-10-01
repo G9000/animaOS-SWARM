@@ -248,9 +248,13 @@ pub(crate) struct SnapshotRun {
 }
 
 /// The first event of every stream (spec §6): the active runs with their
-/// current step, text so far, and tool cards, and the pending approvals
-/// (none before M4).
-pub(crate) fn snapshot_json(agent_id: &str, seq: u64, runs: &[SnapshotRun]) -> Value {
+/// current step, text so far, and tool cards, and their pending approvals.
+pub(crate) fn snapshot_json(
+    agent_id: &str,
+    seq: u64,
+    runs: &[SnapshotRun],
+    approvals: &[ApprovalRequest],
+) -> Value {
     let runs = runs
         .iter()
         .map(|run| {
@@ -270,7 +274,7 @@ pub(crate) fn snapshot_json(agent_id: &str, seq: u64, runs: &[SnapshotRun]) -> V
         "seq": seq,
         "at": now_millis(),
         "runs": runs,
-        "approvals": [],
+        "approvals": approvals.iter().map(approval_json).collect::<Vec<_>>(),
     })
 }
 

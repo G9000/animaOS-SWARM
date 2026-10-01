@@ -110,3 +110,11 @@ impl From<&ApprovalRequest> for ApprovalResponse {
         }
     }
 }
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ApprovalsEnvelope {
+    pub(crate) approvals: Vec<ApprovalResponse>,
+    /// `decided` only: pass it as `cursor` for the next, older page.
+    pub(crate) next_cursor: Option<String>,
+}

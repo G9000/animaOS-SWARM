@@ -69,6 +69,11 @@ pub(crate) const APPROVAL_LOST: &str = "The approval request was lost; the tool 
 pub(crate) const APPROVAL_ALREADY_RESOLVED: &str = "This approval was already resolved";
 pub(crate) const APPROVAL_REVISION_STALE: &str =
     "This approval changed; reload it and decide again";
+/// `GET /api/approvals?status=decided` reads this far back (spec §7.3).
+pub(crate) const DECIDED_APPROVAL_WINDOW_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+/// Decided approvals per page, by default and at most.
+pub(crate) const DEFAULT_APPROVAL_PAGE: usize = 50;
+pub(crate) const MAX_APPROVAL_PAGE: usize = 100;
 
 /// How much a tool can change (spec §7.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]

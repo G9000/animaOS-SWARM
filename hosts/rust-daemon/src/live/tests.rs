@@ -412,6 +412,7 @@ fn a_snapshot_lists_runs_with_their_live_state() {
             live: hub.runs().view(&run.id),
             record: run.clone(),
         }],
+        &[],
     );
 
     assert_eq!(value["type"], "stream.snapshot");

@@ -1,6 +1,7 @@
 mod agencies;
 mod agent_avatar;
 mod agents;
+mod approvals;
 mod capabilities;
 mod chatgpt;
 mod connectors;
@@ -172,6 +173,7 @@ use crate::runtime_model::provider_summaries;
         sessions::compact_session,
         events::agent_events,
         runs::start_session_run, runs::list_session_runs, runs::get_run, runs::stop_run,
+        approvals::list_approvals,
     ),
     components(schemas(self::contracts::AgentSummariesEnvelope)),
     tags(
@@ -186,6 +188,7 @@ use crate::runtime_model::provider_summaries;
         (name = "schedules", description = "Daemon-backed scheduled prompts"),
         (name = "sessions", description = "Agent sessions and their transcripts"),
         (name = "runs", description = "Live runs: the agent event stream, session runs, and stop"),
+        (name = "approvals", description = "Tool approvals: pending requests, decisions, policies, and rules"),
         (name = "workspace", description = "Workspace configuration and onboarding"),
     )
 )]
@@ -514,6 +517,7 @@ fn router_with_services_with_policies(
             "/api/agents/{agent_id}/runs/{run_id}/stop",
             axum::routing::post(runs::stop_run),
         )
+        .route("/api/approvals", get(approvals::list_approvals))
         .route("/api/ready", get(ready_entry))
         .route(
             "/api/workspace",
@@ -1910,6 +1914,7 @@ async fn handle_memory_search(uri: Uri, state: &SharedDaemonState) -> AxumRespon
 
 #[cfg(test)]
 mod tests {
+    mod approvals;
     mod capabilities;
     mod events;
     mod goals;

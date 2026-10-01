@@ -4,6 +4,7 @@ use std::collections::HashSet;
 
 use super::DaemonState;
 use crate::agent_runs::config_helper_parent;
+use crate::approvals::ApprovalRequest;
 use crate::live::{LiveEvent, LiveEventBody, LiveHub, SnapshotRun};
 use crate::runs::RunRecord;
 
@@ -67,6 +68,21 @@ impl DaemonState {
                 .then_with(|| left.record.id.cmp(&right.record.id))
         });
         runs
+    }
+
+    /// The pending approvals of a new stream's runs (spec §6), oldest first,
+    /// so a client that reconnects shows them again.
+    pub(crate) fn live_snapshot_approvals(&self, runs: &[SnapshotRun]) -> Vec<ApprovalRequest> {
+        let run_ids = runs
+            .iter()
+            .map(|run| run.record.id.as_str())
+            .collect::<HashSet<_>>();
+        self.approvals
+            .pending()
+            .into_iter()
+            .filter(|approval| run_ids.contains(approval.run_id.as_str()))
+            .cloned()
+            .collect()
     }
 
     /// The agent whose stream also carries events of `agent_id`'s session

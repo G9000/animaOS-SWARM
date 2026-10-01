@@ -208,6 +208,53 @@ async fn the_first_event_is_a_snapshot_of_the_active_runs() {
 }
 
 #[tokio::test]
+async fn the_snapshot_lists_the_pending_approvals_of_its_runs() {
+    use crate::approvals::{ApprovalRequest, PendingApprovalStart};
+
+    let (state, agent) = state_with_agent();
+    let active = running(&agent, "chat:a");
+    let call = anima_core::ToolCall {
+        id: "call-1".into(),
+        name: "memory_add".into(),
+        args: std::collections::BTreeMap::from([(
+            "content".to_string(),
+            anima_core::DataValue::String("the plan".into()),
+        )]),
+    };
+    {
+        let mut guard = state.write().await;
+        guard.runs.insert(active.clone());
+        guard.live.runs().register(&active.id);
+        for (session, run) in [("chat:a", active.id.as_str()), ("chat:b", "run_elsewhere")] {
+            guard.approvals.insert(ApprovalRequest::pending(
+                PendingApprovalStart {
+                    agent_id: &agent,
+                    session_id: session,
+                    run_id: run,
+                    call: &call,
+                    timeout_ms: 60_000,
+                },
+                5,
+            ));
+        }
+    }
+    let app = router(state, DaemonConfig::default());
+
+    let response = app
+        .oneshot(events_request(&agent, OWNER_ORIGIN))
+        .await
+        .unwrap();
+    let snapshot = SseReader::new(response).next().await;
+
+    let approvals = snapshot.data["approvals"].as_array().unwrap();
+    assert_eq!(approvals.len(), 1, "only the snapshot's runs' approvals");
+    assert_eq!(approvals[0]["runId"], active.id.as_str());
+    assert_eq!(approvals[0]["status"], "pending");
+    assert_eq!(approvals[0]["tool"], "memory_add");
+    assert_eq!(approvals[0]["matcherKinds"], serde_json::json!(["any"]));
+}
+
+#[tokio::test]
 async fn the_snapshot_covers_helper_and_delegated_runs_oldest_first() {
     use crate::sessions::{SessionKind, SessionOrigin, SessionRecord, TitleSource};
     use anima_core::DataValue;
