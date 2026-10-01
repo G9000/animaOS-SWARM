@@ -14,6 +14,7 @@ use crate::approvals::{
     APPROVAL_UNAVAILABLE, MAX_APPROVAL_NOTE_CHARS, MAX_SESSION_ALLOWANCES,
     TOO_MANY_SESSION_ALLOWANCES,
 };
+use crate::live::{run_status_event, LiveEvent, LiveEventBody};
 use crate::runs::{RunLink, RunRecord, RunStatus};
 
 /// A call that needs the owner (spec §7.3).
@@ -112,6 +113,40 @@ fn normalized_note(note: Option<&str>) -> Result<Option<String>, SettleRefusal> 
 }
 
 impl DaemonState {
+    /// `approval.requested` for a pending approval, otherwise
+    /// `approval.resolved`, to its agent's stream and to the stream that
+    /// carries its session (spec §6).
+    pub(crate) fn publish_approval(&self, approval: &ApprovalRequest) {
+        let body = if approval.is_pending() {
+            LiveEventBody::ApprovalRequested(approval.clone())
+        } else {
+            LiveEventBody::ApprovalResolved(approval.clone())
+        };
+        let parent = self.live_parent_agent(&approval.agent_id, &approval.session_id);
+        self.live.publish(
+            LiveEvent::new(&approval.agent_id, body)
+                .session(&approval.session_id)
+                .run(&approval.run_id),
+            parent.as_deref(),
+        );
+    }
+
+    /// `record`'s lifecycle event for its current status: a request's
+    /// `run.awaiting_approval`, or a resume's `run.started`.
+    pub(crate) fn publish_run_status(&self, record: &RunRecord) {
+        let parent = self.live_parent_agent(&record.agent_id, &record.session_id);
+        self.live
+            .publish(run_status_event(record), parent.as_deref());
+    }
+
+    /// `approval.resolved`, then `run.started` when the run resumed.
+    pub(crate) fn publish_settled(&self, settled: &SettledApproval) {
+        self.publish_approval(&settled.approval);
+        if let Some(run) = &settled.run {
+            self.publish_run_status(run);
+        }
+    }
+
     /// Decided approvals for the history store (spec §13.1), the `limit`
     /// oldest resolutions first. Those of deleted agents or sessions are
     /// dropped first: their history went with them, and writing them would

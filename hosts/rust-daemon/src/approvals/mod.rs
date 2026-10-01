@@ -4,12 +4,15 @@
 //! (`gate`).
 #![allow(dead_code)] // M4 Task 8 removes this once the gate and the routes use every item.
 
+pub(crate) mod gate;
 pub(crate) mod policy;
 pub(crate) mod registry;
 
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+#[allow(unused_imports)] // M4 Tasks 6 and 8 use the rest.
+pub(crate) use gate::{ApprovalTimeouts, ApprovalWaiters, PendingApproval};
 #[allow(unused_imports)] // M4 Tasks 3, 5, and 8 use the rest.
 pub(crate) use policy::{
     evaluate, matcher_kinds, risk_class, suggested_matcher, validate_matcher, Verdict,
@@ -49,6 +52,21 @@ pub(crate) const APPROVAL_UNAVAILABLE: &str =
 pub(crate) const TOO_MANY_SESSION_ALLOWANCES: &str = "This session already has 50 allowances";
 /// `allow_session` for a session that no longer exists.
 pub(crate) const APPROVAL_SESSION_GONE: &str = "This approval's session no longer exists";
+/// How long a call waits for the owner (spec §7.3, §16)...
+pub(crate) const APPROVAL_TIMEOUT_MS: u64 = 30 * 60 * 1000;
+/// ...or, for a Telegram-started run, whose connector handles one message
+/// at a time.
+pub(crate) const TELEGRAM_APPROVAL_TIMEOUT_MS: u64 = 15 * 60 * 1000;
+/// A denial's tool result, followed by `": <note>"` when there is a note.
+pub(crate) const DENIED_BY_OWNER: &str = "Denied by owner";
+/// Helpers never wait (spec §7.3).
+pub(crate) const HELPER_NEEDS_APPROVAL: &str = "Needs owner approval; not available to helpers";
+pub(crate) const APPROVAL_NOT_SAVED: &str =
+    "Needs owner approval, but the request could not be saved; the tool did not run";
+pub(crate) const APPROVAL_LOST: &str = "The approval request was lost; the tool did not run";
+pub(crate) const APPROVAL_ALREADY_RESOLVED: &str = "This approval was already resolved";
+pub(crate) const APPROVAL_REVISION_STALE: &str =
+    "This approval changed; reload it and decide again";
 
 /// How much a tool can change (spec §7.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]

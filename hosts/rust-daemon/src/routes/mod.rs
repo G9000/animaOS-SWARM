@@ -64,7 +64,8 @@ use self::contracts::{
     WorkspaceResumeResponse,
 };
 pub(crate) use self::contracts::{
-    AgentRunEnvelope, AgentRuntimeSnapshotResponse, RunResponse, TaskResultResponse,
+    AgentRunEnvelope, AgentRuntimeSnapshotResponse, ApprovalResponse, RunResponse,
+    TaskResultResponse,
 };
 pub(crate) use self::http::configured_bind_is_loopback;
 use self::http::{json_response, make_http_span, read_limited_body, request_query};
