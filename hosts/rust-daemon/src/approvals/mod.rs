@@ -5,6 +5,7 @@
 #![allow(dead_code)] // M4 Task 8 removes this once the gate and the routes use every item.
 
 pub(crate) mod policy;
+pub(crate) mod registry;
 
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -12,6 +13,11 @@ use utoipa::ToSchema;
 #[allow(unused_imports)] // M4 Tasks 3, 5, and 8 use the rest.
 pub(crate) use policy::{
     evaluate, matcher_kinds, risk_class, suggested_matcher, validate_matcher, Verdict,
+};
+#[allow(unused_imports)] // M4 Tasks 3–8 use the rest.
+pub(crate) use registry::{
+    AgentApprovalPolicy, ApprovalDecisionKind, ApprovalRegistry, ApprovalRequest,
+    ApprovalResolution, ApprovalSnapshot, ApprovalStatus, PendingApprovalStart, ResolvedBy,
 };
 
 /// The tool result of a call the owner's policy denies (spec §7.2).
@@ -26,6 +32,11 @@ pub(crate) const MAX_MATCHER_VALUE_CHARS: usize = 512;
 pub(crate) const MAX_APPROVAL_RULES_PER_AGENT: usize = 100;
 /// "Allow for this session" grants one session may keep (plan bound).
 pub(crate) const MAX_SESSION_ALLOWANCES: usize = 50;
+/// A request keeps at most this much of its call's arguments (spec §7.3, §16).
+pub(crate) const MAX_APPROVAL_ARGUMENTS_BYTES: usize = 16 * 1024;
+/// `ApprovalRegistry::add_rule` past `MAX_APPROVAL_RULES_PER_AGENT`.
+pub(crate) const TOO_MANY_RULES: &str =
+    "This companion already has 100 approval rules; remove one first";
 
 /// How much a tool can change (spec §7.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]

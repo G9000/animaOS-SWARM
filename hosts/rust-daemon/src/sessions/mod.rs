@@ -253,6 +253,10 @@ pub(crate) struct SessionRecord {
     /// is not a valid session id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) room_id: Option<String>,
+    /// "Allow for this session" grants (spec §3.2, §7.3), at most
+    /// `approvals::MAX_SESSION_ALLOWANCES`; they end with the session.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) session_allowances: Vec<crate::approvals::SessionAllowance>,
 }
 
 impl SessionRecord {
@@ -287,6 +291,7 @@ impl SessionRecord {
             compaction_error: None,
             pruned_through: None,
             room_id: room,
+            session_allowances: Vec::new(),
         }
     }
 
