@@ -49,8 +49,8 @@ ON CONFLICT (id) DO UPDATE SET
 const PAGE_APPROVALS: &str = "
 SELECT record FROM history_approvals
 WHERE ($1::text IS NULL OR agent_id = $1) AND created_at_ms >= $2
-  AND ($3::bigint IS NULL OR created_at_ms < $3 OR (created_at_ms = $3 AND id < $4))
-ORDER BY created_at_ms DESC, id DESC
+  AND ($3::bigint IS NULL OR created_at_ms < $3 OR (created_at_ms = $3 AND id COLLATE \"C\" < $4))
+ORDER BY created_at_ms DESC, id COLLATE \"C\" DESC
 LIMIT $5";
 
 impl From<sqlx::Error> for HistoryError {

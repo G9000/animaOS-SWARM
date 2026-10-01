@@ -1,6 +1,6 @@
 //! History outbox (spec §13.1): committed messages, terminal runs, and decided
-//! approvals reach the history store within about a second, in batches, idempotently by id, with
-//! retries and backoff. Records stay in the control plane until mirrored, and
+//! approvals reach the history store within about a second, in batches,
+//! idempotently by id, with retries and backoff. Records stay in the control plane until mirrored, and
 //! only saved state is mirrored: the outbox reads the control plane under the
 //! control-plane transaction. Deletions stay saved in the control plane
 //! (`pendingHistoryDeletions`) until the store applies them. After a restart
@@ -295,7 +295,7 @@ impl HistoryService {
     }
 
     /// Reconciles when needed, writes queued items in order, then writes
-    /// terminal runs the ledger has not mirrored yet. `transactions` is the
+    /// terminal runs and decided approvals not mirrored yet. `transactions` is the
     /// control-plane transaction: the control plane is read only while it is
     /// held, so a commit whose save may still fail is never mirrored. The
     /// flush takes it itself (clearing an applied deletion saves under it), so

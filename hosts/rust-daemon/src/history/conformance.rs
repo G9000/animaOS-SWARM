@@ -173,6 +173,22 @@ pub(crate) async fn assert_history_store_approval_conformance(store: &dyn Histor
         [third.id.clone(), second.id.clone()],
         "only approvals created inside the window"
     );
+    assert_eq!(
+        ids(store
+            .page_approvals(&page(Some(&agent), base, Some(&third), 1))
+            .await
+            .unwrap()),
+        [second.id.clone()],
+        "a cursor inside a tie continues with the lower id"
+    );
+    assert_eq!(
+        ids(store
+            .page_approvals(&page(Some(&agent), base + 100, None, 10))
+            .await
+            .unwrap()),
+        [third.id.clone(), second.id.clone(), first.id.clone()],
+        "the window includes its start"
+    );
     // `since_ms = base` keeps other runs' older rows out of a shared database;
     // the filter keeps this run's rows if newer ones from other runs exist.
     let everyone = store
