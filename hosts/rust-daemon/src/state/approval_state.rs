@@ -174,10 +174,13 @@ impl DaemonState {
         })
     }
 
-    /// Takes back a request whose save failed.
+    /// Takes back a request whose save failed. The run goes back to
+    /// `running` only when this open is what moved it to `awaiting_approval`.
     pub(crate) fn revert_open_approval(&mut self, opened: &OpenedApproval) {
         self.approvals.remove(&opened.approval.id);
-        self.resume_if_unblocked(&opened.approval.run_id);
+        if opened.run.is_some() {
+            self.resume_if_unblocked(&opened.approval.run_id);
+        }
     }
 
     /// Moves `run_id` back to `running` once it waits on no approval.
@@ -951,6 +954,93 @@ mod tests {
             .session_allowances
             .is_empty());
         assert!(state.approvals.get(&always.id).unwrap().is_pending());
+    }
+
+    #[test]
+    fn reverting_a_settlement_keeps_a_rule_and_an_allowance_it_did_not_add() {
+        let (mut state, link) = daemon();
+        let first = state
+            .open_approval(&ask(&link, fetch()), 10)
+            .unwrap()
+            .approval;
+        state
+            .settle_approval(&first.id, owner(ApprovalDecisionKind::AllowAlways, 1), 11)
+            .unwrap();
+        let rule_id = state.approvals.rules_for(&link.agent_id)[0].id.clone();
+        let second = state
+            .open_approval(&ask(&link, fetch()), 12)
+            .unwrap()
+            .approval;
+        let settled = state
+            .settle_approval(&second.id, owner(ApprovalDecisionKind::AllowAlways, 1), 13)
+            .unwrap();
+        assert!(
+            settled.undo.added_rule.is_none(),
+            "the equal rule is reused"
+        );
+        state.revert_settled_approval(settled.undo);
+        let rules = state.approvals.rules_for(&link.agent_id);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(
+            rules[0].id, rule_id,
+            "the reverted settlement kept the rule"
+        );
+
+        let third = state
+            .open_approval(&ask(&link, fetch()), 14)
+            .unwrap()
+            .approval;
+        state
+            .settle_approval(&third.id, owner(ApprovalDecisionKind::AllowSession, 1), 15)
+            .unwrap();
+        let fourth = state
+            .open_approval(&ask(&link, fetch()), 16)
+            .unwrap()
+            .approval;
+        let settled = state
+            .settle_approval(&fourth.id, owner(ApprovalDecisionKind::AllowSession, 1), 17)
+            .unwrap();
+        assert!(
+            !settled.undo.added_allowance,
+            "the allowance already existed"
+        );
+        state.revert_settled_approval(settled.undo);
+        let allowances = &state
+            .sessions
+            .get(&link.agent_id, "chat:a")
+            .unwrap()
+            .session_allowances;
+        assert_eq!(allowances.len(), 1);
+        assert_eq!(allowances[0].from_approval_id, third.id);
+    }
+
+    #[test]
+    fn reverting_a_settlement_leaves_a_run_that_is_no_longer_running() {
+        let (mut state, link) = daemon();
+        let id = state
+            .open_approval(&ask(&link, remember()), 10)
+            .unwrap()
+            .approval
+            .id;
+        let settled = state
+            .settle_approval(&id, owner(ApprovalDecisionKind::AllowOnce, 1), 11)
+            .unwrap();
+        assert!(settled.undo.resumed_run);
+        state.runs.get_mut(&link.run_id).unwrap().status = RunStatus::Cancelled;
+        state.revert_settled_approval(settled.undo);
+        assert_eq!(run_status(&state, &link), RunStatus::Cancelled);
+        assert!(state.approvals.get(&id).unwrap().is_pending());
+    }
+
+    #[test]
+    fn reverting_an_open_leaves_a_run_it_did_not_move() {
+        let (mut state, link) = daemon();
+        state.runs.get_mut(&link.run_id).unwrap().status = RunStatus::AwaitingApproval;
+        let opened = state.open_approval(&ask(&link, remember()), 10).unwrap();
+        assert!(opened.run.is_none(), "the run already awaited approval");
+        state.revert_open_approval(&opened);
+        assert_eq!(run_status(&state, &link), RunStatus::AwaitingApproval);
+        assert!(state.approvals.pending().is_empty());
     }
 
     #[test]
