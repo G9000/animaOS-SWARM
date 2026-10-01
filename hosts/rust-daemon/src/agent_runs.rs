@@ -1711,6 +1711,7 @@ impl AgentRunCoordinator {
             memory_store,
             history_outbox,
             persist_request,
+            orphaned_approvals,
         ) = {
             let mut guard = self.state.write().await;
             let mut change_set = RunChangeSet::new(
@@ -1730,6 +1731,9 @@ impl AgentRunCoordinator {
                 }
                 return Err(ApiError::not_found());
             }
+            // Controller ruling m2: settled `stopped` in this run's own save.
+            let orphaned_approvals =
+                guard.stop_orphaned_approvals(&run_id, anima_core::primitives::now_millis());
             // The next run's estimates follow this provider's count (spec
             // §5.2): the first model call's reported prompt tokens over this
             // run's uncalibrated estimate, which leaves out the system prompt
@@ -1761,6 +1765,7 @@ impl AgentRunCoordinator {
                 let rolled_back = apply_run_rollback(&mut guard, &mut rollback);
                 drop(guard);
                 save_offered_steers(&self.state, offered).await;
+                self.save_stopped_approvals(orphaned_approvals).await;
                 rolled_back?;
                 return Err(error);
             }
@@ -1777,6 +1782,7 @@ impl AgentRunCoordinator {
                 guard.memory_store_config(),
                 guard.history.clone(),
                 guard.control_plane_persist_request(),
+                orphaned_approvals,
             )
         };
         if let Err(error) = persist_request.save().await {
@@ -1789,6 +1795,7 @@ impl AgentRunCoordinator {
             let rolled_back = apply_run_rollback(&mut guard, &mut rollback);
             drop(guard);
             save_offered_steers(&self.state, offered).await;
+            self.save_stopped_approvals(orphaned_approvals).await;
             rolled_back?;
             return Err(ApiError::service_unavailable(error.to_string()));
         }
@@ -1796,6 +1803,7 @@ impl AgentRunCoordinator {
         // queued inside the transaction, so a deletion of its session, which
         // takes the same transaction, is always queued after it.
         history_outbox.enqueue_committed(&agent_id, &session_id, &change_set.delta.messages);
+        self.announce_stopped_approvals(&orphaned_approvals).await;
         drop(transaction);
         if let Some(finished) = &finished {
             for event in committed_message_events(finished, &change_set.delta.messages) {
@@ -2070,6 +2078,14 @@ impl Drop for InFlightRunGuard {
                         anima_core::primitives::now_millis(),
                     );
                 }
+                // Controller ruling m2: settled in memory; the next save carries it.
+                let now_ms = anima_core::primitives::now_millis();
+                for approval in guard.stop_orphaned_approvals(&run_id, now_ms) {
+                    guard.publish_approval(&approval);
+                }
+                let Some(record) = guard.runs.get(&run_id) else {
+                    return;
+                };
                 live.publish_record(record);
                 guard
                     .runs
@@ -2135,6 +2151,8 @@ async fn persist_task_result_memory(
     }
 }
 
+#[cfg(test)]
+mod approval_stop_tests;
 #[cfg(test)]
 mod approval_tests;
 #[cfg(test)]

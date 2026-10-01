@@ -92,10 +92,71 @@ impl ApprovalWaiters {
     }
 }
 
-/// A saved and announced request, and the wake-up its settlement sends.
+/// A request, from the moment it exists in the control plane, and the
+/// wake-up its settlement sends. Dropped before it has an outcome (its call
+/// went away: an aborted run task), it settles the request as `stopped`.
 pub(crate) struct PendingApproval {
     pub(crate) id: String,
     pub(crate) woken: oneshot::Receiver<ApprovalRequest>,
+    abandoned: AbandonGuard,
+}
+
+impl PendingApproval {
+    /// Armed as soon as the request is recorded and its waiter registered,
+    /// before the request's save: a call dropped while that save is in
+    /// flight cannot know whether it landed, so the request ends `stopped`
+    /// either way, and that settlement saves it.
+    pub(crate) fn armed(
+        coordinator: AgentRunCoordinator,
+        id: String,
+        woken: oneshot::Receiver<ApprovalRequest>,
+    ) -> Self {
+        Self {
+            abandoned: AbandonGuard {
+                coordinator,
+                id: Some(id.clone()),
+            },
+            id,
+            woken,
+        }
+    }
+
+    /// The request was taken back (its save failed): nothing is left to settle.
+    pub(crate) fn withdraw(mut self) {
+        self.abandoned.disarm();
+    }
+}
+
+/// Settles an approval as `stopped` when its waiting call is dropped before
+/// it had an outcome, so no request waits forever, and forgets its waiter at
+/// once (nobody listens any more). Drop cannot await: the settlement runs in
+/// a spawned task, under the control-plane transaction like every other.
+struct AbandonGuard {
+    coordinator: AgentRunCoordinator,
+    id: Option<String>,
+}
+
+impl AbandonGuard {
+    fn disarm(&mut self) {
+        self.id = None;
+    }
+}
+
+impl Drop for AbandonGuard {
+    fn drop(&mut self) {
+        let Some(id) = self.id.take() else {
+            return;
+        };
+        // The waiters mutex is a leaf: taking it here holds nothing else.
+        self.coordinator.forget_approval_waiter(&id);
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let coordinator = self.coordinator.clone();
+        handle.spawn(async move {
+            coordinator.settle_approval(&id, Settlement::Stopped).await;
+        });
+    }
 }
 
 /// A denial's tool result: `Denied by owner: <note>`, or `Denied by owner`.
@@ -221,7 +282,11 @@ impl ApprovalGate {
         pending: PendingApproval,
         deadline: tokio::time::Instant,
     ) -> Option<ApprovalRequest> {
-        let PendingApproval { id, mut woken } = pending;
+        let PendingApproval {
+            id,
+            mut woken,
+            mut abandoned,
+        } = pending;
         let mut wake_open = true;
         let settled = loop {
             tokio::select! {
@@ -237,6 +302,7 @@ impl ApprovalGate {
             }
         };
         if settled.is_some() {
+            abandoned.disarm();
             return settled;
         }
         let settlement = if self.cancel.is_cancelled() {
@@ -253,6 +319,7 @@ impl ApprovalGate {
         };
         // Whoever won has woken (and so removed) this waiter, or nobody will.
         self.coordinator.forget_approval_waiter(&id);
+        abandoned.disarm();
         settled
     }
 

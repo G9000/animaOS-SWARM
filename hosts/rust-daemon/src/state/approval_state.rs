@@ -400,6 +400,23 @@ impl DaemonState {
         })
     }
 
+    /// Settles `run_id`'s still-pending approvals as `stopped` (controller
+    /// ruling m2): a finished run waits on nothing, so a request whose call
+    /// went away without settling it does not stay pending. The caller saves
+    /// this with the run's own change where it can, then announces them.
+    pub(crate) fn stop_orphaned_approvals(
+        &mut self,
+        run_id: &str,
+        now_ms: u64,
+    ) -> Vec<ApprovalRequest> {
+        self.approvals
+            .pending_ids_for_run(run_id)
+            .into_iter()
+            .filter_map(|id| self.settle_approval(&id, Settlement::Stopped, now_ms).ok())
+            .map(|settled| settled.approval)
+            .collect()
+    }
+
     /// Puts back what a settlement changed after its save failed. Nothing
     /// else changes the approval meanwhile: every settlement holds the
     /// control-plane transaction until it is saved or reverted.
@@ -948,6 +965,46 @@ mod tests {
         let resolution = stopped.resolution.unwrap();
         assert_eq!(resolution.decision, None);
         assert_eq!(resolution.resolved_by, ResolvedBy::Stop);
+    }
+
+    #[test]
+    fn a_finished_run_leaves_no_approval_pending() {
+        let (mut state, link) = daemon();
+        let first = state
+            .open_approval(&ask(&link, remember()), 10)
+            .unwrap()
+            .approval;
+        let decided = state
+            .open_approval(&ask(&link, fetch()), 11)
+            .unwrap()
+            .approval;
+        state
+            .settle_approval(&decided.id, owner(ApprovalDecisionKind::Deny, 1), 12)
+            .unwrap();
+        state
+            .runs
+            .get_mut(&link.run_id)
+            .unwrap()
+            .finish(RunStatus::Failed, None, 13);
+
+        let stopped = state.stop_orphaned_approvals(&link.run_id, 14);
+        assert_eq!(stopped.len(), 1, "only the pending one");
+        assert_eq!(stopped[0].id, first.id);
+        assert_eq!(stopped[0].status, ApprovalStatus::Stopped);
+        assert_eq!(
+            stopped[0].resolution.as_ref().unwrap().resolved_by,
+            ResolvedBy::Stop
+        );
+        assert_eq!(
+            state.approvals.get(&decided.id).unwrap().status,
+            ApprovalStatus::Denied
+        );
+        assert_eq!(
+            run_status(&state, &link),
+            RunStatus::Failed,
+            "still finished"
+        );
+        assert!(state.stop_orphaned_approvals(&link.run_id, 15).is_empty());
     }
 
     #[test]

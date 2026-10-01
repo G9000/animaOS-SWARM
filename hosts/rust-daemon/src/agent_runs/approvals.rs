@@ -85,10 +85,13 @@ impl AgentRunCoordinator {
         // Registered before the request is durable or announced, so a
         // decision always finds its waiter.
         let woken = self.approval_waiters.register(&opened.approval.id);
+        // Armed from here: dropped mid-save, the request ends `stopped`.
+        let pending = PendingApproval::armed(self.clone(), opened.approval.id.clone(), woken);
         if let Err(error) = persist.save().await {
             warn!(approval_id = %opened.approval.id, error = %error, "could not save an approval request; the tool does not run");
             self.approval_waiters.forget(&opened.approval.id);
             self.state.write().await.revert_open_approval(&opened);
+            pending.withdraw();
             drop(transaction);
             return Err(TaskResult::error(APPROVAL_NOT_SAVED, 0));
         }
@@ -100,10 +103,7 @@ impl AgentRunCoordinator {
             guard.publish_approval(&opened.approval);
         }
         drop(transaction);
-        Ok(PendingApproval {
-            id: opened.approval.id,
-            woken,
-        })
+        Ok(pending)
     }
 
     /// Settles `id` as timed out or stopped unless something settled it
@@ -112,6 +112,25 @@ impl AgentRunCoordinator {
     /// the call from running, and a restart before the next save expires
     /// the request anyway (spec §4.8).
     pub(crate) async fn settle_approval(
+        &self,
+        id: &str,
+        settlement: Settlement,
+    ) -> Option<ApprovalRequest> {
+        // Runs to its end even if the waiting call is dropped meanwhile, so a
+        // settlement is never left applied but unannounced and unwoken.
+        let coordinator = self.clone();
+        let id = id.to_string();
+        tokio::spawn(async move {
+            coordinator
+                .settle_approval_to_the_end(&id, settlement)
+                .await
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    async fn settle_approval_to_the_end(
         &self,
         id: &str,
         settlement: Settlement,
@@ -134,6 +153,39 @@ impl AgentRunCoordinator {
         self.approval_waiters.wake(&settled.approval);
         drop(transaction);
         Some(settled.approval)
+    }
+
+    /// Announces approvals a finished run settled as `stopped` with its own
+    /// change, once that change is saved (controller ruling m2), and drops
+    /// any waiter still registered for them.
+    pub(crate) async fn announce_stopped_approvals(&self, approvals: &[ApprovalRequest]) {
+        if approvals.is_empty() {
+            return;
+        }
+        {
+            let guard = self.state.read().await;
+            for approval in approvals {
+                guard.publish_approval(approval);
+            }
+        }
+        for approval in approvals {
+            self.approval_waiters.wake(approval);
+        }
+    }
+
+    /// Saves approvals a failed run settled as `stopped` when its own change
+    /// could not carry them (its commit was rejected or not saved), then
+    /// announces them. An unsaved one is kept, as any unsaved stop is: the
+    /// next save carries it, and a restart expires it anyway.
+    pub(crate) async fn save_stopped_approvals(&self, approvals: Vec<ApprovalRequest>) {
+        if approvals.is_empty() {
+            return;
+        }
+        let persist = self.state.write().await.control_plane_persist_request();
+        if let Err(error) = persist.save().await {
+            warn!(error = %error, "could not save the approvals a failed run left pending; the next save keeps them");
+        }
+        self.announce_stopped_approvals(&approvals).await;
     }
 
     /// The owner's decision (spec §7.3): saved before its waiter is woken; a
