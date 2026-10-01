@@ -37,6 +37,18 @@ pub(crate) const MAX_APPROVAL_ARGUMENTS_BYTES: usize = 16 * 1024;
 /// `ApprovalRegistry::add_rule` past `MAX_APPROVAL_RULES_PER_AGENT`.
 pub(crate) const TOO_MANY_RULES: &str =
     "This companion already has 100 approval rules; remove one first";
+/// The longest owner note (spec §7.3, §16), in characters after trimming.
+pub(crate) const MAX_APPROVAL_NOTE_CHARS: usize = 1_000;
+pub(crate) const APPROVAL_NOTE_TOO_LONG: &str = "note must be at most 1,000 characters";
+/// A timeout's note (spec §7.3): the call's result reads
+/// "Denied by owner: Approval timed out".
+pub(crate) const APPROVAL_TIMED_OUT: &str = "Approval timed out";
+/// The tool result when a run that is not in flight tries to ask.
+pub(crate) const APPROVAL_UNAVAILABLE: &str =
+    "Needs owner approval, but this run cannot ask for it; the tool did not run";
+pub(crate) const TOO_MANY_SESSION_ALLOWANCES: &str = "This session already has 50 allowances";
+/// `allow_session` for a session that no longer exists.
+pub(crate) const APPROVAL_SESSION_GONE: &str = "This approval's session no longer exists";
 
 /// How much a tool can change (spec §7.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]

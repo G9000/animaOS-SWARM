@@ -1,3 +1,4 @@
+mod approval_state;
 mod live_state;
 mod run_commit;
 pub(crate) mod run_stop;
@@ -6,6 +7,10 @@ mod session_state;
 mod swarm_relationships;
 mod swarm_runtime;
 mod swarm_tools;
+#[allow(unused_imports)] // M4 Tasks 5 and 6 use these; Task 8 removes the allow.
+pub(crate) use self::approval_state::{
+    ApprovalAsk, ApprovalUndo, OwnerDecision, SettleRefusal, Settlement,
+};
 pub(crate) use self::run_commit::RunBuild;
 pub(crate) use self::run_commit::RunContextReport;
 pub(crate) use self::session_state::RunSessionRequest;
