@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use super::test_support::{
     approving_coordinator, ask_before_writes, calculate_call, chat_request, companion_config,
     decision, events_until, gated_context, lead_config, ledger_run, patient, pending_approvals,
-    remember_call, tool_input, tool_results, Gate, ScriptedModel, Step,
+    quiet_for, remember_call, tool_input, tool_results, Gate, ScriptedModel, Step,
 };
 use super::AgentRunCoordinator;
 use crate::approvals::{
@@ -635,6 +635,8 @@ async fn a_request_that_cannot_be_saved_never_runs_its_tool() {
     );
     let (coordinator, agent_id) =
         approving_coordinator(model, ask_before_writes(), patient()).await;
+    let hub = coordinator.state.read().await.live.clone();
+    let mut subscription = hub.subscribe(&agent_id).unwrap();
     let running = spawn_run(
         &coordinator,
         chat_request(&agent_id, "chat:ask", "remember"),
@@ -653,16 +655,298 @@ async fn a_request_that_cannot_be_saved_never_runs_its_tool() {
         .unwrap()
         .forget();
     save.release.add_permits(1);
+    // The model is asked again, so the refused call is over: its run is back
+    // at running.
     gate.entered().await;
+    {
+        let guard = coordinator.state.read().await;
+        let runs = guard.runs.for_session(&agent_id, "chat:ask");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, RunStatus::Running);
+    }
     gate.release();
 
     running.await.unwrap().unwrap();
     assert!(only_result(&coordinator, &agent_id)
         .await
         .contains(APPROVAL_NOT_SAVED));
+    {
+        let guard = coordinator.state.read().await;
+        assert!(guard.approvals.pending().is_empty());
+        assert!(guard.approvals.decided().is_empty());
+    }
+    let events = types(&events_until(&mut subscription, "run.completed").await);
+    for unannounced in ["approval.requested", "run.awaiting_approval"] {
+        assert!(!events.iter().any(|kind| kind == unannounced), "{events:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_decision_that_cannot_be_saved_leaves_the_call_waiting() {
+    let model = ScriptedModel::new(vec![
+        Step::Tools(vec![remember_call("call-1", "the plan")]),
+        Step::Text(vec!["ok"]),
+    ]);
+    let (coordinator, agent_id) =
+        approving_coordinator(model, ask_before_writes(), patient()).await;
+    let hub = coordinator.state.read().await.live.clone();
+    let mut subscription = hub.subscribe(&agent_id).unwrap();
+    let running = spawn_run(
+        &coordinator,
+        chat_request(&agent_id, "chat:ask", "remember"),
+    );
+    events_until(&mut subscription, "approval.requested").await;
+    let pending = pending_approvals(&coordinator, 1).await.remove(0);
+
+    let save = coordinator
+        .state
+        .write()
+        .await
+        .install_test_control_plane_save_gate(true);
+    let deciding = spawn_decision(&coordinator, &pending.id, ApprovalDecisionKind::AllowAlways);
+    tokio::time::timeout(Duration::from_secs(5), save.entered.acquire())
+        .await
+        .expect("the decision is saved")
+        .unwrap()
+        .forget();
+    save.release.add_permits(1);
+    let refused = deciding.await.unwrap().unwrap_err();
+    assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    assert_still_waiting(&coordinator, &agent_id, &pending).await;
+    assert_not_resolved(&mut subscription).await;
+
+    // The failing save gate was for one save; the owner decides again.
+    let allowed = coordinator
+        .decide_approval(&pending.id, decision(ApprovalDecisionKind::AllowAlways, 1))
+        .await
+        .unwrap();
+    assert_eq!(allowed.status, ApprovalStatus::Allowed);
+    running.await.unwrap().unwrap();
+    assert_eq!(
+        tool_results(&coordinator, &agent_id).await,
+        ["stored memory: the plan"]
+    );
+}
+
+/// `pending` still waits at revision 1, no rule was made, and its run still
+/// awaits approval.
+async fn assert_still_waiting(
+    coordinator: &AgentRunCoordinator,
+    agent_id: &str,
+    pending: &crate::approvals::ApprovalRequest,
+) {
     let guard = coordinator.state.read().await;
-    assert!(guard.approvals.pending().is_empty());
-    assert!(guard.approvals.decided().is_empty());
+    let still = guard.approvals.pending();
+    assert_eq!(still.len(), 1);
+    assert_eq!(still[0].id, pending.id);
+    assert_eq!(still[0].status, ApprovalStatus::Pending);
+    assert_eq!(still[0].revision, 1);
+    assert_eq!(still[0].resolution, None);
+    assert!(guard.approvals.rules_for(agent_id).is_empty());
+    assert_eq!(
+        guard.runs.get(&pending.run_id).unwrap().status,
+        RunStatus::AwaitingApproval
+    );
+}
+
+async fn assert_not_resolved(subscription: &mut crate::live::LiveSubscription) {
+    let events = types(&quiet_for(subscription).await);
+    assert!(
+        !events.iter().any(|kind| kind == "approval.resolved"),
+        "{events:?}"
+    );
+}
+
+type RunHandle =
+    tokio::task::JoinHandle<Result<crate::routes::AgentRunEnvelope, crate::routes::ApiError>>;
+
+/// Starts the owner's allow, then drops its caller while the decision's save
+/// is held, as a disconnecting HTTP client would; the save then fails or
+/// succeeds. Returns once the decision has let go of the transaction.
+async fn decide_and_walk_away(
+    fail: bool,
+) -> (
+    AgentRunCoordinator,
+    String,
+    crate::approvals::ApprovalRequest,
+    RunHandle,
+    crate::live::LiveSubscription,
+) {
+    let model = ScriptedModel::new(vec![
+        Step::Tools(vec![remember_call("call-1", "the plan")]),
+        Step::Text(vec!["ok"]),
+    ]);
+    let (coordinator, agent_id) =
+        approving_coordinator(model, ask_before_writes(), patient()).await;
+    let hub = coordinator.state.read().await.live.clone();
+    let mut subscription = hub.subscribe(&agent_id).unwrap();
+    let running = spawn_run(
+        &coordinator,
+        chat_request(&agent_id, "chat:ask", "remember"),
+    );
+    events_until(&mut subscription, "approval.requested").await;
+    let pending = pending_approvals(&coordinator, 1).await.remove(0);
+
+    let save = coordinator
+        .state
+        .write()
+        .await
+        .install_test_control_plane_save_gate(fail);
+    let deciding = spawn_decision(&coordinator, &pending.id, ApprovalDecisionKind::AllowOnce);
+    tokio::time::timeout(Duration::from_secs(5), save.entered.acquire())
+        .await
+        .expect("the decision is saved")
+        .unwrap()
+        .forget();
+    deciding.abort();
+    assert!(deciding.await.unwrap_err().is_cancelled());
+    save.release.add_permits(1);
+    drop(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            coordinator.control_plane_transaction(),
+        )
+        .await
+        .expect("the decision finishes on its own"),
+    );
+    (coordinator, agent_id, pending, running, subscription)
+}
+
+#[tokio::test]
+async fn a_decision_whose_caller_leaves_and_whose_save_fails_is_taken_back() {
+    let (coordinator, agent_id, pending, running, mut subscription) =
+        decide_and_walk_away(true).await;
+
+    assert_still_waiting(&coordinator, &agent_id, &pending).await;
+    assert_not_resolved(&mut subscription).await;
+    assert!(!running.is_finished());
+
+    coordinator
+        .decide_approval(&pending.id, decision(ApprovalDecisionKind::AllowOnce, 1))
+        .await
+        .unwrap();
+    running.await.unwrap().unwrap();
+    assert_eq!(
+        tool_results(&coordinator, &agent_id).await,
+        ["stored memory: the plan"]
+    );
+}
+
+#[tokio::test]
+async fn a_decision_whose_caller_leaves_is_still_saved_announced_and_woken() {
+    let (coordinator, agent_id, pending, running, mut subscription) =
+        decide_and_walk_away(false).await;
+
+    let events = events_until(&mut subscription, "run.completed").await;
+    let resolved = events
+        .iter()
+        .find(|event| event["type"] == "approval.resolved")
+        .expect("the decision is announced");
+    assert_eq!(resolved["approval"]["status"], "allowed");
+    tokio::time::timeout(Duration::from_secs(5), running)
+        .await
+        .expect("the waiting call is woken")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        tool_results(&coordinator, &agent_id).await,
+        ["stored memory: the plan"]
+    );
+    let replay = coordinator
+        .decide_approval(&pending.id, decision(ApprovalDecisionKind::AllowOnce, 1))
+        .await
+        .unwrap();
+    assert_eq!(replay.status, ApprovalStatus::Allowed, "it was kept");
+}
+
+#[tokio::test]
+async fn a_lost_wake_up_is_not_a_timeout() {
+    let model = ScriptedModel::new(vec![
+        Step::Tools(vec![remember_call("call-1", "the plan")]),
+        Step::Text(vec!["ok"]),
+    ]);
+    let timeouts = ApprovalTimeouts {
+        default: Duration::from_secs(2),
+        telegram: Duration::from_secs(2),
+    };
+    let (coordinator, agent_id) = approving_coordinator(model, ask_before_writes(), timeouts).await;
+    let running = spawn_run(
+        &coordinator,
+        chat_request(&agent_id, "chat:ask", "remember"),
+    );
+    let pending = pending_approvals(&coordinator, 1).await.remove(0);
+
+    // The wake-up is dropped unsent; the call keeps waiting.
+    coordinator.forget_approval_waiter(&pending.id);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_still_waiting(&coordinator, &agent_id, &pending).await;
+    assert!(!running.is_finished());
+
+    // Nobody hears this allow, so the deadline finds it and the call runs.
+    coordinator
+        .decide_approval(&pending.id, decision(ApprovalDecisionKind::AllowOnce, 1))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), running)
+        .await
+        .expect("the deadline ends the wait")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        tool_results(&coordinator, &agent_id).await,
+        ["stored memory: the plan"]
+    );
+}
+
+#[tokio::test]
+async fn a_tool_the_agent_lost_during_the_wait_does_not_run() {
+    let (coordinator, agent_id) =
+        approving_coordinator(ScriptedModel::new(vec![]), ask_before_writes(), patient()).await;
+    let agent = coordinator
+        .state
+        .read()
+        .await
+        .get_agent(&agent_id)
+        .unwrap()
+        .state;
+    let run = ledger_run(&coordinator, &agent_id, "room-lost").await;
+    let context = gated_context(&coordinator, &run, CancelSignal::new()).await;
+    let calling = tokio::spawn(async move {
+        let input = tool_input(&agent.id, "room-lost");
+        context
+            .execute_tool(agent, input, remember_call("call-1", "x"))
+            .await
+    });
+    let pending = pending_approvals(&coordinator, 1).await.remove(0);
+
+    // While the call waits, the owner takes the tool away from the agent.
+    coordinator
+        .state
+        .write()
+        .await
+        .update_agent(
+            &agent_id,
+            AgentConfigUpdate {
+                tools: Some(
+                    crate::tools::ToolRegistry::new()
+                        .resolve_descriptors(["calculate"])
+                        .unwrap(),
+                ),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    coordinator
+        .decide_approval(&pending.id, decision(ApprovalDecisionKind::AllowOnce, 1))
+        .await
+        .unwrap();
+
+    let result = calling.await.unwrap();
+    assert_eq!(
+        result.error.as_deref(),
+        Some(anima_core::tool_not_configured_error("memory_add").as_str())
+    );
 }
 
 #[tokio::test]

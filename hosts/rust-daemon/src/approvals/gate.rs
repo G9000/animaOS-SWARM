@@ -8,7 +8,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
 use std::time::Duration;
 
-use anima_core::{AgentState, CancelSignal, Content, TaskResult, ToolCall, CANCELLED_TOOL_RESULT};
+use anima_core::{
+    tool_not_configured_error, AgentState, CancelSignal, Content, TaskResult, ToolCall,
+    CANCELLED_TOOL_RESULT,
+};
 use tokio::sync::oneshot;
 
 use super::{
@@ -154,12 +157,15 @@ impl ApprovalGate {
             Verdict::Ask if is_helper_config(&agent.config) => {
                 GateOutcome::Refuse(TaskResult::error(HELPER_NEEDS_APPROVAL, 0))
             }
-            Verdict::Ask => self.ask(call).await,
+            Verdict::Ask => self.ask(agent, call).await,
         }
     }
 
-    async fn ask(&self, call: &ToolCall) -> GateOutcome {
+    async fn ask(&self, agent: &AgentState, call: &ToolCall) -> GateOutcome {
         let timeout = self.coordinator.approval_timeout(self.source);
+        // Taken before the request is made, so the wait ends when the
+        // record's `expiresAtMs` says it does.
+        let deadline = tokio::time::Instant::now() + timeout;
         let ask = ApprovalAsk {
             run: self.run.clone(),
             call: call.clone(),
@@ -169,22 +175,47 @@ impl ApprovalGate {
             Ok(pending) => pending,
             Err(refused) => return GateOutcome::Refuse(refused),
         };
-        match self.wait(pending, timeout).await {
+        let outcome = match self.wait(pending, deadline).await {
             Some(approval) => self.outcome(&approval),
             None => GateOutcome::Refuse(TaskResult::error(APPROVAL_LOST, 0)),
+        };
+        // The owner may have changed the agent during the wait: what runs is
+        // what the agent allows now, not what it allowed when it asked.
+        if matches!(outcome, GateOutcome::Approved)
+            && !self
+                .coordinator
+                .agent_still_allows(&agent.id, &call.name)
+                .await
+        {
+            return GateOutcome::Refuse(TaskResult::error(
+                tool_not_configured_error(&call.name),
+                0,
+            ));
         }
+        outcome
     }
 
     /// The approval as it was settled, by whoever settled it first. Holds no
     /// lock while it waits.
-    async fn wait(&self, pending: PendingApproval, timeout: Duration) -> Option<ApprovalRequest> {
+    async fn wait(
+        &self,
+        pending: PendingApproval,
+        deadline: tokio::time::Instant,
+    ) -> Option<ApprovalRequest> {
         let PendingApproval { id, mut woken } = pending;
-        let deadline = tokio::time::Instant::now() + timeout;
-        let settled = tokio::select! {
-            biased;
-            settled = &mut woken => settled.ok(),
-            () = self.cancel.cancelled() => None,
-            () = tokio::time::sleep_until(deadline) => None,
+        let mut wake_open = true;
+        let settled = loop {
+            tokio::select! {
+                biased;
+                settled = &mut woken, if wake_open => match settled {
+                    Ok(approval) => break Some(approval),
+                    // Dropped unsent: no wake-up is coming, but that is not a
+                    // timeout. The stop or the deadline still settles it.
+                    Err(_) => wake_open = false,
+                },
+                () = self.cancel.cancelled() => break None,
+                () = tokio::time::sleep_until(deadline) => break None,
+            }
         };
         if settled.is_some() {
             return settled;

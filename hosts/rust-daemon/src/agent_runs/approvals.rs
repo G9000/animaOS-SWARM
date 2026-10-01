@@ -44,6 +44,18 @@ impl AgentRunCoordinator {
             .approval_verdict(agent, session_id, call)
     }
 
+    /// Whether `agent_id` still exists and may use `tool` as it is configured
+    /// now. An approval can take minutes, and the owner may change or remove
+    /// the agent meanwhile.
+    pub(crate) async fn agent_still_allows(&self, agent_id: &str, tool: &str) -> bool {
+        self.state
+            .read()
+            .await
+            .agents
+            .get(agent_id)
+            .is_some_and(|runtime| runtime.config().allows_tool(tool))
+    }
+
     /// How long a run from `source` waits for the owner (spec §7.3).
     pub(crate) fn approval_timeout(&self, source: RunSource) -> Duration {
         self.approval_timeouts.for_source(source)
@@ -129,6 +141,30 @@ impl AgentRunCoordinator {
     /// with the record, from the history store once it moved there.
     #[allow(dead_code)] // M4 Task 8's decision route calls it.
     pub(crate) async fn decide_approval(
+        &self,
+        id: &str,
+        decision: OwnerDecision,
+    ) -> Result<ApprovalRequest, ApiError> {
+        // The decision runs to its end (saved, announced, and woken, or taken
+        // back) even if whoever asked stops waiting, e.g. an HTTP client that
+        // disconnects mid-save; otherwise it could stay applied in memory,
+        // unsaved, unannounced, and unwoken.
+        let coordinator = self.clone();
+        let id = id.to_string();
+        let operation =
+            tokio::spawn(
+                async move { coordinator.decide_approval_to_the_end(&id, decision).await },
+            );
+        match operation.await {
+            Ok(decided) => decided,
+            Err(error) => Err(ApiError::service_unavailable(format!(
+                "approval decision failed: {error}"
+            ))),
+        }
+    }
+
+    #[allow(dead_code)] // M4 Task 8's decision route calls `decide_approval`.
+    async fn decide_approval_to_the_end(
         &self,
         id: &str,
         decision: OwnerDecision,
