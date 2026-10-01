@@ -61,6 +61,44 @@ const DELEGATE_TOOLS: &[&str] = &[
 /// "Always allow `git status`" cannot approve `git status; rm -rf ~`.
 const SHELL_OPERATORS: &[char] = &[';', '&', '|', '`', '$', '>', '<', '(', ')', '\n', '\r'];
 
+/// Characters that quote, escape, glob, or expand in a shell. A prefix word
+/// holding one reads differently to the shell than to a whitespace split
+/// (`"./run` against `"./run evil.sh"`), so such a prefix never matches.
+const SHELL_WORD_SPECIALS: &[char] = &['\'', '"', '\\', '*', '?', '[', ']', '{', '}', '~', '#'];
+
+/// Commands that run their arguments as another command, so a suggested
+/// prefix of one would approve anything.
+const WRAPPER_COMMANDS: &[&str] = &[
+    "sh",
+    "bash",
+    "zsh",
+    "dash",
+    "env",
+    "sudo",
+    "doas",
+    "xargs",
+    "time",
+    "nice",
+    "nohup",
+    "timeout",
+    "exec",
+    "eval",
+    "command",
+    "builtin",
+    "source",
+    ".",
+    "python",
+    "node",
+    "bun",
+    "deno",
+    "ruby",
+    "perl",
+    "php",
+    "cmd",
+    "powershell",
+    "pwsh",
+];
+
 /// What a call needs before it runs (spec §7.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Verdict {
@@ -107,9 +145,11 @@ pub(crate) fn matcher_kinds(tool: &str) -> &'static [MatcherKind] {
     }
 }
 
+/// A string argument trimmed the way the tools trim it before use, so a
+/// matcher judges the value the tool will act on.
 fn string_arg<'a>(call: &'a ToolCall, key: &str) -> Option<&'a str> {
     match call.args.get(key) {
-        Some(DataValue::String(value)) => Some(value.as_str()),
+        Some(DataValue::String(value)) => Some(value.trim()),
         _ => None,
     }
 }
@@ -133,20 +173,46 @@ pub(crate) fn matcher_matches(matcher: &ApprovalMatcher, call: &ToolCall) -> boo
     }
 }
 
+/// A character bash does not split words on but Rust's whitespace split
+/// does (U+00A0, vertical tab, U+2028, ...), or a control character.
+fn has_odd_whitespace(text: &str) -> bool {
+    text.chars()
+        .any(|c| c != ' ' && c != '\t' && (c.is_whitespace() || c.is_control()))
+}
+
+/// Words as bash splits them: on space and tab only.
+fn shell_words(text: &str) -> impl Iterator<Item = &str> {
+    text.split([' ', '\t']).filter(|word| !word.is_empty())
+}
+
+/// Whether a prefix's words mean to the shell what they mean to the split.
+fn prefix_words_are_plain(prefix: &str) -> bool {
+    !prefix.contains(SHELL_OPERATORS)
+        && !has_odd_whitespace(prefix)
+        && shell_words(prefix).all(|word| !word.contains(SHELL_WORD_SPECIALS))
+}
+
 /// Whether `command`'s first words are `prefix`'s words, and `command`
-/// holds no shell operator.
+/// holds no shell operator. Commands with odd whitespace and prefixes with
+/// quoting, globbing, or odd whitespace never match.
 pub(crate) fn command_has_prefix(command: &str, prefix: &str) -> bool {
-    if command.contains(SHELL_OPERATORS) {
+    if command.contains(SHELL_OPERATORS) || has_odd_whitespace(command) {
         return false;
     }
-    let prefix = prefix.split_whitespace().collect::<Vec<_>>();
-    let words = command.split_whitespace().collect::<Vec<_>>();
+    if !prefix_words_are_plain(prefix) {
+        return false;
+    }
+    let prefix = shell_words(prefix).collect::<Vec<_>>();
+    let words = shell_words(command).collect::<Vec<_>>();
     !prefix.is_empty() && words.len() >= prefix.len() && words[..prefix.len()] == prefix[..]
 }
 
 /// A workspace-relative path's components, or `None` for an absolute path,
-/// one that climbs with `..`, or one naming a drive.
+/// one that climbs with `..`, one naming a drive, or one with a component
+/// that starts or ends in whitespace. The path is trimmed first, as the
+/// tools trim it.
 fn relative_components(path: &str) -> Option<Vec<&str>> {
+    let path = path.trim();
     if path.starts_with(['/', '\\']) {
         return None;
     }
@@ -155,7 +221,7 @@ fn relative_components(path: &str) -> Option<Vec<&str>> {
         match component {
             "" | "." => {}
             ".." => return None,
-            component if component.contains(':') => return None,
+            component if component.contains(':') || component != component.trim() => return None,
             component => components.push(component),
         }
     }
@@ -166,21 +232,33 @@ fn relative_components(path: &str) -> Option<Vec<&str>> {
 /// across any number of components. Absolute and climbing paths never match.
 pub(crate) fn path_matches(glob: &str, path: &str) -> bool {
     match (relative_components(glob), relative_components(path)) {
-        (Some(pattern), Some(path)) => segments_match(&pattern, &path),
+        (Some(mut pattern), Some(path)) => {
+            pattern.dedup_by(|a, b| *a == "**" && *b == "**");
+            segments_match(&pattern, &path)
+        }
         _ => false,
     }
 }
 
+/// Dynamic programming over (pattern segment, path component), so a glob
+/// with many `**` stays O(pattern x path).
 fn segments_match(pattern: &[&str], path: &[&str]) -> bool {
-    match pattern.split_first() {
-        None => path.is_empty(),
-        Some((first, rest)) if *first == "**" => {
-            (0..=path.len()).any(|skip| segments_match(rest, &path[skip..]))
+    let width = path.len() + 1;
+    // matches[i * width + j]: pattern[i..] matches path[j..].
+    let mut matches = vec![false; (pattern.len() + 1) * width];
+    matches[pattern.len() * width + path.len()] = true;
+    for i in (0..pattern.len()).rev() {
+        for j in (0..=path.len()).rev() {
+            matches[i * width + j] = if pattern[i] == "**" {
+                matches[(i + 1) * width + j] || (j < path.len() && matches[i * width + j + 1])
+            } else {
+                j < path.len()
+                    && component_matches(pattern[i], path[j])
+                    && matches[(i + 1) * width + j + 1]
+            };
         }
-        Some((first, rest)) => path.split_first().is_some_and(|(component, remaining)| {
-            component_matches(first, component) && segments_match(rest, remaining)
-        }),
     }
+    matches[0]
 }
 
 /// `*` matches any run of characters and `?` exactly one, within a component.
@@ -207,32 +285,53 @@ fn component_matches(pattern: &str, text: &str) -> bool {
     pattern[at..].iter().all(|character| *character == '*')
 }
 
+/// The lowercase host of an `http`/`https` URL, or `None` for another
+/// scheme, an unparsable URL, or an IP-literal host (domains never cover
+/// those).
 fn http_host(url: &str) -> Option<String> {
     let parsed = reqwest::Url::parse(url).ok()?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return None;
     }
-    let host = parsed
-        .host_str()?
-        .trim_end_matches('.')
-        .to_ascii_lowercase();
+    let host = parsed.domain()?.trim_end_matches('.').to_ascii_lowercase();
     (!host.is_empty()).then_some(host)
 }
 
 /// Whether `url` is an `http`/`https` URL on `domain` or a subdomain of it.
+/// The port is ignored: the rule trusts the host.
 pub(crate) fn url_in_domain(url: &str, domain: &str) -> bool {
     let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
-    !domain.is_empty()
+    is_domain(&domain)
         && http_host(url)
             .is_some_and(|host| host == domain || host.ends_with(&format!(".{domain}")))
 }
 
+/// Whether the command's first word runs its arguments as another command
+/// (a shell, an interpreter, `sudo`, `env VAR=x`, ...).
+fn is_wrapper(word: &str) -> bool {
+    let name = word.rsplit('/').next().unwrap_or(word).to_ascii_lowercase();
+    let name = name.strip_suffix(".exe").unwrap_or(&name);
+    WRAPPER_COMMANDS.contains(&name)
+        || name.contains('=')
+        || name
+            .strip_prefix("python")
+            .is_some_and(|version| version.chars().all(|c| c.is_ascii_digit() || c == '.'))
+}
+
 /// The command's first word, plus its second when that reads as a
 /// subcommand (`git status`, `npm test`), cut at the first shell operator.
+/// Empty when the first word quotes, globs, has odd whitespace, or wraps
+/// another command.
 fn command_suggestion(command: &str) -> String {
     let head = command.split(SHELL_OPERATORS).next().unwrap_or_default();
-    let mut words = head.split_whitespace();
-    let mut prefix = words.next().unwrap_or_default().to_string();
+    let mut words = shell_words(head);
+    let Some(first) = words.next() else {
+        return String::new();
+    };
+    if first.contains(SHELL_WORD_SPECIALS) || has_odd_whitespace(first) || is_wrapper(first) {
+        return String::new();
+    }
+    let mut prefix = first.to_string();
     if let Some(second) = words.next() {
         let subcommand = second
             .chars()
@@ -249,41 +348,56 @@ fn command_suggestion(command: &str) -> String {
     prefix
 }
 
-/// The file's folder and everything under it, or the file itself at the root.
+/// The file's folder and everything under it, or the file itself at the
+/// root; empty when the path is not a plain relative one.
 fn path_suggestion(path: &str) -> String {
     match relative_components(path) {
+        Some(components) if components.iter().any(|c| c.contains(['*', '?'])) => String::new(),
         Some(components) if components.len() > 1 => {
             format!("{}/**", components[..components.len() - 1].join("/"))
         }
         Some(components) => components[0].to_string(),
-        None => path.trim().to_string(),
+        None => String::new(),
     }
 }
 
 /// What "Always allow" and "Allow for this session" cover unless the owner
 /// edits it (spec §7.3 `suggestedMatcher`): the narrowest kind the tool
-/// takes, filled from the call.
+/// takes, filled from the call. When no safe value can be derived the value
+/// is empty and the kind stays the tool's own, never `any`; the console
+/// offers no scoped decision for an empty value.
 pub(crate) fn suggested_matcher(call: &ToolCall) -> ApprovalMatcher {
     let kind = matcher_kinds(&call.name)[0];
     let value = match kind {
         MatcherKind::CommandPrefix => string_arg(call, "command").map(command_suggestion),
         MatcherKind::PathGlob => string_arg(call, "file_path").map(path_suggestion),
         MatcherKind::Domain => string_arg(call, "url").and_then(http_host),
-        MatcherKind::Any => None,
+        MatcherKind::Any => return ApprovalMatcher::any(),
     };
-    match value {
-        Some(value) => ApprovalMatcher { kind, value },
-        None => ApprovalMatcher::any(),
-    }
+    let candidate = ApprovalMatcher {
+        kind,
+        value: value.unwrap_or_default(),
+    };
+    validate_matcher(&call.name, &candidate).unwrap_or(ApprovalMatcher {
+        kind,
+        value: String::new(),
+    })
 }
 
+/// A registrable-looking domain: two or more non-empty labels of letters,
+/// digits and hyphens, the last starting with a letter (so never an IP).
 fn is_domain(value: &str) -> bool {
     let value = value.trim_end_matches('.');
-    !value.is_empty()
-        && !value.starts_with('.')
+    let mut labels = value.split('.').collect::<Vec<_>>();
+    labels.len() >= 2
+        && labels.iter().all(|label| !label.is_empty())
         && value
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '.'))
+        && labels
+            .pop()
+            .and_then(|label| label.chars().next())
+            .is_some_and(|character| character.is_ascii_alphabetic())
 }
 
 /// An owner's matcher for `tool`, normalized, or why it is refused.
@@ -300,8 +414,8 @@ pub(crate) fn validate_matcher(
         _ if value.is_empty() || value.chars().count() > MAX_MATCHER_VALUE_CHARS => {
             return Err(MATCHER_VALUE_INVALID)
         }
-        MatcherKind::CommandPrefix if !value.contains(SHELL_OPERATORS) => {
-            value.split_whitespace().collect::<Vec<_>>().join(" ")
+        MatcherKind::CommandPrefix if prefix_words_are_plain(value) => {
+            shell_words(value).collect::<Vec<_>>().join(" ")
         }
         MatcherKind::PathGlob if relative_components(value).is_some() => value.to_string(),
         MatcherKind::Domain if is_domain(value) => value.trim_end_matches('.').to_ascii_lowercase(),
@@ -732,5 +846,225 @@ mod tests {
                 "{refused:?}"
             );
         }
+    }
+
+    fn empty(kind: MatcherKind) -> ApprovalMatcher {
+        matcher(kind, "")
+    }
+
+    #[test]
+    fn a_prefix_with_quoting_or_globbing_never_matches() {
+        assert!(!command_has_prefix("\"./run evil.sh\"", "\"./run"));
+        for prefix in [
+            "'a", "\"a", "a\\b", "a*", "a?", "a[", "a]", "a{", "a}", "~/x", "a#b",
+        ] {
+            assert!(!command_has_prefix("a b", prefix), "{prefix}");
+            assert_eq!(
+                validate_matcher("bash", &matcher(MatcherKind::CommandPrefix, prefix)),
+                Err(MATCHER_VALUE_INVALID),
+                "{prefix}"
+            );
+        }
+        assert_eq!(command_suggestion("\"./run evil.sh\""), "");
+        assert_eq!(command_suggestion("git \"status\""), "git");
+        assert_eq!(command_suggestion("~/bin/tool x"), "");
+        assert_eq!(command_suggestion("\"; rm"), "");
+        assert_eq!(
+            suggested_matcher(&call("bash", &[("command", "\"; rm")])),
+            empty(MatcherKind::CommandPrefix)
+        );
+    }
+
+    #[test]
+    fn only_space_and_tab_split_command_words() {
+        assert!(command_has_prefix("git\tstatus -s", "git status"));
+        assert!(!command_has_prefix("git status\r", "git status"));
+        assert!(!command_has_prefix("git status\r\n", "git status"));
+        for odd in ['\u{a0}', '\u{b}', '\u{c}', '\u{2028}', '\u{85}', '\u{0}'] {
+            let command = format!("./run{odd}evil.sh");
+            assert!(!command_has_prefix(&command, "./run"), "{odd:?}");
+            assert!(!command_has_prefix("./run evil.sh", &command), "{odd:?}");
+            assert_eq!(
+                validate_matcher("bash", &matcher(MatcherKind::CommandPrefix, &command)),
+                Err(MATCHER_VALUE_INVALID),
+                "{odd:?}"
+            );
+            assert_eq!(command_suggestion(&command), "", "{odd:?}");
+        }
+        assert_eq!(command_suggestion("git\u{a0}status"), "");
+    }
+
+    #[test]
+    fn a_suggestion_never_falls_back_to_any_for_a_scoped_tool() {
+        for (tool, key, value, kind) in [
+            ("bash", "other", "x", MatcherKind::CommandPrefix),
+            ("bg_start", "command", "", MatcherKind::CommandPrefix),
+            (
+                "web_fetch",
+                "url",
+                "ftp://example.com/x",
+                MatcherKind::Domain,
+            ),
+            ("web_fetch", "url", "not a url", MatcherKind::Domain),
+            ("web_fetch", "url", "http://10.0.0.1/", MatcherKind::Domain),
+            ("web_fetch", "url", "http://[::1]/", MatcherKind::Domain),
+            (
+                "write_file",
+                "file_path",
+                "/etc/passwd",
+                MatcherKind::PathGlob,
+            ),
+            ("write_file", "file_path", "../x", MatcherKind::PathGlob),
+            ("edit_file", "file_path", "C:\\x", MatcherKind::PathGlob),
+            ("multi_edit", "file_path", "a*/b.txt", MatcherKind::PathGlob),
+            ("write_file", "file_path", "", MatcherKind::PathGlob),
+        ] {
+            assert_eq!(
+                suggested_matcher(&call(tool, &[(key, value)])),
+                empty(kind),
+                "{tool} {value}"
+            );
+        }
+        let mut non_string = call("bash", &[]);
+        non_string
+            .args
+            .insert("command".into(), DataValue::Number(1.0));
+        assert_eq!(
+            suggested_matcher(&non_string),
+            empty(MatcherKind::CommandPrefix)
+        );
+        assert_eq!(
+            suggested_matcher(&call("send_message", &[])),
+            ApprovalMatcher::any(),
+            "a tool whose only kind is `any` still suggests it"
+        );
+    }
+
+    #[test]
+    fn matchers_trim_arguments_as_the_tools_do() {
+        assert!(!path_matches("**", " /etc/passwd"));
+        assert!(!path_matches("**", "\t/etc/passwd"));
+        assert!(path_matches("notes/**", "  notes/a.md "));
+        assert!(!path_matches("**", "notes/ x"), "component whitespace");
+        assert!(!path_matches("**", "notes /x"), "component whitespace");
+        let write = call("write_file", &[("file_path", " /etc/passwd")]);
+        assert!(!matcher_matches(
+            &matcher(MatcherKind::PathGlob, "**"),
+            &write
+        ));
+        let write = call("write_file", &[("file_path", " notes/a.md\n")]);
+        assert!(matcher_matches(
+            &matcher(MatcherKind::PathGlob, "notes/**"),
+            &write
+        ));
+        let bash = call("bash", &[("command", "  git status \n")]);
+        assert!(matcher_matches(
+            &matcher(MatcherKind::CommandPrefix, "git status"),
+            &bash
+        ));
+        let fetch = call("web_fetch", &[("url", "  https://docs.rs/serde \n")]);
+        assert!(matcher_matches(
+            &matcher(MatcherKind::Domain, "docs.rs"),
+            &fetch
+        ));
+        assert_eq!(
+            suggested_matcher(&call("bash", &[("command", "  git status -s\n")])),
+            matcher(MatcherKind::CommandPrefix, "git status")
+        );
+        assert_eq!(
+            suggested_matcher(&call("write_file", &[("file_path", " /etc/passwd")])),
+            empty(MatcherKind::PathGlob)
+        );
+    }
+
+    #[test]
+    fn many_double_stars_match_in_polynomial_time() {
+        let path = format!("{}c", "a/".repeat(3000));
+        assert!(!path_matches("**/a/**/a/**/a/**/b", &path));
+        assert!(path_matches("**/a/**/a/**/a/**/c", &path));
+        assert!(path_matches("**/**/**/c", &path));
+        assert!(path_matches("a/**/**/c", &path));
+        assert!(path_matches("**", "a"));
+        assert!(path_matches("a/**", "a/b"));
+        assert!(!path_matches("a/**/b", "a/c"));
+    }
+
+    #[test]
+    fn a_domain_rule_needs_a_real_name_and_never_covers_an_ip() {
+        assert!(!url_in_domain("http://10.0.0.1/", "0.1"));
+        assert!(!url_in_domain("http://10.0.0.1/", "10.0.0.1"));
+        assert!(!url_in_domain("http://[::1]/", "::1"));
+        assert!(!url_in_domain("http://localhost/", "localhost"));
+        assert!(!url_in_domain("http://example.com/", "com"));
+        for refused in ["0.1", "com", "10.0.0.1", "localhost", "a..b", "a.1"] {
+            assert_eq!(
+                validate_matcher("web_fetch", &matcher(MatcherKind::Domain, refused)),
+                Err(MATCHER_VALUE_INVALID),
+                "{refused}"
+            );
+        }
+        assert!(url_in_domain("http://a.example.co.uk/", "example.co.uk"));
+    }
+
+    #[test]
+    fn a_command_that_runs_other_commands_gets_no_suggested_prefix() {
+        for command in [
+            "sh -c ls",
+            "bash script.sh",
+            "zsh x",
+            "dash x",
+            "env FOO=1 ls",
+            "sudo ls",
+            "doas ls",
+            "xargs rm",
+            "time ls",
+            "nice ls",
+            "nohup ls",
+            "timeout 5 ls",
+            "exec ls",
+            "eval ls",
+            "command ls",
+            "builtin cd",
+            "source x",
+            ". ./x",
+            "python x.py",
+            "python2 x.py",
+            "python3 x.py",
+            "python3.12 x.py",
+            "node x.js",
+            "bun run x",
+            "deno run x",
+            "ruby x.rb",
+            "perl x.pl",
+            "php x.php",
+            "/usr/bin/env ls",
+            "FOO=1 ls",
+        ] {
+            assert_eq!(command_suggestion(command), "", "{command}");
+        }
+        for (command, expected) in [
+            ("git status -s", "git status"),
+            ("npm test", "npm test"),
+            ("cargo test --lib", "cargo test"),
+        ] {
+            assert_eq!(command_suggestion(command), expected, "{command}");
+        }
+    }
+
+    #[test]
+    fn pinned_edge_cases_keep_behaving() {
+        assert!(!command_has_prefix("git status\r", "git status"));
+        assert!(command_has_prefix("git\tstatus", "git\tstatus"));
+        for path in ["notes\\..\\x", "\\\\server\\share\\x", "C:\\x", "\\x", "/x"] {
+            assert!(!path_matches("**", path), "{path}");
+        }
+        assert!(path_matches("notes/*", "notes\\x"), "backslash separates");
+        assert!(!url_in_domain("http://example.com@evil.net", "example.com"));
+        assert!(url_in_domain("https://example.com./", "example.com"));
+        assert!(
+            url_in_domain("https://example.com:8443/x", "example.com"),
+            "a domain rule trusts the host on any port"
+        );
+        assert!(url_in_domain("http://evil.net@example.com/", "example.com"));
     }
 }
