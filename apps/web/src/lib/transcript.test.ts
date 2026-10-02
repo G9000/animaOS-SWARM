@@ -680,9 +680,21 @@ describe('mergeSessionRuns', () => {
       'running',
     );
 
+    // Running and awaiting approval are both in flight: the stream's view
+    // wins, so a stale ledger read never puts a resumed run back to
+    // "awaiting approval" (M4 Review Focus 5).
     const awaitingLedger = { ...queued, status: 'awaiting_approval' as const };
     expect(
       mergeSessionRuns([runningLive], [awaitingLedger])[0].run.status,
+    ).toBe('running');
+    expect(
+      mergeSessionRuns(
+        [emptyLiveRun(awaitingLedger)],
+        [{ ...queued, status: 'running' as const }],
+      )[0].run.status,
+    ).toBe('awaiting_approval');
+    expect(
+      mergeSessionRuns([staleQueuedLive], [awaitingLedger])[0].run.status,
     ).toBe('awaiting_approval');
   });
 });

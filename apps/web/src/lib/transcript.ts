@@ -254,11 +254,13 @@ export function liveToolSteps(live: LiveRun): ToolStep[] {
   }));
 }
 
-/** Where a non-terminal status sits in the run lifecycle (spec §4.1). */
+/** Where a non-terminal status sits in the run lifecycle (spec §4.1).
+ *  Running and awaiting approval are both in flight and rank the same: the
+ *  stream's view of either wins (M4 Review Focus 5). */
 const NON_TERMINAL_ORDER: Record<string, number> = {
   queued: 0,
   running: 1,
-  awaiting_approval: 2,
+  awaiting_approval: 1,
 };
 
 /** Whether `next` is further along the (non-terminal) lifecycle than

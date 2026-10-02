@@ -8,12 +8,15 @@ import {
   MAX_LIVE_TOOL_CARDS,
   applyEvent,
   isActiveRun,
+  pendingApprovals,
   sessionLiveRuns,
   stepRunId,
   trimCommittedRun,
   type LiveState,
 } from './session-events';
 import {
+  approvalEvent,
+  approvalFixture,
   deltaEvent,
   progressEvent,
   resyncEvent,
@@ -368,5 +371,160 @@ describe('selectors', () => {
       sessionLiveRuns(state, 'agent-main', 'chat:1').map((live) => live.run.id),
     ).toEqual(['run_b', 'run_a']);
     expect(stepRunId('run_a:3')).toBe('run_a');
+  });
+});
+
+describe('approvals', () => {
+  const awaiting = runFixture('run_1', {
+    status: 'awaiting_approval',
+    startedAtMs: 2,
+  });
+  const cancelled = {
+    ...awaiting,
+    status: 'cancelled' as const,
+    finishedAtMs: 9,
+  };
+
+  it('keeps the snapshot pending approvals on their runs, once', () => {
+    const first = approvalFixture('apr_1', { createdAtMs: 5 });
+    const second = approvalFixture('apr_2', { createdAtMs: 3 });
+    const decided = approvalFixture('apr_3', { status: 'allowed' });
+    const state = applyAll([
+      snapshotEvent([snapshotRun(awaiting)], 1, 'agent-main', [
+        first,
+        second,
+        decided,
+      ]),
+      approvalEvent('approval.requested', first, 2),
+    ]);
+
+    expect(pendingApprovals(state.approvals).map((item) => item.id)).toEqual([
+      'apr_2',
+      'apr_1',
+    ]);
+    expect(state.runs.run_1.approvals.map((item) => item.id)).toEqual([
+      'apr_2',
+      'apr_1',
+    ]);
+
+    const reconnected = applyEvent(
+      state,
+      snapshotEvent([snapshotRun(awaiting)], 1, 'agent-main', [first]),
+    );
+    expect(Object.keys(reconnected.approvals)).toEqual(['apr_1']);
+    expect(reconnected.runs.run_1.approvals).toEqual([first]);
+  });
+
+  it('adds a requested approval and removes it once resolved', () => {
+    const approval = approvalFixture('apr_1');
+    const requested = applyAll([
+      snapshotEvent([]),
+      runEvent('run.awaiting_approval', awaiting, 2),
+      approvalEvent('approval.requested', approval, 3),
+    ]);
+    expect(requested.runs.run_1.approvals).toEqual([approval]);
+
+    const resolved = applyAll(
+      [
+        approvalEvent(
+          'approval.resolved',
+          { ...approval, status: 'allowed', revision: 2 },
+          4,
+        ),
+        runEvent('run.started', { ...awaiting, status: 'running' }, 5),
+      ],
+      requested,
+    );
+    expect(resolved.approvals).toEqual({});
+    expect(resolved.runs.run_1.approvals).toEqual([]);
+    expect(resolved.runs.run_1.run.status).toBe('running');
+  });
+
+  it('attaches an approval that arrived before its run', () => {
+    const approval = approvalFixture('apr_1');
+    const state = applyAll([
+      snapshotEvent([]),
+      approvalEvent('approval.requested', approval, 2),
+      runEvent('run.awaiting_approval', awaiting, 3),
+    ]);
+
+    expect(state.runs.run_1.approvals).toEqual([approval]);
+  });
+
+  it('drops a finished run approvals and ignores ones it never saw', () => {
+    const approval = approvalFixture('apr_1');
+    const state = applyAll([
+      snapshotEvent([snapshotRun(awaiting)], 1, 'agent-main', [approval]),
+      approvalEvent(
+        'approval.resolved',
+        approvalFixture('apr_unknown', { status: 'denied' }),
+        2,
+      ),
+    ]);
+    expect(Object.keys(state.approvals)).toEqual(['apr_1']);
+    expect(state.runs.run_1.approvals).toEqual([approval]);
+
+    const finished = applyEvent(state, runEvent('run.cancelled', cancelled, 3));
+    expect(finished.approvals).toEqual({});
+    expect(finished.runs.run_1.approvals).toEqual([]);
+  });
+
+  it('settles a request it never saw without a phantom entry', () => {
+    const state = applyAll([
+      snapshotEvent([snapshotRun(awaiting)]),
+      approvalEvent(
+        'approval.resolved',
+        approvalFixture('apr_lost', { status: 'stopped', revision: 2 }),
+        2,
+      ),
+    ]);
+
+    expect(state.approvals).toEqual({});
+    expect(state.runs.run_1.approvals).toEqual([]);
+  });
+
+  it('leaves a stopped run to its terminal event', () => {
+    const approval = approvalFixture('apr_1');
+    const waiting = applyAll([
+      snapshotEvent([snapshotRun(awaiting)], 1, 'agent-main', [approval]),
+      approvalEvent(
+        'approval.resolved',
+        { ...approval, status: 'stopped', revision: 2 },
+        2,
+      ),
+    ]);
+    // A stop publishes no `run.started`; the terminal event ends the wait.
+    expect(waiting.runs.run_1.approvals).toEqual([]);
+
+    const stopped = applyEvent(
+      waiting,
+      runEvent('run.cancelled', cancelled, 3),
+    );
+    expect(stopped.runs.run_1.run.status).toBe('cancelled');
+    expect(isActiveRun(stopped.runs.run_1.run)).toBe(false);
+    expect(stopped.approvals).toEqual({});
+  });
+
+  it('ignores a late request for a run that already finished', () => {
+    const state = applyAll([
+      snapshotEvent([]),
+      runEvent('run.cancelled', cancelled, 2),
+      approvalEvent('approval.requested', approvalFixture('apr_late'), 3),
+    ]);
+
+    expect(state.approvals).toEqual({});
+    expect(state.runs.run_1.approvals).toEqual([]);
+  });
+
+  it('keeps an empty suggested matcher value as given', () => {
+    const approval = approvalFixture('apr_1', {
+      suggestedMatcher: { kind: 'command_prefix', value: '' },
+    });
+    const state = applyAll([
+      snapshotEvent([snapshotRun(awaiting)]),
+      approvalEvent('approval.requested', approval, 2),
+    ]);
+
+    expect(state.runs.run_1.approvals[0].suggestedMatcher.value).toBe('');
   });
 });
