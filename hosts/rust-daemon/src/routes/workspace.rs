@@ -263,7 +263,7 @@ pub(crate) async fn handle_put_workspace(
 
     let persist_request = {
         let mut guard = state.write().await;
-        guard.workspace = Some(config);
+        guard.set_workspace(Some(config));
         guard.control_plane_persist_request()
     };
     persist_request
@@ -462,7 +462,7 @@ pub(crate) async fn handle_bootstrap_workspace(
                 }
             }
         }
-        guard.workspace = Some(workspace_config.clone());
+        guard.set_workspace(Some(workspace_config.clone()));
         guard.control_plane_persist_request()
     };
 
@@ -532,7 +532,7 @@ async fn rollback_bootstrap(
         for snapshot in snapshots {
             guard.remove_agent(&snapshot.state.id);
         }
-        guard.workspace = None;
+        guard.set_workspace(None);
         guard.control_plane_persist_request()
     };
     rollback_request.save().await.ok();
@@ -744,7 +744,7 @@ pub(crate) async fn handle_resume_workspace(
             }
             None => {
                 let previous_workspace = guard.workspace.clone();
-                guard.workspace = Some(workspace_config.clone());
+                guard.set_workspace(Some(workspace_config.clone()));
                 (previous_workspace, guard.control_plane_persist_request())
             }
         }
@@ -802,7 +802,7 @@ async fn rollback_resume(
         for (id, _) in created {
             guard.remove_agent(id);
         }
-        guard.workspace = previous_workspace;
+        guard.set_workspace(previous_workspace);
         guard.control_plane_persist_request()
     };
     rollback_request.save().await.ok();

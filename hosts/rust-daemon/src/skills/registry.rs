@@ -134,7 +134,7 @@ fn file_draft(slug: &str, file: &ScannedFile) -> SkillDraft {
     }
 }
 
-fn is_hex_hash(value: &str) -> bool {
+pub(super) fn is_hex_hash(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()

@@ -4,6 +4,7 @@ mod run_commit;
 pub(crate) mod run_stop;
 mod runtime_events;
 mod session_state;
+mod skill_state;
 mod swarm_relationships;
 mod swarm_runtime;
 mod swarm_tools;

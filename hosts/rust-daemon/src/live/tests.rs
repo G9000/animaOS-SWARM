@@ -819,3 +819,19 @@ fn approval_events_carry_the_approval_json() {
     assert_eq!(resolved["type"], "approval.resolved");
     assert_eq!(resolved["approval"]["revision"], 1);
 }
+
+#[test]
+fn skill_updated_names_the_skill_and_the_draft() {
+    let event = LiveEvent::new(
+        "agent-1",
+        LiveEventBody::SkillUpdated {
+            slug: Some("notes".into()),
+            draft_id: None,
+        },
+    )
+    .to_json(5);
+    assert_eq!(event["type"], "skill.updated");
+    assert_eq!(event["slug"], "notes");
+    assert_eq!(event["draftId"], json!(null));
+    assert_eq!(event["seq"], 5);
+}

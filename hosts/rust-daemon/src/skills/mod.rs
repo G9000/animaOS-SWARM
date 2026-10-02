@@ -8,6 +8,10 @@
 pub(crate) mod disk;
 pub(crate) mod file;
 pub(crate) mod registry;
+pub(crate) mod scanner;
+pub(crate) mod service;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 use serde::{Deserialize, Serialize};
 
@@ -15,6 +19,10 @@ use serde::{Deserialize, Serialize};
 pub(crate) use file::{compose_skill_file, parse_skill_file, skill_hash, SkillFile};
 #[allow(unused_imports)] // M5 Tasks 3–9 use them.
 pub(crate) use registry::{status_for, DraftView, ScannedFile, SkillRegistry, SkillSnapshot};
+#[allow(unused_imports)] // M5 Tasks 5–9 use them.
+pub(crate) use scanner::SkillScanner;
+#[allow(unused_imports)] // M5 Tasks 5–9 use them.
+pub(crate) use service::{LoadedSkill, SkillContent, SkillDetail, SkillError, SkillService};
 
 /// A `SKILL.md`'s Markdown body, after its front matter (spec §8.1, §16).
 pub(crate) const MAX_SKILL_BODY_BYTES: usize = 32 * 1024;
@@ -52,6 +60,8 @@ pub(crate) const SKILL_SCAN_INTERVAL_MS: u64 = 60_000;
 /// One read, write, scan, or move of skill files (plan bound: every long
 /// wait is bounded).
 pub(crate) const SKILL_IO_TIMEOUT_MS: u64 = 10_000;
+/// File work slower than this is logged (it still runs to `SKILL_IO_TIMEOUT_MS`).
+pub(crate) const SKILL_IO_SLOW_MS: u64 = 1_000;
 /// An imported `SKILL.md` (plan bound).
 pub(crate) const MAX_SKILL_IMPORT_BYTES: usize = 64 * 1024;
 
@@ -104,6 +114,8 @@ pub(crate) const SKILL_HASH_MISMATCH: &str =
     "SKILL.md changed since you reviewed it; reload and review it again";
 pub(crate) const SKILL_NOT_CHANGED: &str = "This skill has no changes waiting for approval";
 pub(crate) const SKILL_DRAFT_DECIDED: &str = "This draft was already decided";
+pub(crate) const SKILL_FILE_UNREVIEWED: &str =
+    "A SKILL.md the owner hasn't reviewed is in this folder; review it first";
 pub(crate) const TOO_MANY_SKILLS: &str = "This workspace already has 200 skills; delete one first";
 pub(crate) const TOO_MANY_IMPORT_DRAFTS: &str =
     "10 imported skills are already waiting for review; review them first";
@@ -481,6 +493,11 @@ mod tests {
             "Skill text must not contain invisible tag or direction-override characters"
         );
         assert_eq!(DECIDED_DRAFT_RETENTION_MS, 30 * 24 * 60 * 60 * 1000);
+        assert_eq!(SKILL_IO_SLOW_MS, 1_000);
+        assert_eq!(
+            SKILL_FILE_UNREVIEWED,
+            "A SKILL.md the owner hasn't reviewed is in this folder; review it first"
+        );
     }
 
     #[test]

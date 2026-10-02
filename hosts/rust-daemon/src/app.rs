@@ -243,6 +243,9 @@ pub(crate) async fn serve_with_state(
     })?;
     runtime.connectors.start_restored().await;
     runtime.scheduler.start().await;
+    // Spec §8.1: the startup rescan, then one every 60 seconds.
+    let skills = crate::skills::SkillScanner::new(runtime.agent_runs.skills());
+    skills.start();
     let connectors = runtime.connectors.clone();
     let scheduler = runtime.scheduler.clone();
     let agent_runs = runtime.agent_runs.clone();
@@ -264,6 +267,7 @@ pub(crate) async fn serve_with_state(
             live.close();
             jobs.shutdown().await;
             scheduler.shutdown().await;
+            skills.shutdown().await;
             connectors.shutdown().await;
             history.shutdown().await;
         })

@@ -26,6 +26,7 @@ mod compact;
 mod conversations;
 mod queue;
 mod shutdown;
+mod skills;
 mod stop;
 mod titles;
 
