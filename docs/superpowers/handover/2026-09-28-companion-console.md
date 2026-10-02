@@ -2,6 +2,13 @@
 
 This document is for the next agent picking up the companion console upgrade. Read it first; it tells you where everything is and what to do next.
 
+## Update 2026-10-02 (latest): M5 in progress (Tasks 1–7 committed)
+
+- **Done:** the M5 audit rulings are committed in the plan (`be0029f`). Tasks 1–5 are implemented, reviewed and fixed. Tasks 6 (`5729eab`, skill routes) and 7 (`61c6123`, draft/import routes and the multipart reader) are committed but **not yet reviewed**.
+- **Resume:** run one combined review of Tasks 6 and 7, a fix round, then Tasks 8–14, the final review, the fix wave and the gates, then a PR.
+- **Working files:** the ledger, briefs and rules are in `.superpowers/sdd/2026-09-23-companion-console-m5/`. These are local and gitignored; regenerate the briefs from the plan if they're missing.
+- Task 7 hardened the multipart reader now (per-part caps, a linear boundary search) instead of deferring that to M9 (audit m19). Drop that deferral note.
+
 ## Update 2026-10-02 (later): M5 planned and audited, not started
 
 - M4 is merged to `main` (PR #9, merge commit `f34313b`).
