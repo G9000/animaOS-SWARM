@@ -347,35 +347,45 @@ pub(super) async fn put_approval_policy(
         network: input.network,
         delegate: input.delegate,
     };
-    let transaction = state.agent_runs.control_plane_transaction().await;
-    let (previous, persist) = {
-        let mut guard = state.daemon.write().await;
-        match guard.agents.get(&agent_id) {
-            None => return rejected(ApiError::not_found()),
-            Some(runtime) if is_helper_config(runtime.config()) => {
-                return rejected(ApiError::conflict(HELPERS_USE_COMPANION_APPROVALS))
+    // Keep the transaction through the save and any revert even if the HTTP
+    // caller disconnects.
+    let operation = tokio::spawn(async move {
+        let transaction = state.agent_runs.control_plane_transaction().await;
+        let (previous, persist) = {
+            let mut guard = state.daemon.write().await;
+            match guard.agents.get(&agent_id) {
+                None => return rejected(ApiError::not_found()),
+                Some(runtime) if is_helper_config(runtime.config()) => {
+                    return rejected(ApiError::conflict(HELPERS_USE_COMPANION_APPROVALS))
+                }
+                Some(_) => {}
             }
-            Some(_) => {}
+            let previous = guard.approvals.set_policy(&agent_id, policy);
+            (previous, guard.control_plane_persist_request())
+        };
+        if let Err(error) = persist.save().await {
+            state
+                .daemon
+                .write()
+                .await
+                .approvals
+                .restore_policy(&agent_id, previous);
+            return rejected(ApiError::service_unavailable(error.to_string()));
         }
-        let previous = guard.approvals.set_policy(&agent_id, policy);
-        (previous, guard.control_plane_persist_request())
-    };
-    if let Err(error) = persist.save().await {
-        state
-            .daemon
-            .write()
-            .await
-            .approvals
-            .restore_policy(&agent_id, previous);
-        return rejected(ApiError::service_unavailable(error.to_string()));
+        drop(transaction);
+        no_store(json_response(
+            StatusCode::OK,
+            &ApprovalPolicyEnvelope {
+                policy: ApprovalPolicyResponse::from(&policy),
+            },
+        ))
+    });
+    match operation.await {
+        Ok(response) => response,
+        Err(error) => rejected(ApiError::service_unavailable(format!(
+            "approval policy update failed: {error}"
+        ))),
     }
-    drop(transaction);
-    no_store(json_response(
-        StatusCode::OK,
-        &ApprovalPolicyEnvelope {
-            policy: ApprovalPolicyResponse::from(&policy),
-        },
-    ))
 }
 
 /// Every registered tool a rule can cover (all but the read class), by name.
@@ -456,63 +466,73 @@ pub(super) async fn create_approval_rule(
         Err(response) => return response,
     };
     let tool = input.tool.trim().to_string();
-    let transaction = state.agent_runs.control_plane_transaction().await;
-    let (rule, persist) = {
-        let mut guard = state.daemon.write().await;
-        match guard.agents.get(&agent_id) {
-            None => return rejected(ApiError::not_found()),
-            Some(runtime) if is_helper_config(runtime.config()) => {
-                return rejected(ApiError::conflict(HELPERS_USE_COMPANION_APPROVALS))
+    // Keep the transaction through the save and any revert even if the HTTP
+    // caller disconnects.
+    let operation = tokio::spawn(async move {
+        let transaction = state.agent_runs.control_plane_transaction().await;
+        let (rule, persist) = {
+            let mut guard = state.daemon.write().await;
+            match guard.agents.get(&agent_id) {
+                None => return rejected(ApiError::not_found()),
+                Some(runtime) if is_helper_config(runtime.config()) => {
+                    return rejected(ApiError::conflict(HELPERS_USE_COMPANION_APPROVALS))
+                }
+                Some(_) => {}
             }
-            Some(_) => {}
-        }
-        if guard.tool_registry.lookup(&tool).is_none() {
-            return rejected(ApiError::bad_request_static(UNKNOWN_RULE_TOOL));
-        }
-        if risk_class(&tool) == RiskClass::Read {
-            return rejected(ApiError::bad_request_static(READ_TOOLS_NEED_NO_RULE));
-        }
-        let matcher = match validate_matcher(&tool, &ApprovalMatcher::from(input.matcher)) {
-            Ok(matcher) => matcher,
-            Err(message) => return rejected(ApiError::bad_request_static(message)),
+            if guard.tool_registry.lookup(&tool).is_none() {
+                return rejected(ApiError::bad_request_static(UNKNOWN_RULE_TOOL));
+            }
+            if risk_class(&tool) == RiskClass::Read {
+                return rejected(ApiError::bad_request_static(READ_TOOLS_NEED_NO_RULE));
+            }
+            let matcher = match validate_matcher(&tool, &ApprovalMatcher::from(input.matcher)) {
+                Ok(matcher) => matcher,
+                Err(message) => return rejected(ApiError::bad_request_static(message)),
+            };
+            if let Some(existing) = guard.approvals.find_rule(&agent_id, &tool, &matcher) {
+                return no_store(json_response(
+                    StatusCode::OK,
+                    &ApprovalRuleEnvelope {
+                        rule: ApprovalRuleResponse::from(existing),
+                    },
+                ));
+            }
+            let rule = ApprovalRule {
+                id: format!("rule_{}", uuid::Uuid::new_v4()),
+                agent_id: agent_id.clone(),
+                tool,
+                matcher,
+                created_at_ms: now_millis(),
+                from_approval_id: None,
+            };
+            if let Err(message) = guard.approvals.add_rule(rule.clone()) {
+                return rejected(ApiError::conflict(message));
+            }
+            (rule, guard.control_plane_persist_request())
         };
-        if let Some(existing) = guard.approvals.find_rule(&agent_id, &tool, &matcher) {
-            return no_store(json_response(
-                StatusCode::OK,
-                &ApprovalRuleEnvelope {
-                    rule: ApprovalRuleResponse::from(existing),
-                },
-            ));
+        if let Err(error) = persist.save().await {
+            state
+                .daemon
+                .write()
+                .await
+                .approvals
+                .remove_rule(&agent_id, &rule.id);
+            return rejected(ApiError::service_unavailable(error.to_string()));
         }
-        let rule = ApprovalRule {
-            id: format!("rule_{}", uuid::Uuid::new_v4()),
-            agent_id: agent_id.clone(),
-            tool,
-            matcher,
-            created_at_ms: now_millis(),
-            from_approval_id: None,
-        };
-        if let Err(message) = guard.approvals.add_rule(rule.clone()) {
-            return rejected(ApiError::conflict(message));
-        }
-        (rule, guard.control_plane_persist_request())
-    };
-    if let Err(error) = persist.save().await {
-        state
-            .daemon
-            .write()
-            .await
-            .approvals
-            .remove_rule(&agent_id, &rule.id);
-        return rejected(ApiError::service_unavailable(error.to_string()));
+        drop(transaction);
+        no_store(json_response(
+            StatusCode::CREATED,
+            &ApprovalRuleEnvelope {
+                rule: ApprovalRuleResponse::from(&rule),
+            },
+        ))
+    });
+    match operation.await {
+        Ok(response) => response,
+        Err(error) => rejected(ApiError::service_unavailable(format!(
+            "approval rule creation failed: {error}"
+        ))),
     }
-    drop(transaction);
-    no_store(json_response(
-        StatusCode::CREATED,
-        &ApprovalRuleEnvelope {
-            rule: ApprovalRuleResponse::from(&rule),
-        },
-    ))
 }
 
 #[utoipa::path(delete, path = "/api/agents/{agent_id}/approval-rules/{rule_id}", tag = "approvals",
@@ -531,25 +551,35 @@ pub(super) async fn delete_approval_rule(
     if let Err(response) = authorize(&state, &request, false) {
         return response;
     }
-    let transaction = state.agent_runs.control_plane_transaction().await;
-    let (removed, persist) = {
-        let mut guard = state.daemon.write().await;
-        if !guard.agents.contains_key(&agent_id) {
-            return rejected(ApiError::not_found());
-        }
-        let Some(removed) = guard.approvals.remove_rule(&agent_id, &rule_id) else {
-            return rejected(ApiError::not_found());
+    // Keep the transaction through the save and any revert even if the HTTP
+    // caller disconnects.
+    let operation = tokio::spawn(async move {
+        let transaction = state.agent_runs.control_plane_transaction().await;
+        let (removed, persist) = {
+            let mut guard = state.daemon.write().await;
+            if !guard.agents.contains_key(&agent_id) {
+                return rejected(ApiError::not_found());
+            }
+            let Some(removed) = guard.approvals.remove_rule(&agent_id, &rule_id) else {
+                return rejected(ApiError::not_found());
+            };
+            (removed, guard.control_plane_persist_request())
         };
-        (removed, guard.control_plane_persist_request())
-    };
-    if let Err(error) = persist.save().await {
-        // The removal left room, so putting it back cannot hit the cap.
-        let _ = state.daemon.write().await.approvals.add_rule(removed);
-        return rejected(ApiError::service_unavailable(error.to_string()));
+        if let Err(error) = persist.save().await {
+            // The removal left room, so putting it back cannot hit the cap.
+            let _ = state.daemon.write().await.approvals.add_rule(removed);
+            return rejected(ApiError::service_unavailable(error.to_string()));
+        }
+        drop(transaction);
+        no_store(json_response(
+            StatusCode::OK,
+            &DeleteResponse { deleted: true },
+        ))
+    });
+    match operation.await {
+        Ok(response) => response,
+        Err(error) => rejected(ApiError::service_unavailable(format!(
+            "approval rule removal failed: {error}"
+        ))),
     }
-    drop(transaction);
-    no_store(json_response(
-        StatusCode::OK,
-        &DeleteResponse { deleted: true },
-    ))
 }

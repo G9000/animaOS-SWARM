@@ -1,8 +1,10 @@
 //! History outbox (spec §13.1): committed messages, terminal runs, and decided
 //! approvals reach the history store within about a second, in batches,
 //! idempotently by id, with retries and backoff. Records stay in the control plane until mirrored, and
-//! only saved state is mirrored: the outbox reads the control plane under the
-//! control-plane transaction. Deletions stay saved in the control plane
+//! saved state is what is mirrored: the outbox reads the control plane under the
+//! control-plane transaction. The exceptions are timeout and stop settlements
+//! whose save failed, and in-memory orphan sweeps, which are mirrored too; a
+//! restart before the next save may then record those approvals as `expired`. Deletions stay saved in the control plane
 //! (`pendingHistoryDeletions`) until the store applies them. After a restart
 //! or a queue overflow the hot transcript is reconciled against the store;
 //! five minutes of failures become a readiness issue.

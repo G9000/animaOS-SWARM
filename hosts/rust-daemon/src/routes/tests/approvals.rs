@@ -851,3 +851,77 @@ async fn rules_refuse_unknown_and_read_tools_bad_matchers_and_the_101st() {
     assert_eq!(full.status(), StatusCode::CONFLICT);
     assert_eq!(json_body(full).await["error"], TOO_MANY_RULES);
 }
+
+/// A path a JSON control-plane save cannot write to: a directory where the
+/// store expects a file.
+fn invalid_snapshot_directory() -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "anima-approval-route-invalid-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&path).unwrap();
+    path
+}
+
+#[tokio::test]
+async fn a_failed_save_reverts_a_policy_change_a_new_rule_and_a_removed_rule() {
+    use crate::control_plane_store::ControlPlaneStoreConfig;
+
+    let (state, agent) = daemon();
+    let app = router(state.clone(), DaemonConfig::default());
+    let policy = format!("/api/agents/{agent}/approval-policy");
+    let rules = format!("/api/agents/{agent}/approval-rules");
+    let kept =
+        json!({"tool": "bash", "matcher": {"kind": "command_prefix", "value": "git status"}});
+    let created = app
+        .clone()
+        .oneshot(request("POST", &rules, OWNER_ORIGIN, Some(kept)))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let kept_id = json_body(created).await["rule"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let old_policy =
+        json!({"write": "allow", "exec": "ask", "network": "allow", "delegate": "allow"});
+
+    let invalid_path = invalid_snapshot_directory();
+    state
+        .write()
+        .await
+        .set_control_plane_store(Some(ControlPlaneStoreConfig::Json(invalid_path.clone())));
+
+    let strict = json!({"write": "ask", "exec": "deny", "network": "deny", "delegate": "ask"});
+    let new_rule =
+        json!({"tool": "bash", "matcher": {"kind": "command_prefix", "value": "git log"}});
+    for refused in [
+        request("PUT", &policy, OWNER_ORIGIN, Some(strict)),
+        request("POST", &rules, OWNER_ORIGIN, Some(new_rule)),
+        request("DELETE", &format!("{rules}/{kept_id}"), OWNER_ORIGIN, None),
+    ] {
+        let response = app.clone().oneshot(refused).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+    }
+
+    let read = json_body(
+        app.clone()
+            .oneshot(request("GET", &policy, OWNER_ORIGIN, None))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(read["policy"], old_policy, "the old policy stays");
+    let listed = json_body(
+        app.oneshot(request("GET", &rules, OWNER_ORIGIN, None))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let listed = listed["rules"].as_array().unwrap();
+    assert_eq!(listed.len(), 1, "the new rule was not added");
+    assert_eq!(listed[0]["id"], kept_id, "the deleted rule is still there");
+    let _ = std::fs::remove_dir_all(invalid_path);
+}
