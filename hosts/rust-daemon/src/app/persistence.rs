@@ -626,9 +626,13 @@ mod tests {
                 !crate::control_plane_store::pre_approvals_backup_path(&path).exists(),
                 "{version:?}: a pre-sessions snapshot writes only the pre-sessions backup"
             );
+            assert!(
+                !crate::control_plane_store::pre_skills_backup_path(&path).exists(),
+                "{version:?}: a pre-sessions snapshot writes no skills backup"
+            );
             let saved: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-            assert_eq!(saved["version"], 7, "{version:?}");
+            assert_eq!(saved["version"], 8, "{version:?}");
             assert_eq!(state.read().await.agent_count(), 1);
             let _ = std::fs::remove_dir_all(dir);
         }
@@ -679,7 +683,7 @@ mod tests {
         );
         let saved: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(saved["version"], 7);
+        assert_eq!(saved["version"], 8);
         let guard = state.read().await;
         assert_eq!(guard.agent_count(), 1);
         assert_eq!(
@@ -729,7 +733,7 @@ mod tests {
         );
         let saved: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(saved["version"], 7);
+        assert_eq!(saved["version"], 8);
         assert_eq!(saved["approvalRules"], serde_json::json!([]));
         let guard = state.read().await;
         assert_eq!(guard.agent_count(), 1);
@@ -737,6 +741,56 @@ mod tests {
             guard.approvals.policy(&agent_id),
             crate::approvals::ApprovalPolicy::default()
         );
+        drop(guard);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// M5: an M4 (version-7) snapshot is backed up as `.pre-skills.bak`
+    /// before version 8 is saved; the earlier upgrades' backups stay.
+    #[tokio::test]
+    async fn upgrading_a_version_seven_snapshot_writes_the_skills_backup_and_loads_it() {
+        let dir = temp_dir("upgrade-skills");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("control-plane.json");
+        let mut source = crate::state::DaemonState::new();
+        let agent_id = source.create_agent(upgrader()).unwrap().state.id;
+        let mut value = serde_json::to_value(source.control_plane_snapshot()).unwrap();
+        value["version"] = 7.into();
+        let object = value.as_object_mut().unwrap();
+        for key in ["skills", "skillDrafts"] {
+            object.remove(key);
+        }
+        let original = serde_json::to_string_pretty(&value).unwrap();
+        std::fs::write(&path, &original).unwrap();
+        let m4_backup = older_snapshot_file(Some(6));
+        let pre_approvals = crate::control_plane_store::pre_approvals_backup_path(&path);
+        std::fs::write(&pre_approvals, &m4_backup).unwrap();
+        let state = Arc::new(tokio::sync::RwLock::new(crate::state::DaemonState::new()));
+
+        configure_control_plane_store(&state, Some(ControlPlaneStoreConfig::Json(path.clone())))
+            .await
+            .unwrap();
+
+        let backup = crate::control_plane_store::pre_skills_backup_path(&path);
+        assert_eq!(
+            std::fs::read_to_string(&backup).unwrap(),
+            original,
+            "the backup is the untouched version-7 original"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&pre_approvals).unwrap(),
+            m4_backup,
+            "the M4 upgrade's backup is never overwritten"
+        );
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["version"], 8);
+        assert_eq!(saved["skills"], serde_json::json!([]));
+        assert_eq!(saved["skillDrafts"], serde_json::json!([]));
+        let guard = state.read().await;
+        assert_eq!(guard.agent_count(), 1);
+        assert!(guard.agents.contains_key(&agent_id));
+        assert!(guard.skills.records().is_empty());
         drop(guard);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -751,7 +805,7 @@ mod tests {
         configure_control_plane_store(&fresh, Some(config.clone()))
             .await
             .unwrap();
-        assert!(path.exists(), "a fresh start saves a version-7 snapshot");
+        assert!(path.exists(), "a fresh start saves a version-8 snapshot");
 
         let restarted = Arc::new(tokio::sync::RwLock::new(crate::state::DaemonState::new()));
         configure_control_plane_store(&restarted, Some(config))
@@ -761,16 +815,17 @@ mod tests {
         assert!(!crate::control_plane_store::pre_sessions_backup_path(&path).exists());
         assert!(!crate::control_plane_store::pre_live_runs_backup_path(&path).exists());
         assert!(!crate::control_plane_store::pre_approvals_backup_path(&path).exists());
+        assert!(!crate::control_plane_store::pre_skills_backup_path(&path).exists());
         let saved: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(saved["version"], 7, "a version-7 snapshot writes no backup");
+        assert_eq!(saved["version"], 8, "a version-8 snapshot writes no backup");
         let _ = std::fs::remove_dir_all(dir);
     }
 
     // Controller ruling (pre-flight audit): the backup is written only when the
     // loaded version is below CONTROL_PLANE_STORE_VERSION, so a later version
     // bump can never clobber it. This simulates a backup already on disk from a
-    // prior upgrade and proves loading a current (v7) snapshot never rewrites it.
+    // prior upgrade and proves loading a current (v8) snapshot never rewrites it.
     #[tokio::test]
     async fn loading_a_current_snapshot_leaves_an_existing_pre_upgrade_backup_untouched() {
         let dir = temp_dir("current-with-backup");
@@ -781,7 +836,7 @@ mod tests {
         configure_control_plane_store(&fresh, Some(config.clone()))
             .await
             .unwrap();
-        assert!(path.exists(), "a fresh start saves a version-7 snapshot");
+        assert!(path.exists(), "a fresh start saves a version-8 snapshot");
 
         let backup = crate::control_plane_store::pre_sessions_backup_path(&path);
         let preexisting_backup = "{\"version\":3,\"agents\":[],\"swarms\":[]}";

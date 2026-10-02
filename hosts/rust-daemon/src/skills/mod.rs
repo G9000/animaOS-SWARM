@@ -6,11 +6,14 @@
 #![allow(dead_code)] // M5 Task 9 removes this once the routes, tools, and runs use every item.
 
 pub(crate) mod file;
+pub(crate) mod registry;
 
 use serde::{Deserialize, Serialize};
 
 #[allow(unused_imports)] // M5 Tasks 2–9 use them.
 pub(crate) use file::{compose_skill_file, parse_skill_file, skill_hash, SkillFile};
+#[allow(unused_imports)] // M5 Tasks 3–9 use them.
+pub(crate) use registry::{status_for, DraftView, ScannedFile, SkillRegistry, SkillSnapshot};
 
 /// A `SKILL.md`'s Markdown body, after its front matter (spec §8.1, §16).
 pub(crate) const MAX_SKILL_BODY_BYTES: usize = 32 * 1024;
