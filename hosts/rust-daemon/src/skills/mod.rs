@@ -172,10 +172,14 @@ pub(crate) fn slugify(name: &str) -> Option<String> {
     is_valid_slug(&slug).then_some(slug)
 }
 
-/// Unicode tag characters and bidirectional embeddings, overrides, and
-/// isolates: invisible text that can smuggle instructions past the owner.
+/// Unicode tag characters, bidirectional embeddings, overrides, and
+/// isolates, and the supplementary variation selectors: invisible text that
+/// can smuggle instructions past the owner.
 fn is_smuggling_character(character: char) -> bool {
-    matches!(character as u32, 0xE0000..=0xE007F | 0x202A..=0x202E | 0x2066..=0x2069)
+    matches!(
+        character as u32,
+        0xE0000..=0xE007F | 0x202A..=0x202E | 0x2066..=0x2069 | 0xE0100..=0xE01EF
+    )
 }
 
 /// What a one-line field refuses on top of control characters: the
@@ -188,6 +192,12 @@ fn is_hidden_in_one_line(character: char) -> bool {
             0x2028
                 | 0x2029
                 | 0x00AD
+                | 0x034F
+                | 0x115F
+                | 0x1160
+                | 0x3164
+                | 0xFFA0
+                | 0x0890..=0x0891
                 | 0x0600..=0x0605
                 | 0x061C
                 | 0x06DD
@@ -209,10 +219,20 @@ fn is_hidden_in_one_line(character: char) -> bool {
         )
 }
 
+/// Two or more variation selectors in a row: one after an emoji (❤️) is
+/// fine, a run can carry hidden bytes.
+fn has_variation_selector_run(value: &str) -> bool {
+    let selector = |character: char| matches!(character as u32, 0xFE00..=0xFE0F);
+    value
+        .chars()
+        .zip(value.chars().skip(1))
+        .any(|(first, second)| selector(first) && selector(second))
+}
+
 /// `value` trimmed when it is 1 to `max_chars` characters with no control
 /// or hidden character, so it can never span lines of the index.
 fn one_line(value: &str, max_chars: usize, invalid: &'static str) -> Result<String, &'static str> {
-    if value.chars().any(is_hidden_in_one_line) {
+    if value.chars().any(is_hidden_in_one_line) || has_variation_selector_run(value) {
         return Err(SKILL_TEXT_HIDDEN);
     }
     let trimmed = value.trim();
