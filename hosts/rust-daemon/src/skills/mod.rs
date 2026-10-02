@@ -5,6 +5,7 @@
 //! `service`, `scanner`, `drafts`, and `runtime`.
 #![allow(dead_code)] // M5 Task 9 removes this once the routes, tools, and runs use every item.
 
+pub(crate) mod disk;
 pub(crate) mod file;
 pub(crate) mod registry;
 
@@ -35,8 +36,11 @@ pub(crate) const MAX_SKILL_FILE_BYTES: usize =
     MAX_SKILL_BODY_BYTES + MAX_SKILL_FRONT_MATTER_BYTES + 16;
 /// Skill records in one workspace (plan bound).
 pub(crate) const MAX_SKILLS: usize = 200;
-/// Skill folders one scan reads, by name (plan bound).
+/// Folders holding a `SKILL.md` that one scan reads (plan bound).
 pub(crate) const MAX_SCANNED_SKILL_FOLDERS: usize = 200;
+/// Folders one scan looks into besides the registered ones, so a flood of
+/// empty folders cannot make a scan time out forever.
+pub(crate) const MAX_EXAMINED_SKILL_FOLDERS: usize = 1_000;
 /// Imported drafts waiting for the owner (plan bound).
 pub(crate) const MAX_PENDING_IMPORT_DRAFTS: usize = 10;
 /// Decided drafts kept, newest first (plan bound).
@@ -92,6 +96,7 @@ pub(crate) const SKILL_FILE_FRONT_MATTER_INVALID: &str =
 pub(crate) const SKILL_FILE_TOO_LARGE: &str = "SKILL.md is larger than 36 KiB";
 pub(crate) const SKILL_FILE_OUTSIDE: &str = "SKILL.md resolves outside the workspace";
 pub(crate) const SKILLS_FOLDER_OUTSIDE: &str = "The skills folder resolves outside the workspace";
+pub(crate) const SKILL_FOLDER_NOT_LOWERCASE: &str = "Rename the folder to lowercase";
 
 pub(crate) const SKILLS_NEED_WORKSPACE: &str = "Skills need a configured workspace";
 pub(crate) const SKILL_HASH_MISMATCH: &str =
@@ -460,6 +465,8 @@ mod tests {
         assert_eq!(MAX_SKILL_NAME_CHARS, 64);
         assert_eq!(MAX_SKILL_DESCRIPTION_CHARS, 300);
         assert_eq!(SKILL_SCAN_INTERVAL_MS, 60_000);
+        assert_eq!(MAX_EXAMINED_SKILL_FOLDERS, 1_000);
+        assert_eq!(SKILL_FOLDER_NOT_LOWERCASE, "Rename the folder to lowercase");
         assert_eq!(
             SKILL_SLUG_INVALID,
             "slug must be 1–64 lowercase letters, digits, or hyphens, starting with a letter or digit, and not a reserved name (import, con, nul, …)"
