@@ -163,3 +163,18 @@
   color: var(--color-danger);
   font-size: 12px;
 }
+.nav-badge,
+.session-approval-badge {
+  min-width: 18px;
+  border-radius: 9px;
+  padding: 0 5px;
+  background: var(--color-amber);
+  color: var(--color-abyss);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 18px;
+  text-align: center;
+}
+.nav-badge {
+  margin-left: auto;
+}

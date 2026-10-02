@@ -28,6 +28,7 @@ import { useSessionCommands } from './hooks/useSessionCommands';
 import { useSessionPending } from './hooks/useSessionPending';
 import { useSessionSends } from './hooks/useSessionSends';
 import { useTranscriptActions } from './hooks/useTranscriptActions';
+import { ApprovalsPage } from './pages/ApprovalsPage';
 import {
   SESSION_MESSAGES_LIVE_POLL_MS,
   SESSION_MESSAGES_POLL_MS,
@@ -42,6 +43,7 @@ import {
   type DaemonSnapshot,
 } from './lib/daemon-api';
 import { selectMainAgent } from './lib/agent-access';
+import { pendingApprovalCount } from './lib/approvals';
 import { useHashRoute, type HashRoute } from './lib/hash-route';
 import { exportFileName, sessionKey } from './lib/session-groups';
 import { loadDraft, storeDraft } from './lib/drafts';
@@ -1241,6 +1243,27 @@ export function ViewHarness() {
               }
             />
           }
+          approvals={
+            <ApprovalsPage
+              agentId={agent.id}
+              live={live.state}
+              streamOpen={live.status === 'open'}
+              sessions={sessions.sessions}
+              onOpenSession={(approval) =>
+                commands.openTarget({
+                  agentId: approval.agentId,
+                  sessionId: approval.sessionId,
+                })
+              }
+            />
+          }
+          pendingApprovals={pendingApprovalCount(
+            live.state.approvals,
+            live.status === 'open',
+            sessions.sessions,
+          )}
+          sessions={sessions.sessions}
+          onOpenSession={openSession}
           workspaceState={workspace}
           sidebar={sidebar}
           conversation={sessionView}

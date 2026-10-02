@@ -6,9 +6,11 @@ import {
   type ApprovalMatcher,
   type ApprovalMatcherKind,
   type RiskClass,
+  type Session,
 } from '@animaOS-SWARM/sdk';
 
 import { daemon } from './daemon-api';
+import type { LiveState } from './session-events';
 
 /** The daemon's bound on a matcher value (`MAX_MATCHER_VALUE_CHARS`). */
 export const MAX_MATCHER_VALUE_CHARS = 512;
@@ -167,4 +169,19 @@ export function formatWhen(ms: number): string {
     hour: '2-digit',
     minute: '2-digit',
   });
+}
+
+/** Approvals waiting for the owner: the stream's while it is open (every
+ *  pending one of the companion and its helpers), else the listed
+ *  sessions' counts. */
+export function pendingApprovalCount(
+  approvals: LiveState['approvals'],
+  streamOpen: boolean,
+  sessions: readonly Session[],
+): number {
+  if (streamOpen) return Object.keys(approvals).length;
+  return sessions.reduce(
+    (total, session) => total + session.pendingApprovals,
+    0,
+  );
 }

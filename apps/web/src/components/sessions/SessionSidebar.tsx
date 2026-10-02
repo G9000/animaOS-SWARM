@@ -49,6 +49,7 @@ function rowLabel(session: Session): string {
   return [
     session.title,
     session.activeRuns > 0 ? 'working' : null,
+    session.pendingApprovals > 0 ? 'needs approval' : null,
     session.unread ? 'unread' : null,
   ]
     .filter(Boolean)
@@ -156,6 +157,11 @@ function SessionRow({
             <span className="session-pulse" aria-hidden />
           )}
           <span className="session-title">{session.title}</span>
+          {session.pendingApprovals > 0 && (
+            <span className="session-approval-badge" aria-hidden>
+              {session.pendingApprovals}
+            </span>
+          )}
           {session.unread && (
             <span className="session-unread-dot" aria-hidden />
           )}

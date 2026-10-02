@@ -4,6 +4,8 @@ import type { Run, SessionMessage } from '@animaOS-SWARM/sdk';
 
 import { daemon } from '../lib/daemon-api';
 import {
+  approvalEvent,
+  approvalFixture,
   messageCreatedEvent,
   runEvent,
   runFixture,
@@ -104,6 +106,27 @@ describe('useLiveSession', () => {
     events.streams[0].push(
       runEvent('run.completed', { ...other, status: 'completed' }, 2),
       messageCreatedEvent(other, 'm1', 'assistant', 3),
+    );
+    await flush(LIVE_REFRESH_DELAY_MS);
+    expect(refreshSessions).toHaveBeenCalledTimes(1);
+    expect(refreshMessages).not.toHaveBeenCalled();
+  });
+
+  it('refreshes the sidebar’s approval badges on approval events alone', async () => {
+    const { events, refreshSessions, refreshMessages } = setup();
+    await flush();
+    events.streams[0].push(snapshotEvent([]));
+    await flush(LIVE_REFRESH_DELAY_MS);
+    refreshSessions.mockClear();
+    refreshMessages.mockClear();
+
+    // A second approval of a run already waiting comes without a run event.
+    events.streams[0].push(
+      approvalEvent(
+        'approval.requested',
+        approvalFixture('apr_2', { sessionId: 'room-7' }),
+        2,
+      ),
     );
     await flush(LIVE_REFRESH_DELAY_MS);
     expect(refreshSessions).toHaveBeenCalledTimes(1);

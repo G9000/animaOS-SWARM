@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
+import type { Session } from '@animaOS-SWARM/sdk';
 import type { DaemonConnection } from '../hooks/useDaemonBootstrap';
 import type { DaemonWorkspaceState } from '../lib/daemon-api';
 import type { HashPage, HashRoute, Navigate } from '../lib/hash-route';
@@ -9,18 +10,23 @@ import { WorkspaceFiles } from './WorkspaceFiles';
 import { WorkspaceCapabilities } from './WorkspaceCapabilities';
 import { CommandMenu, type StudioCommand } from './CommandMenu';
 import { PROMPT_LIBRARY } from '../lib/prompt-library';
-import { GearIcon, PulseIcon, SendIcon, SparkIcon } from './icons';
+import { sessionKey } from '../lib/session-groups';
+import { GearIcon, PulseIcon, SendIcon, ShieldIcon, SparkIcon } from './icons';
 import { ghostBtnCls } from './ui-bits';
 
 /** Pages this release renders; the other hash pages open the conversation
  *  until their milestones build them. */
 export const AVAILABLE_PAGES = [
+  'approvals',
   'work',
   'files',
   'connectors',
   'capabilities',
 ] as const satisfies readonly HashPage[];
 export type AvailablePage = (typeof AVAILABLE_PAGES)[number];
+
+/** Session titles the command menu offers, newest activity first. */
+export const MAX_SESSION_COMMANDS = 50;
 
 interface Destination {
   page: AvailablePage;
@@ -29,6 +35,7 @@ interface Destination {
 }
 
 const PRIMARY_DESTINATIONS: Destination[] = [
+  { page: 'approvals', label: 'Approvals', icon: <ShieldIcon size={16} /> },
   { page: 'work', label: 'Work', icon: <SparkIcon size={16} /> },
   { page: 'files', label: 'Files', icon: <PulseIcon size={16} /> },
   { page: 'connectors', label: 'Connectors', icon: <GearIcon size={16} /> },
@@ -74,30 +81,42 @@ function DestinationNavigation({
   navigate,
   placement,
   onOpenChats,
+  pendingApprovals,
 }: {
   page: AvailablePage | null;
   navigate: Navigate;
   placement: 'sidebar' | 'bottom-dock';
   onOpenChats: () => void;
+  pendingApprovals: number;
 }) {
   const sidebar = placement === 'sidebar';
   const [systemOpen, setSystemOpen] = useState(false);
   const systemExpanded =
     systemOpen || SYSTEM_DESTINATIONS.some((item) => item.page === page);
   const itemClass = `studio-nav-item inline-flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm transition ${sidebar ? 'w-full justify-start text-left' : 'min-w-16 shrink-0 flex-col gap-1 text-[10px]'}`;
-  const destination = (item: Destination) => (
-    <button
-      key={item.page}
-      type="button"
-      onClick={() => navigate({ kind: 'page', page: item.page })}
-      aria-current={page === item.page ? 'page' : undefined}
-      aria-label={item.label}
-      className={itemClass}
-    >
-      {item.icon}
-      <span>{item.label}</span>
-    </button>
-  );
+  const destination = (item: Destination) => {
+    const waiting = item.page === 'approvals' ? pendingApprovals : 0;
+    return (
+      <button
+        key={item.page}
+        type="button"
+        onClick={() => navigate({ kind: 'page', page: item.page })}
+        aria-current={page === item.page ? 'page' : undefined}
+        aria-label={
+          waiting > 0 ? `${item.label}, ${waiting} waiting` : item.label
+        }
+        className={itemClass}
+      >
+        {item.icon}
+        <span>{item.label}</span>
+        {waiting > 0 && (
+          <span className="nav-badge" aria-hidden>
+            {waiting}
+          </span>
+        )}
+      </button>
+    );
+  };
   return (
     <nav
       aria-label="Workspace navigation"
@@ -254,6 +273,10 @@ export function WorkspaceShell({
   conversationRoute,
   sidebar = null,
   connectors = null,
+  approvals = null,
+  pendingApprovals = 0,
+  sessions = [],
+  onOpenSession,
   workspaceState = null,
   onOpenSettings,
   onChangeWorkspaceAvatar = ignoreWorkspaceAvatarChange,
@@ -272,6 +295,13 @@ export function WorkspaceShell({
   /** The sessions list for the desktop sidebar and the mobile drawer. */
   sidebar?: ReactNode | null;
   connectors?: ReactNode | null;
+  /** The Approvals page, shown at `#/approvals`. */
+  approvals?: ReactNode | null;
+  /** Approvals waiting for the owner, for the destination's badge. */
+  pendingApprovals?: number;
+  /** The listed sessions the command menu offers by title. */
+  sessions?: readonly Session[];
+  onOpenSession?: (session: Session) => void;
   workspaceState?: DaemonWorkspaceState | null;
   onOpenSettings: () => void;
   onChangeWorkspaceAvatar?: (file: File) => Promise<void>;
@@ -337,6 +367,16 @@ export function WorkspaceShell({
       group: 'Navigate',
       run: newChat,
     },
+    {
+      id: 'review-approvals',
+      title: 'Review tool approvals',
+      description:
+        pendingApprovals > 0
+          ? `${pendingApprovals} waiting for you`
+          : 'Nothing is waiting',
+      group: 'Navigate',
+      run: () => navigate({ kind: 'page', page: 'approvals' }),
+    },
     ...DESTINATIONS.map((item) => ({
       id: item.page,
       title: `Go to ${item.label}`,
@@ -361,6 +401,18 @@ export function WorkspaceShell({
             run: () => setFocusMode((value) => !value),
           },
         ]
+      : []),
+    ...(onOpenSession
+      ? sessions
+          .filter((session) => !session.archived)
+          .slice(0, MAX_SESSION_COMMANDS)
+          .map((session) => ({
+            id: `session:${sessionKey(session)}`,
+            title: session.title,
+            description: 'Open this conversation',
+            group: 'Sessions',
+            run: () => onOpenSession(session),
+          }))
       : []),
     ...(onPickPrompt
       ? PROMPT_LIBRARY.map((prompt) => ({
@@ -430,6 +482,7 @@ export function WorkspaceShell({
                 navigate={navigate}
                 placement="sidebar"
                 onOpenChats={openConversation}
+                pendingApprovals={pendingApprovals}
               />
               {sidebar}
               <div className="companion-status" role="status">
@@ -533,7 +586,9 @@ export function WorkspaceShell({
               <div className="companion-chat-panel" hidden={page !== null}>
                 {conversation}
               </div>
-              {page === 'connectors' ? (
+              {page === 'approvals' ? (
+                approvals
+              ) : page === 'connectors' ? (
                 connectors
               ) : page === 'files' ? (
                 <WorkspaceFiles online={connection === 'online'} />
@@ -551,6 +606,7 @@ export function WorkspaceShell({
             navigate={navigate}
             placement="bottom-dock"
             onOpenChats={openConversation}
+            pendingApprovals={pendingApprovals}
           />
         )}
       </div>

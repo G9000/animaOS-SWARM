@@ -8,9 +8,11 @@ import {
   decideApproval,
   describeMatcher,
   isBroadExecMatcher,
+  pendingApprovalCount,
   revealHiddenCharacters,
 } from './approvals';
 import { approvalFixture } from '../test/live';
+import { sessionFixture } from '../test/sessions';
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -152,5 +154,21 @@ describe('approvalOutcome', () => {
       'Expired at a restart',
     );
     expect(approvalOutcome(approvalFixture('apr_2'))).toBe('Waiting');
+  });
+});
+
+describe('pendingApprovalCount', () => {
+  it('counts the stream’s approvals while it is open, else the sessions’', () => {
+    const approvals = {
+      apr_1: approvalFixture('apr_1'),
+      apr_2: approvalFixture('apr_2'),
+    };
+    const sessions = [
+      sessionFixture('chat:1', { pendingApprovals: 1 }),
+      sessionFixture('chat:2', { pendingApprovals: 3 }),
+    ];
+    expect(pendingApprovalCount(approvals, true, sessions)).toBe(2);
+    expect(pendingApprovalCount(approvals, false, sessions)).toBe(4);
+    expect(pendingApprovalCount({}, true, sessions)).toBe(0);
   });
 });
