@@ -16,6 +16,7 @@ mod runs;
 mod runtime_model;
 mod schedules;
 mod sessions;
+mod skills;
 mod state;
 mod tools;
 
