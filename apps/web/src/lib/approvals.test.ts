@@ -4,6 +4,7 @@ import { DaemonConnectionError, DaemonHttpError } from '@animaOS-SWARM/sdk';
 import { daemon } from './daemon-api';
 import {
   COMPANION_UNREACHABLE,
+  approvalOutcome,
   decideApproval,
   describeMatcher,
   isBroadExecMatcher,
@@ -109,5 +110,47 @@ describe('decideApproval', () => {
     expect(COMPANION_UNREACHABLE).toBe(
       'Could not reach your companion. Try again.',
     );
+  });
+});
+
+describe('approvalOutcome', () => {
+  it('says how each approval ended', () => {
+    const resolution = {
+      decision: null,
+      note: null,
+      matcher: null,
+      ruleId: null,
+      resolvedBy: 'owner' as const,
+      resolvedAtMs: 5,
+    };
+    const ended = (
+      status: 'allowed' | 'denied' | 'stopped' | 'expired',
+      overrides: Partial<typeof resolution> = {},
+    ) =>
+      approvalOutcome(
+        approvalFixture('apr_1', {
+          status,
+          resolution: { ...resolution, ...overrides },
+        }),
+      );
+
+    expect(ended('allowed', { decision: 'allow_once' })).toBe('Allowed once');
+    expect(ended('allowed', { decision: 'allow_session' })).toBe(
+      'Allowed for the session',
+    );
+    expect(ended('allowed', { decision: 'allow_always' })).toBe(
+      'Always allowed',
+    );
+    expect(ended('denied', { decision: 'deny' })).toBe('Denied');
+    expect(ended('denied', { decision: 'deny', resolvedBy: 'timeout' })).toBe(
+      'Timed out',
+    );
+    expect(ended('stopped', { resolvedBy: 'stop' })).toBe(
+      'Stopped with its run',
+    );
+    expect(ended('expired', { resolvedBy: 'restart' })).toBe(
+      'Expired at a restart',
+    );
+    expect(approvalOutcome(approvalFixture('apr_2'))).toBe('Waiting');
   });
 });

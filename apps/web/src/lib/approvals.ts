@@ -133,3 +133,38 @@ export const decideApproval: ApprovalDecide = async (approval, input) => {
     return COMPANION_UNREACHABLE;
   }
 };
+
+/** How an approval ended, in a few words. */
+export function approvalOutcome(approval: Approval): string {
+  const resolution = approval.resolution;
+  switch (approval.status) {
+    case 'pending':
+      return 'Waiting';
+    case 'stopped':
+      return 'Stopped with its run';
+    case 'expired':
+      return 'Expired at a restart';
+    case 'denied':
+      return resolution?.resolvedBy === 'timeout' ? 'Timed out' : 'Denied';
+    case 'allowed':
+      return resolution?.decision === 'allow_session'
+        ? 'Allowed for the session'
+        : resolution?.decision === 'allow_always'
+          ? 'Always allowed'
+          : 'Allowed once';
+  }
+}
+
+/** When it was settled, or asked while it is still pending. */
+export function resolvedAt(approval: Approval): number {
+  return approval.resolution?.resolvedAtMs ?? approval.createdAtMs;
+}
+
+export function formatWhen(ms: number): string {
+  return new Date(ms).toLocaleString([], {
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+}

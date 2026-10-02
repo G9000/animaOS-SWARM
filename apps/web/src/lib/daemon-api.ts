@@ -10,6 +10,9 @@ import {
   type AgencyGenerateRequest,
   type AgencyGenerateResponse,
   type ApprovalDecisionInput,
+  type ApprovalListOptions,
+  type ApprovalPolicy,
+  type ApprovalRuleInput,
   type WorkspaceBootstrapRequest,
   type AgentMemory,
   type AgentTasks,
@@ -378,6 +381,18 @@ export const daemon = {
   /** The owner's decision on a pending approval (spec §7.3). */
   decideApproval: (approvalId: string, input: ApprovalDecisionInput) =>
     setupClient.approvals.decide(approvalId, input),
+  listApprovals: (options: ApprovalListOptions) =>
+    setupClient.approvals.list(options),
+  approvalPolicy: (agentId: string, options: { signal?: AbortSignal } = {}) =>
+    setupClient.approvals.policy(agentId, options),
+  setApprovalPolicy: (agentId: string, policy: ApprovalPolicy) =>
+    setupClient.approvals.setPolicy(agentId, policy),
+  approvalRules: (agentId: string, options: { signal?: AbortSignal } = {}) =>
+    setupClient.approvals.rules(agentId, options),
+  addApprovalRule: (agentId: string, input: ApprovalRuleInput) =>
+    setupClient.approvals.addRule(agentId, input),
+  removeApprovalRule: (agentId: string, ruleId: string) =>
+    setupClient.approvals.removeRule(agentId, ruleId),
   listAgentSummaries: () => setupClient.agents.listSummaries(),
   cancelAgentJob: (id: string, jobId: string, input: { revision: number }) =>
     setupClient.agents.cancelJob(id, jobId, input),
