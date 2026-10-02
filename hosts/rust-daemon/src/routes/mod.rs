@@ -15,6 +15,7 @@ mod http;
 mod jobs;
 mod mail;
 mod memories;
+mod multipart;
 mod oauth_apps;
 mod profile;
 mod runs;
@@ -179,6 +180,8 @@ use crate::runtime_model::provider_summaries;
         approvals::delete_approval_rule,
         skills::list_skills, skills::get_skill, skills::put_skill, skills::patch_skill,
         skills::delete_skill, skills::approve_skill,
+        skills::list_skill_drafts, skills::approve_skill_draft, skills::reject_skill_draft,
+        skills::import_skill,
     ),
     components(schemas(self::contracts::AgentSummariesEnvelope)),
     tags(
@@ -541,6 +544,19 @@ fn router_with_services_with_policies(
             axum::routing::delete(approvals::delete_approval_rule),
         )
         .route("/api/skills", get(skills::list_skills))
+        .route(
+            "/api/skills/import",
+            axum::routing::post(skills::import_skill),
+        )
+        .route("/api/skill-drafts", get(skills::list_skill_drafts))
+        .route(
+            "/api/skill-drafts/{draft_id}/approve",
+            axum::routing::post(skills::approve_skill_draft),
+        )
+        .route(
+            "/api/skill-drafts/{draft_id}/reject",
+            axum::routing::post(skills::reject_skill_draft),
+        )
         .route(
             "/api/skills/{slug}",
             get(skills::get_skill)

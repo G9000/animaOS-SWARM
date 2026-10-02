@@ -3,21 +3,29 @@
 //! `Cache-Control: no-store`, and answers 409 without a configured workspace.
 
 use axum::extract::{Path, Request, State};
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use super::approvals::STATUS_INVALID;
 use super::contracts::{
-    ErrorBody, SkillDeleteResponse, SkillDetailEnvelope, SkillEnvelope, SkillFileResponse,
+    ApprovedSkillDraftEnvelope, ErrorBody, SkillDeleteResponse, SkillDetailEnvelope,
+    SkillDraftEnvelope, SkillDraftResponse, SkillDraftsEnvelope, SkillEnvelope, SkillFileResponse,
     SkillResponse, SkillsEnvelope,
 };
-use super::http::{json_response, read_limited_body};
+use super::http::{json_response, read_limited_body, request_query};
 use super::jobs::{authorize, no_store};
+use super::multipart::{
+    parse_form_with, FormLimits, FORM_TOO_LARGE, MAX_FORM_HEADER_BYTES, MAX_FORM_PARTS,
+};
 use super::sessions::rejected;
 use super::{parse_json_body, ApiError, AppState};
-use crate::skills::{SkillContent, SkillError, SKILLS_NEED_WORKSPACE};
+use crate::skills::{
+    DraftApproval, SkillContent, SkillError, IMPORT_NOT_MULTIPART, IMPORT_TOO_LARGE,
+    MAX_SKILL_IMPORT_BYTES, SKILLS_NEED_WORKSPACE, SKILL_SLUG_INVALID,
+};
 
 /// Bodies the skill routes read, or the daemon-wide limit when larger: a
 /// 32 KiB body can take six bytes a character once JSON-escaped, and the
@@ -268,6 +276,198 @@ pub(super) async fn approve_skill(
             StatusCode::OK,
             &SkillEnvelope {
                 skill: SkillResponse::from(&record),
+            },
+        ),
+        Err(error) => skill_error(error),
+    }
+}
+
+/// An imported file plus its multipart framing.
+const MAX_IMPORT_REQUEST_BYTES: usize = MAX_SKILL_IMPORT_BYTES + 16 * 1024;
+
+/// The import form: a `file` and a `slug`, with room for a few more fields.
+const IMPORT_FORM_LIMITS: FormLimits = FormLimits {
+    max_total_bytes: MAX_IMPORT_REQUEST_BYTES,
+    max_parts: MAX_FORM_PARTS,
+    max_header_bytes: MAX_FORM_HEADER_BYTES,
+    max_part_bytes: MAX_SKILL_IMPORT_BYTES,
+};
+
+#[derive(Debug, Default, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub(super) struct DraftApprovalRequest {
+    /// The owner's edit of the body; the draft's body when absent.
+    #[serde(default)]
+    body: Option<String>,
+    /// Required for a file draft: the `fileHash` the owner reviewed.
+    #[serde(default)]
+    hash: Option<String>,
+}
+
+#[utoipa::path(get, path = "/api/skill-drafts", tag = "skills",
+    params(("status" = Option<String>, Query, description = "`pending` (the default): stored drafts and SKILL.md files without a record, oldest first, after a rescan. `decided`: approved and rejected drafts of the last 30 days, newest first")),
+    responses(
+        (status = 200, description = "The drafts", body = SkillDraftsEnvelope),
+        (status = 400, description = "An invalid status", body = ErrorBody),
+        (status = 403, description = "Local owner required", body = ErrorBody),
+        (status = 409, description = "No workspace is configured", body = ErrorBody)
+    ))]
+pub(super) async fn list_skill_drafts(State(state): State<AppState>, request: Request) -> Response {
+    if let Err(response) = authorize(&state, &request, true) {
+        return response;
+    }
+    let decided = match request_query(request.uri())
+        .ok()
+        .and_then(|params| params.get("status").cloned())
+        .as_deref()
+    {
+        None | Some("") | Some("pending") => false,
+        Some("decided") => true,
+        Some(_) => return rejected(ApiError::bad_request_static(STATUS_INVALID)),
+    };
+    match state.agent_runs.skills().drafts(decided).await {
+        Ok(views) => answer(
+            StatusCode::OK,
+            &SkillDraftsEnvelope {
+                drafts: views.iter().map(SkillDraftResponse::from).collect(),
+            },
+        ),
+        Err(error) => skill_error(error),
+    }
+}
+
+#[utoipa::path(post, path = "/api/skill-drafts/{draft_id}/approve", tag = "skills",
+    params(("draft_id" = String, Path, description = "`skd_<uuid>` or `file:<slug>`, percent-encoded")),
+    request_body = DraftApprovalRequest,
+    responses(
+        (status = 200, description = "SKILL.md written (or, for an unedited file draft, kept) and its hash pinned", body = ApprovedSkillDraftEnvelope),
+        (status = 400, description = "An invalid body, a file draft without its reviewed hash, or a file that is not a valid SKILL.md", body = ErrorBody),
+        (status = 403, description = "Local owner required", body = ErrorBody),
+        (status = 404, description = "No such draft", body = ErrorBody),
+        (status = 409, description = "No workspace is configured, the draft was already decided, the file changed since it was reviewed, or the workspace already has 200 skills", body = ErrorBody),
+        (status = 503, description = "The file or the registry could not be saved; the draft stays pending", body = ErrorBody)
+    ))]
+pub(super) async fn approve_skill_draft(
+    State(state): State<AppState>,
+    Path(draft_id): Path<String>,
+    request: Request,
+) -> Response {
+    if let Err(response) = authorize(&state, &request, false) {
+        return response;
+    }
+    let limit = state.config.max_request_bytes.max(MAX_SKILL_REQUEST_BYTES);
+    let bytes = match read_limited_body(request, limit).await {
+        Ok(bytes) => bytes,
+        Err(response) => return no_store(response),
+    };
+    let input: DraftApprovalRequest = if bytes.is_empty() {
+        DraftApprovalRequest::default()
+    } else {
+        match parse_json_body(bytes) {
+            Ok(input) => input,
+            Err(error) => return rejected(error),
+        }
+    };
+    let approval = DraftApproval {
+        body: input.body,
+        hash: input.hash,
+    };
+    match state
+        .agent_runs
+        .skills()
+        .approve_draft(&draft_id, approval)
+        .await
+    {
+        Ok(approved) => answer(
+            StatusCode::OK,
+            &ApprovedSkillDraftEnvelope {
+                draft: SkillDraftResponse::of(
+                    &approved.draft,
+                    Some(approved.skill.approved_hash.clone()),
+                ),
+                skill: SkillResponse::from(&approved.skill),
+            },
+        ),
+        Err(error) => skill_error(error),
+    }
+}
+
+#[utoipa::path(post, path = "/api/skill-drafts/{draft_id}/reject", tag = "skills",
+    params(("draft_id" = String, Path, description = "`skd_<uuid>` or `file:<slug>`, percent-encoded")),
+    responses(
+        (status = 200, description = "The draft, rejected; a file draft stays hidden until its file changes, and the file stays", body = SkillDraftEnvelope),
+        (status = 403, description = "Local owner required", body = ErrorBody),
+        (status = 404, description = "No such draft", body = ErrorBody),
+        (status = 409, description = "No workspace is configured, or the draft was already decided", body = ErrorBody),
+        (status = 503, description = "The rejection could not be saved", body = ErrorBody)
+    ))]
+pub(super) async fn reject_skill_draft(
+    State(state): State<AppState>,
+    Path(draft_id): Path<String>,
+    request: Request,
+) -> Response {
+    if let Err(response) = authorize(&state, &request, false) {
+        return response;
+    }
+    match state.agent_runs.skills().reject_draft(&draft_id).await {
+        Ok(draft) => answer(
+            StatusCode::OK,
+            &SkillDraftEnvelope {
+                draft: SkillDraftResponse::of(&draft, None),
+            },
+        ),
+        Err(error) => skill_error(error),
+    }
+}
+
+#[utoipa::path(post, path = "/api/skills/import", tag = "skills",
+    request_body(content = String, content_type = "multipart/form-data", description = "A `file` part holding a SKILL.md (at most 64 KiB) and an optional `slug` field"),
+    responses(
+        (status = 201, description = "A pending import draft", body = SkillDraftEnvelope),
+        (status = 400, description = "Not multipart with a file part, a file over 64 KiB, an invalid slug, or a file that is not a valid SKILL.md", body = ErrorBody),
+        (status = 403, description = "Local owner required", body = ErrorBody),
+        (status = 409, description = "No workspace is configured, or 10 imports already wait for review", body = ErrorBody),
+        (status = 503, description = "The draft could not be saved", body = ErrorBody)
+    ))]
+pub(super) async fn import_skill(State(state): State<AppState>, request: Request) -> Response {
+    if let Err(response) = authorize(&state, &request, false) {
+        return response;
+    }
+    let content_type = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    // Any read failure here is almost always the size bound.
+    let Ok(body) = read_limited_body(request, MAX_IMPORT_REQUEST_BYTES).await else {
+        return rejected(ApiError::bad_request_static(IMPORT_TOO_LARGE));
+    };
+    let parts = match parse_form_with(&content_type, &body, &IMPORT_FORM_LIMITS) {
+        Ok(parts) => parts,
+        Err(FORM_TOO_LARGE) => return rejected(ApiError::bad_request_static(IMPORT_TOO_LARGE)),
+        Err(_) => return rejected(ApiError::bad_request_static(IMPORT_NOT_MULTIPART)),
+    };
+    let Some(file) = parts.iter().find(|part| part.name == "file") else {
+        return rejected(ApiError::bad_request_static(IMPORT_NOT_MULTIPART));
+    };
+    let slug = match parts.iter().find(|part| part.name == "slug") {
+        None => None,
+        Some(part) => match String::from_utf8(part.bytes.clone()) {
+            Ok(slug) => Some(slug),
+            Err(_) => return skill_error(SkillError::Invalid(SKILL_SLUG_INVALID.to_string())),
+        },
+    };
+    match state
+        .agent_runs
+        .skills()
+        .import(file.bytes.clone(), slug)
+        .await
+    {
+        Ok(draft) => answer(
+            StatusCode::CREATED,
+            &SkillDraftEnvelope {
+                draft: SkillDraftResponse::of(&draft, draft.base_hash.clone()),
             },
         ),
         Err(error) => skill_error(error),
