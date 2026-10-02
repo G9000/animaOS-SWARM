@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   DaemonHttpError,
   DEFAULT_APPROVAL_POLICY,
@@ -49,6 +49,8 @@ export interface ApprovalsView {
   refresh: () => void;
 }
 
+type ErrorSource = 'pending' | 'decided' | 'settings' | 'action';
+
 function message(error: unknown): string {
   return error instanceof DaemonHttpError
     ? error.message
@@ -68,35 +70,67 @@ export function useApprovals({
   const [policy, setPolicy] = useState<ApprovalPolicy | null>(null);
   const [rules, setRules] = useState<ApprovalRule[]>([]);
   const [tools, setTools] = useState<ApprovalTool[]>([]);
-  const [error, setError] = useState<string | null>(null);
+  // Each source keeps its own error, so one read failing neither hides
+  // the others' results nor is cleared by an unrelated success.
+  const [errors, setErrors] = useState<Record<ErrorSource, string | null>>({
+    pending: null,
+    decided: null,
+    settings: null,
+    action: null,
+  });
+  const setError = useCallback(
+    (source: ErrorSource, value: string | null) =>
+      setErrors((current) =>
+        current[source] === value ? current : { ...current, [source]: value },
+      ),
+    [],
+  );
   const [reads, setReads] = useState(0);
   const refresh = useCallback(() => setReads((value) => value + 1), []);
   // A settled approval leaves the stream's pending set: the decided list
   // has a new entry.
   const pendingKey = Object.keys(streamApprovals).sort().join('\u0000');
+  const policyRef = useRef<ApprovalPolicy | null>(null);
+  const savesInFlight = useRef(0);
+  const loadMore = useRef<AbortController | null>(null);
+
+  // No load-more outlives the list it would extend.
+  useEffect(() => () => loadMore.current?.abort(), []);
 
   useEffect(() => {
     const controller = new AbortController();
     const { signal } = controller;
-    void Promise.all([
-      daemon.listApprovals({ status: 'decided', agentId, signal }),
-      streamOpen
-        ? null
-        : daemon.listApprovals({ status: 'pending', agentId, signal }),
-    ]).then(
-      ([decidedPage, pendingPage]) => {
+    loadMore.current?.abort();
+    void daemon.listApprovals({ status: 'decided', agentId, signal }).then(
+      (page) => {
         if (signal.aborted) return;
-        setDecided(decidedPage.approvals);
-        setCursor(decidedPage.nextCursor);
-        if (pendingPage) setReadPending(pendingPage.approvals);
-        setError(null);
+        setDecided(page.approvals);
+        setCursor(page.nextCursor);
+        setError('decided', null);
       },
       (caught: unknown) => {
-        if (!signal.aborted) setError(message(caught));
+        if (!signal.aborted) setError('decided', message(caught));
       },
     );
     return () => controller.abort();
-  }, [agentId, streamOpen, reads, pendingKey, epoch]);
+  }, [agentId, reads, pendingKey, epoch, setError]);
+
+  useEffect(() => {
+    if (streamOpen) return;
+    const controller = new AbortController();
+    const { signal } = controller;
+    void daemon.listApprovals({ status: 'pending', agentId, signal }).then(
+      (page) => {
+        if (signal.aborted) return;
+        setReadPending(page.approvals);
+        setError('pending', null);
+      },
+      (caught: unknown) => {
+        if (!signal.aborted) setError('pending', message(caught));
+      },
+    );
+    return () => controller.abort();
+  }, [agentId, streamOpen, reads, epoch, setError]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -107,16 +141,18 @@ export function useApprovals({
     ]).then(
       ([nextPolicy, nextRules]) => {
         if (signal.aborted) return;
+        policyRef.current = nextPolicy;
         setPolicy(nextPolicy);
         setRules(nextRules.rules);
         setTools(nextRules.tools);
+        setError('settings', null);
       },
       (caught: unknown) => {
-        if (!signal.aborted) setError(message(caught));
+        if (!signal.aborted) setError('settings', message(caught));
       },
     );
     return () => controller.abort();
-  }, [agentId, reads]);
+  }, [agentId, reads, setError]);
 
   const pending = useMemo(
     () => (streamOpen ? pendingApprovals(streamApprovals) : readPending),
@@ -125,31 +161,58 @@ export function useApprovals({
 
   const loadMoreDecided = useCallback(() => {
     if (!cursor) return;
-    void daemon.listApprovals({ status: 'decided', agentId, cursor }).then(
-      (page) => {
-        setDecided((current) => [
-          ...current,
-          ...page.approvals.filter(
-            (approval) => !current.some((known) => known.id === approval.id),
-          ),
-        ]);
-        setCursor(page.nextCursor);
-      },
-      (caught: unknown) => setError(message(caught)),
-    );
-  }, [agentId, cursor]);
+    loadMore.current?.abort();
+    const controller = new AbortController();
+    loadMore.current = controller;
+    const { signal } = controller;
+    void daemon
+      .listApprovals({ status: 'decided', agentId, cursor, signal })
+      .then(
+        (page) => {
+          if (signal.aborted) return;
+          setDecided((current) => [
+            ...current,
+            ...page.approvals.filter(
+              (approval) => !current.some((known) => known.id === approval.id),
+            ),
+          ]);
+          setCursor(page.nextCursor);
+        },
+        (caught: unknown) => {
+          if (!signal.aborted) setError('action', message(caught));
+        },
+      );
+  }, [agentId, cursor, setError]);
 
+  // Built from the latest policy, not the rendered one, so two quick
+  // changes both stand. The choice shows at once; the daemon's answer
+  // replaces it when no newer change is still being saved.
   const setPolicyAction = useCallback(
     async (klass: PolicyClass, action: ApprovalPolicyAction) => {
-      const next = { ...(policy ?? DEFAULT_APPROVAL_POLICY), [klass]: action };
+      const before = policyRef.current ?? DEFAULT_APPROVAL_POLICY;
+      const next = { ...before, [klass]: action };
+      policyRef.current = next;
+      setPolicy(next);
+      savesInFlight.current += 1;
       try {
-        setPolicy(await daemon.setApprovalPolicy(agentId, next));
-        setError(null);
+        const saved = await daemon.setApprovalPolicy(agentId, next);
+        savesInFlight.current -= 1;
+        if (savesInFlight.current === 0) {
+          policyRef.current = saved;
+          setPolicy(saved);
+        }
+        setError('action', null);
       } catch (caught) {
-        setError(message(caught));
+        savesInFlight.current -= 1;
+        if (policyRef.current?.[klass] === action) {
+          const reverted = { ...policyRef.current, [klass]: before[klass] };
+          policyRef.current = reverted;
+          setPolicy(reverted);
+        }
+        setError('action', message(caught));
       }
     },
-    [agentId, policy],
+    [agentId, setError],
   );
 
   const addRule = useCallback(
@@ -161,14 +224,14 @@ export function useApprovals({
             ? current
             : [...current, rule],
         );
-        setError(null);
+        setError('action', null);
         return true;
       } catch (caught) {
-        setError(message(caught));
+        setError('action', message(caught));
         return false;
       }
     },
-    [agentId],
+    [agentId, setError],
   );
 
   const removeRule = useCallback(
@@ -176,12 +239,12 @@ export function useApprovals({
       try {
         await daemon.removeApprovalRule(agentId, rule.id);
         setRules((current) => current.filter((known) => known.id !== rule.id));
-        setError(null);
+        setError('action', null);
       } catch (caught) {
-        setError(message(caught));
+        setError('action', message(caught));
       }
     },
-    [agentId],
+    [agentId, setError],
   );
 
   return {
@@ -192,7 +255,7 @@ export function useApprovals({
     policy,
     rules,
     tools,
-    error,
+    error: Object.values(errors).find((value) => value !== null) ?? null,
     setPolicyAction,
     addRule,
     removeRule,

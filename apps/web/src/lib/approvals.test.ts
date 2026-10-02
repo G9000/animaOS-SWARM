@@ -35,7 +35,35 @@ describe('describeMatcher', () => {
   });
 });
 
+describe('describeMatcher with hidden characters', () => {
+  it('writes them out in the scope line', () => {
+    expect(
+      describeMatcher('bash', {
+        kind: 'command_prefix',
+        value: 'rm\u202E gnirts',
+      }),
+    ).toBe('bash commands starting with “rm\\u{202e} gnirts”');
+    expect(
+      describeMatcher('web\u200Bfetch', {
+        kind: 'domain',
+        value: 'a\u200Db.io',
+      }),
+    ).toBe('web\\u{200b}fetch on a\\u{200d}b.io and its subdomains');
+  });
+});
+
 describe('isBroadExecMatcher', () => {
+  it('reads the first word like the daemon does', () => {
+    const exec = (value: string) =>
+      isBroadExecMatcher('exec', { kind: 'command_prefix', value });
+    expect(exec('/usr/bin/python3 -c')).toBe(true);
+    expect(exec('bash.exe -c')).toBe(true);
+    expect(exec('Python')).toBe(true);
+    expect(exec(String.raw`C:\tools\Node.EXE x`)).toBe(true);
+    expect(exec('/usr/bin/ls')).toBe(false);
+    expect(exec('pythonic')).toBe(false);
+  });
+
   it('flags an exec rule that lets the companion run almost anything', () => {
     expect(isBroadExecMatcher('exec', { kind: 'any', value: '' })).toBe(true);
     for (const value of ['curl https://x', 'python3 -c 1', 'python3.12', 'sh'])

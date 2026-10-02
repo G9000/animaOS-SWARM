@@ -140,6 +140,61 @@ describe('ApprovalsPage', () => {
     await waitFor(() => expect(pendingReads()).toBe(2));
   });
 
+  it('refreshes after a decision that failed, when the stream is closed', async () => {
+    const user = userEvent.setup();
+    const approval = approvalFixture('apr_1');
+    vi.mocked(daemon.listApprovals).mockImplementation(async (options) => ({
+      approvals: options.status === 'pending' ? [approval] : [],
+      nextCursor: null,
+    }));
+    vi.spyOn(daemon, 'decideApproval').mockRejectedValue(
+      new DaemonHttpError(409, { error: 'already decided' }),
+    );
+    renderPage({ streamOpen: false });
+
+    const card = await screen.findByRole('region', {
+      name: 'Approval needed: bash',
+    });
+    const pendingReads = () =>
+      vi
+        .mocked(daemon.listApprovals)
+        .mock.calls.filter(([options]) => options.status === 'pending').length;
+    await user.click(within(card).getByRole('button', { name: 'Deny' }));
+    expect(await within(card).findByRole('alert')).toHaveTextContent(
+      'already decided',
+    );
+    await waitFor(() => expect(pendingReads()).toBe(2));
+  });
+
+  it('offers no rule for another agent’s approval', async () => {
+    const helper = approvalFixture('apr_2', { agentId: 'helper-7' });
+    const mine = approvalFixture('apr_1');
+    renderPage({ live: streamWith(mine, helper) });
+    await screen.findByText(
+      'Always allow bash commands starting with “git status”',
+    );
+
+    const cards = screen.getAllByRole('region', {
+      name: 'Approval needed: bash',
+    });
+    expect(cards).toHaveLength(2);
+    const withNote = cards.filter((card) =>
+      within(card).queryByText(
+        'Rules for other agents are not managed here yet.',
+      ),
+    );
+    expect(withNote).toHaveLength(1);
+    const [other] = withNote;
+    const own = cards.find((card) => card !== other);
+    if (!own) throw new Error('expected the companion’s own card');
+    expect(
+      within(other).queryByRole('button', { name: 'Always allow' }),
+    ).not.toBeInTheDocument();
+    expect(
+      within(own).getByRole('button', { name: 'Always allow' }),
+    ).toBeVisible();
+  });
+
   it('lists decided approvals newest first and loads older ones', async () => {
     const user = userEvent.setup();
     const resolution = (
@@ -191,6 +246,7 @@ describe('ApprovalsPage', () => {
       status: 'decided',
       agentId: 'agent-main',
       cursor: '10:apr_new',
+      signal: expect.any(AbortSignal),
     });
   });
 

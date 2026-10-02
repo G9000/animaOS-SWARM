@@ -95,14 +95,14 @@ export function ApprovalCard({
   approval,
   onDecide,
   context,
-  canPersist = true,
+  canPersist = false,
 }: {
   approval: Approval;
   onDecide?: ApprovalDecide;
   /** Shown in the header, such as the session the call came from. */
   context?: ReactNode;
-  /** Offer "Always allow": false for another agent's call, whose rules
-   *  this console does not manage yet. */
+  /** Offer "Always allow": only for the companion's calls; another
+   *  agent's rules are not managed in this console yet. */
   canPersist?: boolean;
 }) {
   const [note, setNote] = useState('');
@@ -147,7 +147,9 @@ export function ApprovalCard({
       aria-label={`Approval needed: ${approval.tool}`}
     >
       <header className="approval-card-header">
-        <strong className="approval-card-tool">{approval.tool}</strong>
+        <strong className="approval-card-tool">
+          {revealHiddenCharacters(approval.tool)}
+        </strong>
         <span className="approval-card-class">
           {CLASS_LABELS[approval.class]}
         </span>

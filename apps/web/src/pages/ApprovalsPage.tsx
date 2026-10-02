@@ -204,8 +204,9 @@ export function ApprovalsPage({
   );
   const decide: ApprovalDecide = async (approval, input) => {
     const failure = await decideApproval(approval, input);
-    // Without the stream nothing else tells this page it went through.
-    if (!failure && !streamOpen) view.refresh();
+    // Without the stream nothing else tells this page what became of the
+    // approval: a 404 or 409 means it was settled elsewhere.
+    if (!streamOpen) view.refresh();
     return failure;
   };
 
@@ -232,6 +233,7 @@ export function ApprovalsPage({
                 key={approval.id}
                 approval={approval}
                 onDecide={decide}
+                canPersist={approval.agentId === agentId}
                 context={
                   <button
                     type="button"

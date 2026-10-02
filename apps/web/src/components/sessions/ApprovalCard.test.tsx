@@ -11,7 +11,9 @@ describe('ApprovalCard', () => {
       arguments: '{"command":"<img src=x onerror=alert(1)> **bold**"}',
       argumentsTruncated: true,
     });
-    const { container } = render(<ApprovalCard approval={approval} />);
+    const { container } = render(
+      <ApprovalCard canPersist approval={approval} />,
+    );
 
     const card = screen.getByRole('region', { name: 'Approval needed: bash' });
     expect(within(card).getByLabelText('Arguments')).toHaveTextContent(
@@ -47,6 +49,22 @@ describe('ApprovalCard', () => {
     );
   });
 
+  it('makes hidden characters in the tool name and the scope visible', () => {
+    const approval = approvalFixture('apr_1', {
+      tool: 'ba\u202Esh',
+      suggestedMatcher: { kind: 'command_prefix', value: 'git\u200B status' },
+    });
+    render(<ApprovalCard approval={approval} />);
+
+    const card = screen.getByRole('region');
+    expect(card.querySelector('.approval-card-tool')).toHaveTextContent(
+      'ba\\u{202e}sh',
+    );
+    expect(card.querySelector('.approval-card-scope')).toHaveTextContent(
+      'ba\\u{202e}sh commands starting with “git\\u{200b} status”',
+    );
+  });
+
   it('sends a trimmed note with a denial and no matcher', async () => {
     const user = userEvent.setup();
     const approval = approvalFixture('apr_1');
@@ -73,7 +91,7 @@ describe('ApprovalCard', () => {
     const approval = approvalFixture('apr_1');
     const onDecide = vi.fn().mockResolvedValue(null);
     const { unmount } = render(
-      <ApprovalCard approval={approval} onDecide={onDecide} />,
+      <ApprovalCard canPersist approval={approval} onDecide={onDecide} />,
     );
     expect(
       screen.getByText(/bash commands starting with “git status”/),
@@ -130,6 +148,7 @@ describe('ApprovalCard', () => {
       'A rule this broad lets your companion run almost anything, including changing its own approval settings.';
     render(
       <ApprovalCard
+        canPersist
         approval={approvalFixture('apr_1', {
           suggestedMatcher: { kind: 'command_prefix', value: 'ls -la' },
         })}
@@ -151,6 +170,7 @@ describe('ApprovalCard', () => {
     const onDecide = vi.fn().mockResolvedValue(null);
     const { unmount } = render(
       <ApprovalCard
+        canPersist
         approval={approvalFixture('apr_1', { argumentsTruncated: true })}
         onDecide={onDecide}
       />,
@@ -167,6 +187,7 @@ describe('ApprovalCard', () => {
 
     render(
       <ApprovalCard
+        canPersist
         approval={approvalFixture('apr_2', {
           suggestedMatcher: { kind: 'command_prefix', value: '' },
         })}
@@ -185,7 +206,6 @@ describe('ApprovalCard', () => {
       <ApprovalCard
         approval={approvalFixture('apr_1', { agentId: 'helper-7' })}
         onDecide={vi.fn()}
-        canPersist={false}
       />,
     );
 

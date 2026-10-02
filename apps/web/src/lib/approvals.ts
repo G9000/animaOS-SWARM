@@ -53,13 +53,16 @@ export function describeMatcher(
   tool: string,
   matcher: ApprovalMatcher,
 ): string {
+  // The model chose these values: show hidden characters as escapes.
+  const value = revealHiddenCharacters(matcher.value);
+  tool = revealHiddenCharacters(tool);
   switch (matcher.kind) {
     case 'command_prefix':
-      return `${tool} commands starting with “${matcher.value}”`;
+      return `${tool} commands starting with “${value}”`;
     case 'path_glob':
-      return `${tool} on files matching “${matcher.value}”`;
+      return `${tool} on files matching “${value}”`;
     case 'domain':
-      return `${tool} on ${matcher.value} and its subdomains`;
+      return `${tool} on ${value} and its subdomains`;
     case 'any':
       return `every ${tool} call`;
   }
@@ -104,7 +107,11 @@ export function isBroadExecMatcher(
   if (riskClass !== 'exec') return false;
   if (matcher.kind === 'any') return true;
   if (matcher.kind !== 'command_prefix') return false;
-  const [first = ''] = matcher.value.trim().split(/\s+/);
+  const [word = ''] = matcher.value.trim().split(/\s+/);
+  // Like the daemon's `is_wrapper`: `/usr/bin/python3`, `bash.exe` and
+  // `Python` count as the command they name.
+  const base = word.split(/[/\\]/).pop() ?? word;
+  const first = base.toLowerCase().replace(/\.exe$/, '');
   return BROAD_COMMANDS.has(first) || /^python[\d.]*$/.test(first);
 }
 
