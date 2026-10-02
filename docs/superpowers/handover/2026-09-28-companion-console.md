@@ -2,6 +2,22 @@
 
 This document is for the next agent picking up the companion console upgrade. Read it first; it tells you where everything is and what to do next.
 
+## Update 2026-10-02 (later): M5 planned and audited, not started
+
+- M4 is merged to `main` (PR #9, merge commit `f34313b`).
+- **M5 (Skills) plan:** `docs/superpowers/plans/2026-09-23-companion-console-m5.md`, 14 tasks. Snapshot moves to v8, with `.pre-skills.bak` / `control_plane.backup.7` written first.
+- **Pre-flight audit:** `docs/superpowers/plans/2026-09-23-companion-console-m5-preflight-audit.md`, with 0 Blocker, 4 Important and 19 Minor findings.
+- **Resume here:**
+  1. Rule on the audit findings: insert a `#### Controller rulings from the pre-flight audit (binding)` block per affected task and commit the plan. The auditor's recommended rulings are in the audit, and none needs a question for the owner.
+  2. Extract briefs to `.superpowers/sdd/2026-09-23-companion-console-m5/` and copy `rules.md` from the M4 folder.
+  3. Run Tasks 1→14 as in M4.
+- **The four Important findings:**
+  - **I1:** hidden Unicode (tag characters, bidi overrides, zero-width characters, U+2028/2029) in drafts.
+  - **I2:** the page's Edit button can approve text nobody reviewed.
+  - **I3:** Windows device names (`con`, `nul`, `com1`…) pass as slugs.
+  - **I4:** `act()` warnings in the Skills page tests and `useSkillCommands`.
+- **Tiers:** the auditor recommends the most capable model for Tasks 4, 5, 9 and 13.
+
 ## Update 2026-10-02: M4 done, PR open
 
 - **M4 (Approvals) is complete** on `feat/companion-console`, and [PR #9](https://github.com/G9000/animaOS-SWARM/pull/9) to `main` is ready for review.
