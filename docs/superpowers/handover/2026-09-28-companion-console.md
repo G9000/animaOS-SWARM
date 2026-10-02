@@ -2,7 +2,16 @@
 
 This document is for the next agent picking up the companion console upgrade. Read it first; it tells you where everything is and what to do next.
 
-## Where things stand (2026-09-28)
+## Update 2026-10-02: M4 in progress (Tasks 1–9 done)
+
+- **M4 Tasks 1–9 are committed and pushed** on `feat/companion-console`; each was reviewed, and the review fixes are in. That covers the whole daemon side (risk table, registry and snapshot v7, settling, history store, the gate, Stop, reads, routes) plus the SDK approvals client. A **draft PR** to `main` is open.
+- **Resume at Task 10** (web live state), then 11–13, the whole-milestone final review, one fix wave, and the Task 14 gates. Briefs are extracted per task in `.superpowers/sdd/2026-09-23-companion-console-m4/briefs/` (regenerate from the plan if missing). The controller rulings are committed in the M4 plan; I2 used the auditor's ruling (README note plus UI warning), as the owner chose.
+- **Carry into the web tasks:** `suggestedMatcher.value` can be `""` (disable the scoped buttons); the reducer must tolerate `approval.resolved` without a prior `approval.requested`; a stopped settlement publishes no `run.started`.
+- **Carry into the fix wave:** a 503-with-revert route test for PUT policy, POST rule and DELETE rule.
+- **Commits are GPG-signed.** When gpg-agent's cache expires, a commit blocks on a pinentry dialog until the owner answers it.
+- The last full daemon lib run passed: 930 passed / 4 ignored. The Nx gates have not been run yet.
+
+## Where things stood (2026-09-28)
 
 - **Done and merged to `main`:**
   - M0 (security groundwork), M1 (run coordinator), M2 (sessions), and M3 (live runs).
