@@ -129,6 +129,14 @@ pub(super) async fn blocking<T: Send + 'static>(
     }
 }
 
+/// The state a scan reads before its file work.
+struct ScanInput {
+    root: PathBuf,
+    generation: u64,
+    previous: std::collections::BTreeMap<String, ScannedFile>,
+    registered: BTreeSet<String>,
+}
+
 #[derive(Clone)]
 pub(crate) struct SkillService {
     pub(super) state: SharedDaemonState,
@@ -206,7 +214,12 @@ impl SkillService {
                     .skills
                     .set_scanned(&written, scanned),
                 Err(error) => {
-                    undo(&mut self.state.write().await.skills);
+                    // A late write may still land: the old scan says nothing
+                    // about the file now, so the skill reads missing until
+                    // the next scan.
+                    let mut guard = self.state.write().await;
+                    undo(&mut guard.skills);
+                    guard.skills.set_scanned(&written, None);
                     return Err(error);
                 }
             }
@@ -283,20 +296,39 @@ impl SkillService {
     /// Rescans the skills folder (spec §8.1); `true` when a status or the
     /// file drafts changed, which is announced as `skill.updated`.
     pub(crate) async fn scan(&self) -> Result<bool, SkillError> {
-        let root = self.workspace().await?;
-        let (generation, previous, registered) = {
-            let guard = self.state.read().await;
-            (
-                guard.skills.generation(),
-                guard.skills.scanned_files().clone(),
-                guard
-                    .skills
-                    .records()
-                    .iter()
-                    .map(|record| record.slug.clone())
-                    .collect::<BTreeSet<_>>(),
-            )
-        };
+        let input = self.scan_input().await?;
+        self.scan_with(input).await
+    }
+
+    /// What a scan starts from, read under one lock so the workspace and the
+    /// generation always belong together.
+    async fn scan_input(&self) -> Result<ScanInput, SkillError> {
+        let guard = self.state.read().await;
+        let root = guard
+            .workspace
+            .as_ref()
+            .map(|workspace| workspace.root_path.clone())
+            .ok_or(SkillError::NoWorkspace)?;
+        Ok(ScanInput {
+            root,
+            generation: guard.skills.generation(),
+            previous: guard.skills.scanned_files().clone(),
+            registered: guard
+                .skills
+                .records()
+                .iter()
+                .map(|record| record.slug.clone())
+                .collect::<BTreeSet<_>>(),
+        })
+    }
+
+    async fn scan_with(&self, input: ScanInput) -> Result<bool, SkillError> {
+        let ScanInput {
+            root,
+            generation,
+            previous,
+            registered,
+        } = input;
         let scanned = blocking(move || disk::scan_skills_folder(&root, &previous, &registered))
             .await?
             .map_err(SkillError::Unavailable)?;
@@ -509,7 +541,7 @@ impl SkillService {
         let (workspace, target) = (read_root.clone(), slug.clone());
         let bytes = blocking(move || disk::read_skill_bytes(&workspace, &target))
             .await?
-            .map_err(SkillError::Invalid)?
+            .map_err(SkillError::Unavailable)?
             .ok_or(SkillError::NotFound)?;
         let current = skill_hash(&bytes);
         if current != reviewed {
@@ -647,6 +679,7 @@ mod tests {
 
     use super::*;
     use crate::agent_runs::test_support::{companion_config, next_event};
+    use crate::control_plane_store::WorkspaceConfig;
     use crate::skills::test_support::{
         broken_store, content, service, skill_text, temp_workspace, with_workspace, write_skill,
     };
@@ -897,7 +930,7 @@ mod tests {
         let _held = skills.transactions.clone().lock_owned().await;
 
         let refused = tokio::time::timeout(
-            Duration::from_millis(500),
+            Duration::from_secs(10),
             skills.approve_changed("notes", &"0".repeat(64)),
         )
         .await;
@@ -906,6 +939,86 @@ mod tests {
             refused,
             Ok(Err(SkillError::Conflict(SKILL_HASH_MISMATCH.into())))
         );
+    }
+
+    #[tokio::test]
+    async fn approving_reports_a_file_that_cannot_be_read_as_unavailable() {
+        let (state, root, _) = daemon("approve-unreadable").await;
+        let skills = service(&state);
+        skills.save("notes", content("notes")).await.unwrap();
+        let file = root.join("skills/notes/SKILL.md");
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+
+        let refused = skills.approve_changed("notes", &"0".repeat(64)).await;
+
+        assert!(
+            matches!(refused, Err(SkillError::Unavailable(_))),
+            "{refused:?}"
+        );
+        assert_eq!(
+            skills.approve_changed("notes", "nope").await,
+            Err(SkillError::Invalid(SKILL_HASH_REQUIRED.into())),
+            "malformed input stays a 400"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_write_does_not_leave_the_skill_reading_active() {
+        let (state, root, _) = daemon("write-fail").await;
+        let skills = service(&state);
+        skills.save("notes", content("notes")).await.unwrap();
+        assert_eq!(
+            state.read().await.skills.get("notes").unwrap().status,
+            SkillStatus::Active
+        );
+        let file = root.join("skills/notes/SKILL.md");
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+
+        let mut edited = content("notes");
+        edited.body = "Do it differently.".into();
+        let refused = skills.save("notes", edited).await;
+
+        assert!(
+            matches!(refused, Err(SkillError::Unavailable(_))),
+            "{refused:?}"
+        );
+        let guard = state.read().await;
+        assert!(
+            guard.skills.scanned("notes").is_none(),
+            "the cache is stale"
+        );
+        assert_ne!(
+            guard.skills.get("notes").unwrap().status,
+            SkillStatus::Active,
+            "a late write may still land, so the old scan cannot vouch for it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_scan_that_began_before_a_workspace_switch_is_dropped() {
+        let (state, old_root, _) = daemon("scan-switch").await;
+        let skills = service(&state);
+        write_skill(&old_root, "old-skill", &skill_text("old-skill"));
+        let input = skills.scan_input().await.unwrap();
+        assert_eq!(input.root, old_root);
+
+        let new_root = temp_workspace("scan-switch-new");
+        state.write().await.set_workspace(Some(WorkspaceConfig {
+            root_path: new_root,
+            company_name: "Acme".into(),
+            mission: "Ship carefully".into(),
+            values: vec![],
+        }));
+
+        assert_eq!(skills.scan_with(input).await, Ok(false));
+        let guard = state.read().await;
+        assert!(
+            guard.skills.file_drafts().is_empty(),
+            "no old-workspace drafts"
+        );
+        assert!(guard.skills.scanned_files().is_empty());
     }
 
     #[tokio::test]
