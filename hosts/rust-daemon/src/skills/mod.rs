@@ -556,6 +556,11 @@ mod tests {
             "a\u{200B}b",
             "a\u{FEFF}b",
             "a\u{00AD}b",
+            "ok \u{E0100}\u{E0101}",
+            "a\u{FE0F}\u{FE0F}b",
+            "a\u{034F}b",
+            "a\u{3164}b",
+            "a\u{0890}b",
         ] {
             assert_eq!(validate_name(hidden), Err(SKILL_TEXT_HIDDEN), "{hidden:?}");
             assert_eq!(
@@ -565,9 +570,10 @@ mod tests {
             );
         }
         assert_eq!(validate_name("\u{200B}"), Err(SKILL_TEXT_HIDDEN));
-        for hidden in ["x\u{E0041}", "x\u{202E}"] {
+        for hidden in ["x\u{E0041}", "x\u{202E}", "x\u{E0100}"] {
             assert_eq!(validate_body(hidden), Err(SKILL_TEXT_HIDDEN), "{hidden:?}");
         }
+        assert!(validate_name("Love \u{2764}\u{FE0F}").is_ok());
         for allowed in ["family 👨\u{200D}👩", "x\u{200B}", "x\u{2028}"] {
             assert_eq!(validate_body(allowed), Ok(()), "{allowed:?}");
         }
