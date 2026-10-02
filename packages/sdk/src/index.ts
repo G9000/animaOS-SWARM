@@ -53,13 +53,43 @@ export type {
   StartRunInput,
   StartRunResult,
 } from './runs.js';
-export { AgentEventsClient, isRunLifecycleEvent } from './events.js';
+export {
+  AgentEventsClient,
+  isApprovalEvent,
+  isRunLifecycleEvent,
+} from './events.js';
 export type {
   AgentEvent,
   LiveToolCard,
   RunLifecycleEventType,
   SnapshotRun,
 } from './events.js';
+export {
+  ApprovalsClient,
+  DEFAULT_APPROVAL_POLICY,
+  MAX_APPROVAL_NOTE_CHARS,
+  POLICY_CLASSES,
+} from './approvals.js';
+export type {
+  Approval,
+  ApprovalDecision,
+  ApprovalDecisionInput,
+  ApprovalListOptions,
+  ApprovalMatcher,
+  ApprovalMatcherKind,
+  ApprovalPage,
+  ApprovalPolicy,
+  ApprovalPolicyAction,
+  ApprovalResolution,
+  ApprovalResolvedBy,
+  ApprovalRule,
+  ApprovalRuleInput,
+  ApprovalRules,
+  ApprovalStatus,
+  ApprovalTool,
+  PolicyClass,
+  RiskClass,
+} from './approvals.js';
 export { ChatGptClient } from './chatgpt.js';
 export type { ChatGptLogin, ChatGptStatus } from './chatgpt.js';
 export type {
