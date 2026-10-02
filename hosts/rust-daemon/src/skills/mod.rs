@@ -6,6 +6,7 @@
 #![allow(dead_code)] // M5 Task 9 removes this once the routes, tools, and runs use every item.
 
 pub(crate) mod disk;
+pub(crate) mod drafts;
 pub(crate) mod file;
 pub(crate) mod registry;
 pub(crate) mod scanner;
@@ -15,6 +16,8 @@ pub(crate) mod test_support;
 
 use serde::{Deserialize, Serialize};
 
+#[allow(unused_imports)] // M5 Tasks 7–8 use them.
+pub(crate) use drafts::{ApprovedDraft, DraftApproval, Proposal};
 #[allow(unused_imports)] // M5 Tasks 2–9 use them.
 pub(crate) use file::{compose_skill_file, parse_skill_file, skill_hash, SkillFile};
 #[allow(unused_imports)] // M5 Tasks 3–9 use them.
