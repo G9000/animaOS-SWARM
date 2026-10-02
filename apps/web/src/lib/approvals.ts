@@ -1,0 +1,135 @@
+import {
+  DaemonHttpError,
+  type Approval,
+  type ApprovalDecision,
+  type ApprovalDecisionInput,
+  type ApprovalMatcher,
+  type ApprovalMatcherKind,
+  type RiskClass,
+} from '@animaOS-SWARM/sdk';
+
+import { daemon } from './daemon-api';
+
+/** The daemon's bound on a matcher value (`MAX_MATCHER_VALUE_CHARS`). */
+export const MAX_MATCHER_VALUE_CHARS = 512;
+
+/** What the owner sees when a request never reached the daemon. */
+export const COMPANION_UNREACHABLE =
+  'Could not reach your companion. Try again.';
+
+/** Sends the owner's decision with the approval's own revision; answers
+ *  null when it went through, otherwise the message to show. */
+export type ApprovalDecide = (
+  approval: Approval,
+  input: Omit<ApprovalDecisionInput, 'revision'>,
+) => Promise<string | null>;
+
+export const CLASS_LABELS: Record<RiskClass, string> = {
+  read: 'Reads',
+  write: 'Changes files and records',
+  exec: 'Runs commands',
+  network: 'Uses the internet',
+  delegate: 'Asks other agents',
+};
+
+export const DECISION_LABELS: Record<ApprovalDecision, string> = {
+  allow_once: 'Allow once',
+  allow_session: 'Allow for this session',
+  allow_always: 'Always allow',
+  deny: 'Deny',
+};
+
+export const MATCHER_KIND_LABELS: Record<ApprovalMatcherKind, string> = {
+  command_prefix: 'Command starts with',
+  path_glob: 'File path matches',
+  domain: 'Website domain is',
+  any: 'Any call of this tool',
+};
+
+/** What a rule or allowance covers, in words. */
+export function describeMatcher(
+  tool: string,
+  matcher: ApprovalMatcher,
+): string {
+  switch (matcher.kind) {
+    case 'command_prefix':
+      return `${tool} commands starting with “${matcher.value}”`;
+    case 'path_glob':
+      return `${tool} on files matching “${matcher.value}”`;
+    case 'domain':
+      return `${tool} on ${matcher.value} and its subdomains`;
+    case 'any':
+      return `every ${tool} call`;
+  }
+}
+
+/** Commands that can run or fetch almost anything: a rule starting with
+ *  one of them is no real limit. `python` also covers `python3.12`. */
+const BROAD_COMMANDS: ReadonlySet<string> = new Set([
+  'curl',
+  'wget',
+  'node',
+  'bun',
+  'deno',
+  'ruby',
+  'perl',
+  'php',
+  'sh',
+  'bash',
+  'zsh',
+  'env',
+  'sudo',
+  'xargs',
+  'npx',
+  'bunx',
+  'npm',
+  'pnpm',
+  'yarn',
+  'make',
+  'git',
+  'cargo',
+  'go',
+  'docker',
+  'ssh',
+]);
+
+/** True when a rule or allowance on this matcher would let the companion
+ *  run almost anything, including changing its own approval settings. */
+export function isBroadExecMatcher(
+  riskClass: RiskClass,
+  matcher: ApprovalMatcher,
+): boolean {
+  if (riskClass !== 'exec') return false;
+  if (matcher.kind === 'any') return true;
+  if (matcher.kind !== 'command_prefix') return false;
+  const [first = ''] = matcher.value.trim().split(/\s+/);
+  return BROAD_COMMANDS.has(first) || /^python[\d.]*$/.test(first);
+}
+
+const HIDDEN_CHARACTERS = /[\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/g;
+
+/** Writes zero-width and direction-changing characters out as `\u{…}`, so
+ *  text cannot look different from what it is. */
+export function revealHiddenCharacters(text: string): string {
+  return text.replace(
+    HIDDEN_CHARACTERS,
+    (character) =>
+      `\\u{${(character.codePointAt(0) ?? 0).toString(16).padStart(4, '0')}}`,
+  );
+}
+
+export const decideApproval: ApprovalDecide = async (approval, input) => {
+  try {
+    await daemon.decideApproval(approval.id, {
+      ...input,
+      revision: approval.revision,
+    });
+    return null;
+  } catch (error) {
+    if (error instanceof DaemonHttpError)
+      return error.status === 404
+        ? 'This approval is no longer waiting.'
+        : error.message;
+    return COMPANION_UNREACHABLE;
+  }
+};

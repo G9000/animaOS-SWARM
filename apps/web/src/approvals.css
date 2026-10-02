@@ -1,0 +1,81 @@
+/* Approval cards and the Approvals page (spec §15.2, §15.4). */
+.approval-card {
+  display: flex;
+  max-width: 85%;
+  flex-direction: column;
+  gap: 8px;
+  align-self: flex-start;
+  border: 1px solid var(--color-amber);
+  border-radius: 12px;
+  padding: 10px 12px;
+  background: rgb(255 255 255 / 0.02);
+}
+.approval-card-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.approval-card-tool {
+  color: var(--color-ink);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.approval-card-class,
+.approval-card-lead,
+.approval-card-note,
+.approval-card-scope,
+.approval-card-expiry {
+  color: var(--color-ink-3);
+  font-size: 12px;
+}
+.approval-card-arguments {
+  max-height: 16rem;
+  overflow: auto;
+  border-radius: 8px;
+  padding: 8px;
+  background: var(--color-abyss);
+  color: var(--color-ink-2);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.approval-card-label {
+  color: var(--color-ink-2);
+  font-size: 11px;
+}
+.approval-card-input {
+  width: 100%;
+  border: 1px solid var(--color-line);
+  border-radius: 8px;
+  padding: 6px 8px;
+  background: var(--color-panel);
+  color: var(--color-ink);
+  font-size: 12px;
+}
+.approval-card-matcher {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border: 1px solid var(--color-line);
+  border-radius: 8px;
+  padding: 8px;
+}
+.approval-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.approval-card-deny,
+.approval-card-error {
+  color: var(--color-danger);
+}
+.approval-card-warning {
+  color: var(--color-amber);
+  font-size: 12px;
+}
+.approval-card-sent {
+  color: var(--color-mint);
+  font-size: 12px;
+}

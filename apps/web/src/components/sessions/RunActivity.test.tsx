@@ -1,11 +1,11 @@
-import { render, screen } from '@testing-library/react';
+import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 
 import { emptyLiveRun } from '../../lib/session-events';
 import type { ToolStep } from '../../lib/transcript';
 import type { ChatMessage } from '../../lib/types';
-import { runFixture } from '../../test/live';
+import { approvalFixture, runFixture } from '../../test/live';
 import { PendingMessage, RunActivity, ToolBlock } from './RunActivity';
 import { RunOutcomeCard } from './RunOutcomeCard';
 
@@ -136,6 +136,63 @@ describe('RunActivity', () => {
     );
     expect(screen.getByRole('status')).toBe(region);
     expect(region).toHaveTextContent('Compacting earlier messages…');
+  });
+
+  it('shows the run’s approval cards inline and decides through the transcript actions', async () => {
+    const user = userEvent.setup();
+    const run = runFixture('run_1', {
+      status: 'awaiting_approval',
+      startedAtMs: Date.now(),
+    });
+    const approval = approvalFixture('apr_1');
+    const onDecideApproval = vi.fn().mockResolvedValue(null);
+    render(
+      <RunActivity
+        agentName="Nova"
+        renderMessage={renderMessage}
+        live={{ ...emptyLiveRun(run), approvals: [approval] }}
+        actions={{ onDecideApproval, companionAgentId: 'agent-main' }}
+      />,
+    );
+
+    expect(screen.getByText('Waiting for your approval…')).toBeVisible();
+    const card = screen.getByRole('region', { name: 'Approval needed: bash' });
+    expect(
+      within(card).getByRole('button', { name: 'Always allow' }),
+    ).toBeVisible();
+    await user.click(within(card).getByRole('button', { name: 'Allow once' }));
+    expect(onDecideApproval).toHaveBeenCalledWith(approval, {
+      decision: 'allow_once',
+    });
+    expect(
+      await within(card).findByText('Allowed once. Continuing…'),
+    ).toBeVisible();
+  });
+
+  it('offers no rule for an approval that belongs to another agent', () => {
+    const run = runFixture('run_h', {
+      agentId: 'helper-7',
+      status: 'awaiting_approval',
+      startedAtMs: Date.now(),
+    });
+    render(
+      <RunActivity
+        agentName="Helper"
+        renderMessage={renderMessage}
+        live={{
+          ...emptyLiveRun(run),
+          approvals: [approvalFixture('apr_h', { agentId: 'helper-7' })],
+        }}
+        actions={{ onDecideApproval: vi.fn(), companionAgentId: 'agent-main' }}
+      />,
+    );
+
+    expect(
+      screen.queryByRole('button', { name: 'Always allow' }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByText('Rules for other agents are not managed here yet.'),
+    ).toBeVisible();
   });
 });
 

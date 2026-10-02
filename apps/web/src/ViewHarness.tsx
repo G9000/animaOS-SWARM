@@ -983,6 +983,7 @@ export function ViewHarness() {
     compact: (session) => void commands.compactSession(session),
     compacting: commands.compacting,
     openSession: commands.openTarget,
+    companionId: agentId,
   });
 
   if (connection === 'unknown' || (connection === 'online' && !loaded)) {

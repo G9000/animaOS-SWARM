@@ -9,6 +9,7 @@ import {
   createDaemonClient,
   type AgencyGenerateRequest,
   type AgencyGenerateResponse,
+  type ApprovalDecisionInput,
   type WorkspaceBootstrapRequest,
   type AgentMemory,
   type AgentTasks,
@@ -374,6 +375,9 @@ export const daemon = {
   /** The companion's live event stream (spec §6). */
   agentEvents: (agentId: string, options: { signal?: AbortSignal } = {}) =>
     setupClient.events.stream(agentId, options),
+  /** The owner's decision on a pending approval (spec §7.3). */
+  decideApproval: (approvalId: string, input: ApprovalDecisionInput) =>
+    setupClient.approvals.decide(approvalId, input),
   listAgentSummaries: () => setupClient.agents.listSummaries(),
   cancelAgentJob: (id: string, jobId: string, input: { revision: number }) =>
     setupClient.agents.cancelJob(id, jobId, input),

@@ -11,6 +11,7 @@ import {
   type TranscriptActions,
 } from '../../lib/transcript';
 import type { ChatMessage } from '../../lib/types';
+import { ApprovalCard } from './ApprovalCard';
 import { HelperCard } from './HelperCard';
 import { ToolStepCard } from './ToolStepCard';
 
@@ -183,9 +184,20 @@ export function RunActivity({
           actions={actions}
         />
       )}
+      {live.approvals.map((approval) => (
+        <ApprovalCard
+          key={approval.id}
+          approval={approval}
+          onDecide={actions?.onDecideApproval}
+          canPersist={approval.agentId === actions?.companionAgentId}
+        />
+      ))}
       {/* The status region stays mounted and only its text changes, so a
        *  screen reader announces the phase when it starts (S3b-E). */}
       <div role="status">
+        {run.status === 'awaiting_approval' && (
+          <p className="run-phase">Waiting for your approval…</p>
+        )}
         {live.phase === 'compacting' && (
           <p className="run-phase">Compacting earlier messages…</p>
         )}

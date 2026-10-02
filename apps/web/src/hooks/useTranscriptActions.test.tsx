@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { emptyLiveRun } from '../lib/session-events';
 import type { ToolStep } from '../lib/transcript';
-import { runFixture } from '../test/live';
+import { approvalFixture, runFixture } from '../test/live';
 import { sessionFixture } from '../test/sessions';
 import {
   helperSessionTarget,
@@ -191,5 +191,25 @@ describe('useTranscriptActions', () => {
   it('does not send again where the message cannot go', () => {
     const { result } = actionsFor({ resendable: false });
     expect(result.current.onSendAgain).toBeUndefined();
+  });
+
+  it('decides approvals through its handler with one identity across renders', async () => {
+    const decideApproval = vi.fn().mockResolvedValue(null);
+    const { result, rerender } = actionsFor({
+      decideApproval,
+      companionId: 'agent-main',
+    });
+    const first = result.current;
+    rerender();
+    expect(result.current).toBe(first);
+    expect(result.current.companionAgentId).toBe('agent-main');
+
+    const approval = approvalFixture('apr_1');
+    await expect(
+      result.current.onDecideApproval?.(approval, { decision: 'deny' }),
+    ).resolves.toBeNull();
+    expect(decideApproval).toHaveBeenCalledWith(approval, {
+      decision: 'deny',
+    });
   });
 });
