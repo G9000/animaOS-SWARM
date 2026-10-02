@@ -194,7 +194,8 @@ export function useLiveSession({
     }
     const lifecycle = isRunLifecycleEvent(event);
     const sessionChange = event.type.startsWith('session.');
-    if (lifecycle || sessionChange) refreshSoon('sessions', refreshSessions);
+    if (lifecycle || sessionChange || event.type.startsWith('approval.'))
+      refreshSoon('sessions', refreshSessions);
     if (
       !key ||
       event.agentId !== sessionAgentId ||

@@ -538,4 +538,19 @@ describe('SessionSidebar', () => {
     );
     expect(screen.queryByRole('menu')).not.toBeInTheDocument();
   });
+
+  it('marks a session that waits for an approval', () => {
+    renderSidebar({
+      sessions: [
+        sessionFixture('chat:deploy', {
+          title: 'Deploy',
+          pendingApprovals: 2,
+          lastActivityAtMs: NOW.getTime(),
+        }),
+      ],
+    });
+
+    const row = screen.getByRole('button', { name: 'Deploy, needs approval' });
+    expect(within(row).getByText('2')).toBeVisible();
+  });
 });

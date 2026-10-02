@@ -10,9 +10,10 @@ use async_trait::async_trait;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 
 use super::{
-    message_ordinal, role_name, search_tokens, searchable_text, to_i64, HistoryError,
-    HistoryMessage, HistoryStore, MessagePageQuery,
+    message_ordinal, role_name, search_tokens, searchable_text, to_i64, ApprovalPageQuery,
+    HistoryError, HistoryMessage, HistoryStore, MessagePageQuery,
 };
+use crate::approvals::ApprovalRequest;
 use crate::runs::RunRecord;
 
 /// `PRAGMA user_version` of the schema this daemon writes.
@@ -114,6 +115,22 @@ ON CONFLICT (id) DO UPDATE SET
     created_at_ms = excluded.created_at_ms,
     finished_at_ms = excluded.finished_at_ms,
     record = excluded.record";
+
+const UPSERT_APPROVAL: &str = "
+INSERT INTO approvals (id, agent_id, session_id, created_at_ms, record)
+VALUES (?1, ?2, ?3, ?4, ?5)
+ON CONFLICT (id) DO UPDATE SET
+    agent_id = excluded.agent_id,
+    session_id = excluded.session_id,
+    created_at_ms = excluded.created_at_ms,
+    record = excluded.record";
+
+const PAGE_APPROVALS: &str = "
+SELECT record FROM approvals
+WHERE (?1 IS NULL OR agent_id = ?1) AND created_at_ms >= ?2
+  AND (?3 IS NULL OR created_at_ms < ?3 OR (created_at_ms = ?3 AND id < ?4))
+ORDER BY created_at_ms DESC, id DESC
+LIMIT ?5";
 
 const PAGE_MESSAGES: &str = "
 SELECT agent_id, session_id, hidden, record FROM messages
@@ -348,6 +365,89 @@ impl HistoryStore for SqliteHistoryStore {
         .await
     }
 
+    async fn upsert_approvals(&self, approvals: &[ApprovalRequest]) -> Result<(), HistoryError> {
+        if approvals.is_empty() {
+            return Ok(());
+        }
+        let rows = approvals
+            .iter()
+            .map(
+                |approval| -> Result<(String, String, String, i64, String), HistoryError> {
+                    Ok((
+                        approval.id.clone(),
+                        approval.agent_id.clone(),
+                        approval.session_id.clone(),
+                        to_i64(approval.created_at_ms)?,
+                        serde_json::to_string(approval)?,
+                    ))
+                },
+            )
+            .collect::<Result<Vec<_>, HistoryError>>()?;
+        self.run(move |connection| {
+            let transaction = connection.transaction()?;
+            {
+                let mut statement = transaction.prepare_cached(UPSERT_APPROVAL)?;
+                for (id, agent_id, session_id, created_at_ms, record) in &rows {
+                    statement.execute(params![id, agent_id, session_id, created_at_ms, record])?;
+                }
+            }
+            transaction.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn get_approval(
+        &self,
+        approval_id: &str,
+    ) -> Result<Option<ApprovalRequest>, HistoryError> {
+        let approval_id = approval_id.to_string();
+        self.run(move |connection| {
+            let record = connection
+                .query_row(
+                    "SELECT record FROM approvals WHERE id = ?1",
+                    params![approval_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            record
+                .map(|record| serde_json::from_str(&record).map_err(HistoryError::from))
+                .transpose()
+        })
+        .await
+    }
+
+    async fn page_approvals(
+        &self,
+        query: &ApprovalPageQuery,
+    ) -> Result<Vec<ApprovalRequest>, HistoryError> {
+        let query = query.clone();
+        self.run(move |connection| {
+            let (before_at, before_id) = match &query.before {
+                Some((at_ms, id)) => (Some(to_i64(*at_ms)?), id.clone()),
+                None => (None, String::new()),
+            };
+            let mut statement = connection.prepare_cached(PAGE_APPROVALS)?;
+            let records = statement
+                .query_map(
+                    params![
+                        query.agent_id,
+                        to_i64(query.since_ms)?,
+                        before_at,
+                        before_id,
+                        i64::try_from(query.limit).unwrap_or(i64::MAX)
+                    ],
+                    |row| row.get::<_, String>(0),
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            records
+                .iter()
+                .map(|record| serde_json::from_str(record).map_err(HistoryError::from))
+                .collect()
+        })
+        .await
+    }
+
     async fn existing_message_ids(&self, ids: &[String]) -> Result<HashSet<String>, HistoryError> {
         let ids = ids.to_vec();
         self.run(move |connection| {
@@ -567,7 +667,7 @@ impl HistoryStore for SqliteHistoryStore {
         let (agent_id, session_id) = (agent_id.to_string(), session_id.to_string());
         self.run(move |connection| {
             let transaction = connection.transaction()?;
-            for table in ["messages", "runs", "attachments"] {
+            for table in ["messages", "runs", "attachments", "approvals"] {
                 transaction.execute(
                     &format!("DELETE FROM {table} WHERE agent_id = ?1 AND session_id = ?2"),
                     params![agent_id, session_id],
@@ -583,8 +683,8 @@ impl HistoryStore for SqliteHistoryStore {
         let agent_id = agent_id.to_string();
         self.run(move |connection| {
             let transaction = connection.transaction()?;
-            // Usage rows stay (spec §3.3).
-            for table in ["messages", "runs", "attachments"] {
+            // Usage rows stay (spec §3.3); approvals go with their agent.
+            for table in ["messages", "runs", "attachments", "approvals"] {
                 transaction.execute(
                     &format!("DELETE FROM {table} WHERE agent_id = ?1"),
                     params![agent_id],
@@ -601,8 +701,8 @@ impl HistoryStore for SqliteHistoryStore {
 mod tests {
     use super::*;
     use crate::history::conformance::{
-        assert_history_store_checkin_text_conformance, assert_history_store_conformance,
-        assert_history_store_diacritics_conformance,
+        assert_history_store_approval_conformance, assert_history_store_checkin_text_conformance,
+        assert_history_store_conformance, assert_history_store_diacritics_conformance,
         assert_history_store_indexed_text_cap_conformance,
         assert_history_store_session_search_conformance, history_message,
     };
@@ -639,6 +739,7 @@ mod tests {
         assert_history_store_checkin_text_conformance(&store).await;
         assert_history_store_indexed_text_cap_conformance(&store).await;
         assert_history_store_diacritics_conformance(&store).await;
+        assert_history_store_approval_conformance(&store).await;
         assert_eq!(store.label(), "sqlite");
         assert!(!store.is_ephemeral());
     }

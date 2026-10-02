@@ -39,6 +39,8 @@ import {
 } from './hooks/useDaemonBootstrap';
 import { sessionFixture } from './test/sessions';
 import {
+  approvalEvent,
+  approvalFixture,
   deltaEvent,
   idleAgentEvents,
   messageCreatedEvent,
@@ -2116,8 +2118,8 @@ it('opens the new session on a page that still shows the conversation', async ()
     agents: [snapshot('agent-main', 'Nova', 1)],
   });
   mockProviders();
-  // Approvals arrives in a later release; until then it shows the chat.
-  window.history.replaceState(null, '', '/#/approvals');
+  // Automations arrives in a later release; until then it shows the chat.
+  window.history.replaceState(null, '', '/#/automations');
   render(<ViewHarness />);
 
   await user.type(await screen.findByPlaceholderText('Message Nova…'), 'Hello');
@@ -2830,6 +2832,60 @@ it('streams a reply into the open session with its tool steps, then shows the co
       screen.queryByRole('button', { name: 'Stop' }),
     ).not.toBeInTheDocument(),
   );
+});
+
+it('shows a pending approval inline and on the Approvals badge, once, and decides it', async () => {
+  const user = userEvent.setup();
+  const { stream } = await openLiveSession();
+  const run = { ...runningRun(), status: 'awaiting_approval' as const };
+  const approval = approvalFixture('apr_7', {
+    sessionId: 'room-7',
+    runId: run.id,
+  });
+  const decide = vi
+    .spyOn(daemon, 'decideApproval')
+    .mockResolvedValue({ ...approval, status: 'allowed', revision: 2 });
+  act(() =>
+    stream.push(snapshotEvent([snapshotRun(run)], 1, 'agent-main', [approval])),
+  );
+
+  const card = await screen.findByRole('region', {
+    name: 'Approval needed: bash',
+  });
+  expect(screen.getByText('Waiting for your approval…')).toBeVisible();
+  expect(
+    screen.getByRole('button', { name: 'Approvals, 1 waiting' }),
+  ).toBeVisible();
+  // A reconnect's snapshot shows it again, still once.
+  act(() =>
+    stream.push(snapshotEvent([snapshotRun(run)], 1, 'agent-main', [approval])),
+  );
+  expect(
+    screen.getAllByRole('region', { name: 'Approval needed: bash' }),
+  ).toHaveLength(1);
+
+  await user.click(within(card).getByRole('button', { name: 'Allow once' }));
+  expect(decide).toHaveBeenCalledWith('apr_7', {
+    decision: 'allow_once',
+    revision: 1,
+  });
+  act(() =>
+    stream.push(
+      approvalEvent(
+        'approval.resolved',
+        { ...approval, status: 'allowed', revision: 2 },
+        2,
+      ),
+      runEvent('run.started', { ...run, status: 'running' }, 3),
+    ),
+  );
+
+  await waitFor(() =>
+    expect(
+      screen.queryByRole('region', { name: 'Approval needed: bash' }),
+    ).not.toBeInTheDocument(),
+  );
+  expect(screen.getByRole('button', { name: 'Approvals' })).toBeVisible();
 });
 
 it('streams a reply without rendering unchanged history again', async () => {

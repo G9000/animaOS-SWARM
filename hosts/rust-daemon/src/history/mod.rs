@@ -25,6 +25,7 @@ use anima_core::{Message, MessageRole};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use crate::approvals::ApprovalRequest;
 use crate::runs::RunRecord;
 
 /// Rows per in-memory table in ephemeral mode (spec §13.1).
@@ -94,6 +95,18 @@ pub(crate) struct MessagePageQuery {
     pub(crate) before: Option<MessageOrder>,
     pub(crate) limit: usize,
     pub(crate) include_hidden: bool,
+}
+
+/// One page of decided approvals, newest first by `(createdAtMs, id)`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ApprovalPageQuery {
+    /// Only this agent's; every agent's when `None`.
+    pub(crate) agent_id: Option<String>,
+    /// Only approvals created at or after this time (spec §7.3's 30 days).
+    pub(crate) since_ms: u64,
+    /// Only approvals strictly older than this `(createdAtMs, id)`.
+    pub(crate) before: Option<(u64, String)>,
+    pub(crate) limit: usize,
 }
 
 /// A history deletion the control plane has saved and the store may not have
@@ -178,6 +191,19 @@ pub(crate) trait HistoryStore: Send + Sync {
 
     async fn upsert_runs(&self, runs: &[RunRecord]) -> Result<(), HistoryError>;
 
+    /// Decided approvals (spec §13.1), idempotent by id.
+    async fn upsert_approvals(&self, approvals: &[ApprovalRequest]) -> Result<(), HistoryError>;
+
+    async fn get_approval(
+        &self,
+        approval_id: &str,
+    ) -> Result<Option<ApprovalRequest>, HistoryError>;
+
+    async fn page_approvals(
+        &self,
+        query: &ApprovalPageQuery,
+    ) -> Result<Vec<ApprovalRequest>, HistoryError>;
+
     async fn existing_message_ids(&self, ids: &[String]) -> Result<HashSet<String>, HistoryError>;
 
     async fn get_message(
@@ -224,11 +250,11 @@ pub(crate) trait HistoryStore: Send + Sync {
         limit: usize,
     ) -> Result<Vec<HistoryMessage>, HistoryError>;
 
-    /// Removes a session's messages, runs, and attachment records.
+    /// Removes a session's messages, runs, approvals, and attachment records.
     async fn delete_session(&self, agent_id: &str, session_id: &str) -> Result<(), HistoryError>;
 
-    /// Removes an agent's messages, runs, and attachment records in every
-    /// session; usage rows stay (spec §3.3).
+    /// Removes an agent's messages, runs, approvals, and attachment records
+    /// in every session; usage rows stay (spec §3.3).
     async fn delete_agent(&self, agent_id: &str) -> Result<(), HistoryError>;
 }
 

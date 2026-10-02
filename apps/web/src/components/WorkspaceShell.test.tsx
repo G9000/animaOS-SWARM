@@ -246,11 +246,82 @@ describe('WorkspaceShell', () => {
   });
 
   it('shows the conversation for pages that arrive in later releases', () => {
-    render(<Shell initialRoute={{ kind: 'page', page: 'approvals' }} />);
+    render(<Shell initialRoute={{ kind: 'page', page: 'automations' }} />);
     expect(screen.getByText('Workspace canvas')).toBeVisible();
     expect(
       screen.queryByRole('button', { name: 'Open companion chat' }),
     ).not.toBeInTheDocument();
+  });
+
+  it('opens Approvals from the navigation with its waiting badge', async () => {
+    const user = userEvent.setup();
+    render(
+      <Shell approvals={<div>Approvals page</div>} pendingApprovals={2} />,
+    );
+    const nav = screen.getByRole('navigation', {
+      name: 'Workspace navigation',
+    });
+
+    await user.click(
+      within(nav).getByRole('button', { name: 'Approvals, 2 waiting' }),
+    );
+
+    expect(screen.getByText('Approvals page')).toBeVisible();
+    expect(screen.getByText('Workspace canvas')).not.toBeVisible();
+    expect(
+      within(nav).getByRole('button', { name: 'Approvals, 2 waiting' }),
+    ).toHaveAttribute('aria-current', 'page');
+  });
+
+  it('names the destination plainly when nothing waits', () => {
+    render(<Shell approvals={<div>Approvals page</div>} />);
+    expect(
+      within(
+        screen.getByRole('navigation', { name: 'Workspace navigation' }),
+      ).getByRole('button', { name: 'Approvals' }),
+    ).toBeVisible();
+  });
+
+  it('reviews approvals and opens sessions by title from commands', async () => {
+    const user = userEvent.setup();
+    const onOpenSession = vi.fn();
+    const plans = sessionFixture('chat:plans', { title: 'Weekend plans' });
+    render(
+      <Shell
+        approvals={<div>Approvals page</div>}
+        pendingApprovals={1}
+        sessions={[
+          plans,
+          sessionFixture('chat:old', { title: 'Old archive', archived: true }),
+        ]}
+        onOpenSession={onOpenSession}
+      />,
+    );
+
+    await user.keyboard('{Control>}k{/Control}');
+    expect(
+      screen.getByRole('option', { name: /Review tool approvals/ }),
+    ).toHaveTextContent('1 waiting for you');
+    expect(
+      screen.getByRole('option', { name: /Go to Approvals/ }),
+    ).toBeVisible();
+    expect(
+      screen.queryByRole('option', { name: /Old archive/ }),
+    ).not.toBeInTheDocument();
+    await user.type(
+      screen.getByRole('combobox', { name: 'Search commands' }),
+      'weekend',
+    );
+    await user.keyboard('{Enter}');
+    expect(onOpenSession).toHaveBeenCalledWith(plans);
+
+    await user.keyboard('{Control>}k{/Control}');
+    await user.type(
+      screen.getByRole('combobox', { name: 'Search commands' }),
+      'review',
+    );
+    await user.keyboard('{Enter}');
+    expect(screen.getByText('Approvals page')).toBeVisible();
   });
 
   it('shows the main agent identity in the sidebar presence block', () => {

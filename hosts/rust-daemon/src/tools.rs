@@ -79,6 +79,9 @@ pub(crate) struct ToolExecutionContext {
     /// The run's stop signal; the bash polling loop kills its child when it
     /// is set (spec §4.6).
     pub(super) cancel: Option<anima_core::CancelSignal>,
+    /// The run's approval gate (spec §7.3); `None` for swarm runs and direct
+    /// tool calls, which have no session or owner to ask.
+    pub(super) approvals: Option<crate::approvals::ApprovalGate>,
 }
 
 impl ToolExecutionContext {
@@ -110,6 +113,7 @@ impl ToolExecutionContext {
             mail: None,
             todo_revision: Arc::new(std::sync::Mutex::new(None)),
             cancel: None,
+            approvals: None,
         }
     }
 
@@ -160,14 +164,54 @@ impl ToolExecutionContext {
         self
     }
 
+    /// Puts the run's approval gate between the live checks and dispatch.
+    pub(crate) fn with_approvals(mut self, gate: Option<crate::approvals::ApprovalGate>) -> Self {
+        self.approvals = gate;
+        self
+    }
+
     pub(crate) async fn execute_tool(
         self,
         agent: AgentState,
         user_message: Message,
         tool_call: ToolCall,
     ) -> TaskResult<Content> {
+        if let Err(refused) = self.live_checks(&agent, &tool_call).await {
+            return refused;
+        }
+        // No approval is asked for a tool that does not exist.
+        let Some(handler) = self.tool_registry.lookup(&tool_call.name) else {
+            return TaskResult::error(format!("Unknown tool: {}", tool_call.name), 0);
+        };
+        // Spec §7.3: after the live checks, before dispatch. An approval can
+        // take minutes, so what it approved is checked again first.
+        if let Some(gate) = &self.approvals {
+            match gate.check(&agent, &tool_call).await {
+                crate::approvals::GateOutcome::Proceed => {}
+                crate::approvals::GateOutcome::Approved => {
+                    if let Err(refused) = self.live_checks(&agent, &tool_call).await {
+                        return refused;
+                    }
+                }
+                crate::approvals::GateOutcome::Refuse(result) => return result,
+            }
+        }
+        handler(self, agent, user_message, tool_call).await
+    }
+
+    /// The checks every call passes before it may run, and again after an
+    /// approval: the tool is configured, a helper runs no process tool, and a
+    /// delegating manager or peer still permits it.
+    async fn live_checks(
+        &self,
+        agent: &AgentState,
+        tool_call: &ToolCall,
+    ) -> Result<(), TaskResult<Content>> {
         if !agent.config.allows_tool(&tool_call.name) {
-            return TaskResult::error(tool_not_configured_error(&tool_call.name), 0);
+            return Err(TaskResult::error(
+                tool_not_configured_error(&tool_call.name),
+                0,
+            ));
         }
         if is_process_tool(&tool_call.name)
             && agent
@@ -177,43 +221,43 @@ impl ToolExecutionContext {
                 .and_then(|settings| settings.additional.get("workspaceRole"))
                 == Some(&DataValue::String("helper".into()))
         {
-            return TaskResult::error(
+            return Err(TaskResult::error(
                 "Process tools are unavailable to helpers until process cancellation is supported",
                 0,
-            );
+            ));
         }
         if let Some(parent_id) = &self.delegated_parent {
-            if let Some(coordinator) = &self.team {
-                if !coordinator
-                    .parent_allows_tool(parent_id, &tool_call.name)
-                    .await
-                {
-                    return TaskResult::error(
-                        "The manager no longer has permission for this delegated tool",
-                        0,
-                    );
-                }
-            } else {
-                return TaskResult::error("Delegated permission context is unavailable", 0);
+            let Some(coordinator) = &self.team else {
+                return Err(TaskResult::error(
+                    "Delegated permission context is unavailable",
+                    0,
+                ));
+            };
+            if !coordinator
+                .parent_allows_tool(parent_id, &tool_call.name)
+                .await
+            {
+                return Err(TaskResult::error(
+                    "The manager no longer has permission for this delegated tool",
+                    0,
+                ));
             }
         }
-        let handler = self.tool_registry.lookup(&tool_call.name);
         for source in &self.peer_sources {
-            if let Some(coordinator) = &self.team {
-                if !coordinator.peer_allows_tool(source, &tool_call.name).await {
-                    return TaskResult::error(
-                        "An originating agent no longer permits this peer tool action",
-                        0,
-                    );
-                }
-            } else {
-                return TaskResult::error("Peer permission context is unavailable", 0);
+            let Some(coordinator) = &self.team else {
+                return Err(TaskResult::error(
+                    "Peer permission context is unavailable",
+                    0,
+                ));
+            };
+            if !coordinator.peer_allows_tool(source, &tool_call.name).await {
+                return Err(TaskResult::error(
+                    "An originating agent no longer permits this peer tool action",
+                    0,
+                ));
             }
         }
-        match handler {
-            Some(handler) => handler(self, agent, user_message, tool_call).await,
-            None => TaskResult::error(format!("Unknown tool: {}", tool_call.name), 0),
-        }
+        Ok(())
     }
 }
 

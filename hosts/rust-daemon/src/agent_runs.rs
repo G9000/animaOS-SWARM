@@ -21,6 +21,7 @@ use crate::runs::{
 };
 use crate::state::DaemonState;
 
+mod approvals;
 mod compact;
 mod conversations;
 mod queue;
@@ -359,6 +360,10 @@ pub(crate) struct AgentRunCoordinator {
     /// call (controller ruling, M3 pre-flight audit): the model adapter has
     /// no request timeout of its own.
     title_timeout: std::time::Duration,
+    /// Calls waiting for the owner, by approval id (spec §7.3).
+    approval_waiters: crate::approvals::ApprovalWaiters,
+    /// How long a call waits for the owner (spec §7.3).
+    approval_timeouts: crate::approvals::ApprovalTimeouts,
 }
 
 impl AgentRunCoordinator {
@@ -621,6 +626,8 @@ impl AgentRunCoordinator {
             title_timeout: std::time::Duration::from_millis(
                 crate::sessions::titles::TITLE_TIMEOUT_MS,
             ),
+            approval_waiters: crate::approvals::ApprovalWaiters::default(),
+            approval_timeouts: crate::approvals::ApprovalTimeouts::default(),
         }
     }
 
@@ -635,6 +642,16 @@ impl AgentRunCoordinator {
     #[cfg(test)]
     pub(crate) fn with_title_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.title_timeout = timeout;
+        self
+    }
+
+    /// Shorter approval waits, so tests need not wait thirty minutes.
+    #[cfg(test)]
+    pub(crate) fn with_approval_timeouts(
+        mut self,
+        timeouts: crate::approvals::ApprovalTimeouts,
+    ) -> Self {
+        self.approval_timeouts = timeouts;
         self
     }
 
@@ -1576,7 +1593,18 @@ impl AgentRunCoordinator {
                 session_id: session_id.clone(),
                 agent_id: agent_id.clone(),
             }))
-            .with_cancel(Some(live_run.control().cancel));
+            .with_cancel(Some(live_run.control().cancel))
+            // Spec §7.3: the gate between the live checks and dispatch.
+            .with_approvals(Some(crate::approvals::ApprovalGate::new(
+                self.clone(),
+                crate::runs::RunLink {
+                    run_id: run_id.clone(),
+                    session_id: session_id.clone(),
+                    agent_id: agent_id.clone(),
+                },
+                source,
+                live_run.control().cancel,
+            )));
         let history = runtime.messages().to_vec();
         let execution = async {
             runtime
@@ -1683,6 +1711,7 @@ impl AgentRunCoordinator {
             memory_store,
             history_outbox,
             persist_request,
+            orphaned_approvals,
         ) = {
             let mut guard = self.state.write().await;
             let mut change_set = RunChangeSet::new(
@@ -1700,8 +1729,15 @@ impl AgentRunCoordinator {
                 if let Some(record) = guard.runs.get(&run_id) {
                     live_run.publish_record(record);
                 }
+                let orphaned =
+                    guard.stop_orphaned_approvals(&run_id, anima_core::primitives::now_millis());
+                drop(guard);
+                self.save_stopped_approvals(orphaned).await;
                 return Err(ApiError::not_found());
             }
+            // Controller ruling m2: settled `stopped` in this run's own save.
+            let orphaned_approvals =
+                guard.stop_orphaned_approvals(&run_id, anima_core::primitives::now_millis());
             // The next run's estimates follow this provider's count (spec
             // §5.2): the first model call's reported prompt tokens over this
             // run's uncalibrated estimate, which leaves out the system prompt
@@ -1733,6 +1769,7 @@ impl AgentRunCoordinator {
                 let rolled_back = apply_run_rollback(&mut guard, &mut rollback);
                 drop(guard);
                 save_offered_steers(&self.state, offered).await;
+                self.save_stopped_approvals(orphaned_approvals).await;
                 rolled_back?;
                 return Err(error);
             }
@@ -1749,6 +1786,7 @@ impl AgentRunCoordinator {
                 guard.memory_store_config(),
                 guard.history.clone(),
                 guard.control_plane_persist_request(),
+                orphaned_approvals,
             )
         };
         if let Err(error) = persist_request.save().await {
@@ -1761,6 +1799,7 @@ impl AgentRunCoordinator {
             let rolled_back = apply_run_rollback(&mut guard, &mut rollback);
             drop(guard);
             save_offered_steers(&self.state, offered).await;
+            self.save_stopped_approvals(orphaned_approvals).await;
             rolled_back?;
             return Err(ApiError::service_unavailable(error.to_string()));
         }
@@ -1768,6 +1807,7 @@ impl AgentRunCoordinator {
         // queued inside the transaction, so a deletion of its session, which
         // takes the same transaction, is always queued after it.
         history_outbox.enqueue_committed(&agent_id, &session_id, &change_set.delta.messages);
+        self.announce_stopped_approvals(&orphaned_approvals).await;
         drop(transaction);
         if let Some(finished) = &finished {
             for event in committed_message_events(finished, &change_set.delta.messages) {
@@ -2042,6 +2082,14 @@ impl Drop for InFlightRunGuard {
                         anima_core::primitives::now_millis(),
                     );
                 }
+                // Controller ruling m2: settled in memory; the next save carries it.
+                let now_ms = anima_core::primitives::now_millis();
+                for approval in guard.stop_orphaned_approvals(&run_id, now_ms) {
+                    guard.publish_approval(&approval);
+                }
+                let Some(record) = guard.runs.get(&run_id) else {
+                    return;
+                };
                 live.publish_record(record);
                 guard
                     .runs
@@ -2107,6 +2155,10 @@ async fn persist_task_result_memory(
     }
 }
 
+#[cfg(test)]
+mod approval_stop_tests;
+#[cfg(test)]
+mod approval_tests;
 #[cfg(test)]
 mod compaction_tests;
 #[cfg(test)]

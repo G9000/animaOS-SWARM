@@ -3,7 +3,8 @@
 
 use std::collections::HashSet;
 
-use super::DaemonState;
+use super::{ApprovalUndo, DaemonState, Settlement};
+use crate::approvals::ApprovalRequest;
 use crate::connectors::{
     InboundProcessingState, OutboundDeliveryState, TelegramInboundRecord, TelegramOutboundRecord,
 };
@@ -19,6 +20,8 @@ pub(crate) struct RunStopUndo {
     pub(crate) inbound: Vec<TelegramInboundRecord>,
     pub(crate) outbound: Vec<TelegramOutboundRecord>,
     pub(crate) jobs: Vec<AgentJobRecord>,
+    /// Approvals the stop settled, as they were (spec §4.6).
+    pub(crate) approvals: Vec<ApprovalUndo>,
 }
 
 impl RunStopUndo {
@@ -28,6 +31,7 @@ impl RunStopUndo {
             && self.inbound.is_empty()
             && self.outbound.is_empty()
             && self.jobs.is_empty()
+            && self.approvals.is_empty()
     }
 }
 
@@ -40,6 +44,10 @@ pub(crate) struct RunStopPlan {
     pub(crate) signal: Vec<String>,
     /// Queued runs cancelled outright, as they are now.
     pub(crate) cancelled: Vec<RunRecord>,
+    /// Approvals this stop settled as `stopped`, as they now are. A run
+    /// they moved back to `running` is not announced as started: its
+    /// terminal event follows (controller ruling m6).
+    pub(crate) approvals: Vec<ApprovalRequest>,
     pub(crate) undo: RunStopUndo,
 }
 
@@ -69,6 +77,7 @@ impl DaemonState {
                 run: record,
                 signal: Vec::new(),
                 cancelled: Vec::new(),
+                approvals: Vec::new(),
                 undo,
             });
         }
@@ -90,9 +99,11 @@ impl DaemonState {
             run: record,
             signal: targets.clone(),
             cancelled: Vec::new(),
+            approvals: Vec::new(),
             undo: RunStopUndo::default(),
         };
         let mut sources: Vec<(RunSource, String)> = Vec::new();
+        let mut stopping: Vec<String> = Vec::new();
         for id in &targets {
             let Some(target) = self.runs.get_mut(id) else {
                 continue;
@@ -118,6 +129,7 @@ impl DaemonState {
                     if let Some(source_ref) = target.source_ref.clone() {
                         sources.push((target.source, source_ref));
                     }
+                    stopping.push(id.clone());
                 }
                 _ => {}
             }
@@ -128,6 +140,18 @@ impl DaemonState {
                 RunSource::Telegram => self.stop_inbound(&source_ref, &mut plan.undo),
                 RunSource::Job => self.stop_job(&source_ref, now_ms, &mut plan.undo),
                 _ => {}
+            }
+        }
+        // Spec §4.6: a stopped run's pending approvals resolve as `stopped`
+        // in this same save, so a decision that comes later finds them
+        // settled and the waiting calls hear it from the stop.
+        for run_id in &stopping {
+            for approval_id in self.approvals.pending_ids_for_run(run_id) {
+                if let Ok(settled) = self.settle_approval(&approval_id, Settlement::Stopped, now_ms)
+                {
+                    plan.approvals.push(settled.approval);
+                    plan.undo.approvals.push(settled.undo);
+                }
             }
         }
         if let Some(current) = self.runs.get(run_id).cloned() {
@@ -193,6 +217,10 @@ impl DaemonState {
     /// anything its run recorded meanwhile; source records go back only if
     /// nothing else changed them since.
     pub(crate) fn revert_run_stop(&mut self, undo: RunStopUndo) {
+        // Newest first, so each run goes back to awaiting its approvals.
+        for approval in undo.approvals.into_iter().rev() {
+            self.revert_settled_approval(approval);
+        }
         for previous in undo.runs {
             match self.runs.get_mut(&previous.id) {
                 Some(current) if previous.status == RunStatus::Queued => *current = previous,

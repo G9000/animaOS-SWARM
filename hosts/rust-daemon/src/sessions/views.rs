@@ -131,6 +131,7 @@ pub(crate) struct SessionView {
     pub(crate) message_count: usize,
     pub(crate) preview: Option<String>,
     pub(crate) active_runs: usize,
+    pub(crate) pending_approvals: usize,
     pub(crate) unread: bool,
     pub(crate) capabilities: SessionCapabilities,
     pub(crate) matched: Option<SessionMatch>,
@@ -182,6 +183,7 @@ struct Candidate {
     preview: Option<String>,
     unread: bool,
     active_runs: usize,
+    pending_approvals: usize,
     capabilities: SessionCapabilities,
     matched: Option<SessionMatch>,
 }
@@ -246,6 +248,9 @@ fn candidate(
         active_runs: state
             .runs
             .active_count_for_session(&record.agent_id, &record.id),
+        pending_approvals: state
+            .approvals
+            .pending_count_for_session(&record.agent_id, &record.id),
         capabilities: record.capabilities(schedule_exists),
         matched,
     }
@@ -395,6 +400,7 @@ async fn complete(store: &dyn HistoryStore, candidates: Vec<Candidate>) -> Vec<S
             message_count,
             preview,
             active_runs: candidate.active_runs,
+            pending_approvals: candidate.pending_approvals,
             unread: candidate.unread,
             capabilities: candidate.capabilities,
             matched: candidate.matched,

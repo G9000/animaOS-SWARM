@@ -6,9 +6,9 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use anima_core::{
-    AgentConfig, AgentSettings, Content, DataValue, ModelAdapter, ModelGenerateRequest,
-    ModelGenerateResponse, ModelStopReason, ModelStreamFrame, ModelStreamSink, TokenUsage,
-    ToolCall,
+    AgentConfig, AgentSettings, CancelSignal, Content, DataValue, Message, MessageRole,
+    ModelAdapter, ModelGenerateRequest, ModelGenerateResponse, ModelStopReason, ModelStreamFrame,
+    ModelStreamSink, TokenUsage, ToolCall,
 };
 use async_trait::async_trait;
 use tokio::sync::{RwLock, Semaphore};
@@ -16,10 +16,15 @@ use tokio::sync::{RwLock, Semaphore};
 use super::{
     AcceptRun, AcceptedRun, AgentRunCoordinator, AgentRunRequest, RunRoom, SessionRunMode,
 };
+use crate::approvals::{
+    ApprovalDecisionKind, ApprovalGate, ApprovalPolicy, ApprovalRequest, ApprovalTimeouts,
+    PolicyAction, RiskClass,
+};
 use crate::live::{LiveDelivery, LiveEvent, LiveSubscription};
-use crate::runs::{RunSource, RunStatus};
+use crate::runs::{RunLink, RunRecord, RunSource, RunStart, RunStatus};
 use crate::sessions::{SessionKind, SessionOrigin, SessionRecord, TitleSource};
-use crate::state::DaemonState;
+use crate::state::{DaemonState, OwnerDecision};
+use crate::tools::ToolExecutionContext;
 
 /// One scripted model call.
 #[derive(Clone, Debug)]
@@ -417,4 +422,164 @@ pub(crate) async fn quiet_for(subscription: &mut LiveSubscription) -> Vec<serde_
         events.push(event.to_json(0));
     }
     events
+}
+
+/// A `memory_add` call (write class, spec §7.1) storing `text`.
+pub(crate) fn remember_call(id: &str, text: &str) -> ToolCall {
+    ToolCall {
+        id: id.into(),
+        name: "memory_add".into(),
+        args: BTreeMap::from([("content".to_string(), DataValue::String(text.into()))]),
+    }
+}
+
+/// A coordinator whose one agent may use `calculate` and `memory_add`,
+/// under `policy`, waiting at most `timeouts` for the owner.
+pub(crate) async fn approving_coordinator(
+    model: Arc<dyn ModelAdapter>,
+    policy: ApprovalPolicy,
+    timeouts: ApprovalTimeouts,
+) -> (AgentRunCoordinator, String) {
+    let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(model)));
+    let agent_id = {
+        let mut guard = state.write().await;
+        let mut config = companion_config("companion");
+        config.tools = Some(
+            crate::tools::ToolRegistry::new()
+                .resolve_descriptors(["calculate", "memory_add"])
+                .unwrap(),
+        );
+        let agent_id = guard.create_agent(config).unwrap().state.id;
+        guard.approvals.set_policy(&agent_id, policy);
+        agent_id
+    };
+    (
+        AgentRunCoordinator::new(state, Arc::new(Semaphore::new(8)))
+            .with_approval_timeouts(timeouts),
+        agent_id,
+    )
+}
+
+/// A tool context for `run` with its approval gate, as `run_locked` builds one.
+pub(crate) async fn gated_context(
+    coordinator: &AgentRunCoordinator,
+    run: &RunLink,
+    cancel: CancelSignal,
+) -> ToolExecutionContext {
+    coordinator
+        .state
+        .read()
+        .await
+        .tool_execution_context()
+        .with_team(coordinator.clone(), false)
+        .with_run_link(Some(run.clone()))
+        .with_cancel(Some(cancel.clone()))
+        .with_approvals(Some(ApprovalGate::new(
+            coordinator.clone(),
+            run.clone(),
+            RunSource::Web,
+            cancel,
+        )))
+}
+
+/// Waits (up to five seconds) until at least `count` approvals are pending;
+/// returns them oldest first.
+pub(crate) async fn pending_approvals(
+    coordinator: &AgentRunCoordinator,
+    count: usize,
+) -> Vec<ApprovalRequest> {
+    for _ in 0..500 {
+        let pending = coordinator
+            .state
+            .read()
+            .await
+            .approvals
+            .pending()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        if pending.len() >= count {
+            return pending;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("{count} approvals never became pending");
+}
+
+/// The owner's `kind` at `revision`, without a note or a matcher.
+pub(crate) fn decision(kind: ApprovalDecisionKind, revision: u64) -> OwnerDecision {
+    OwnerDecision {
+        kind,
+        note: None,
+        matcher: None,
+        revision,
+    }
+}
+
+/// The texts of `agent_id`'s committed tool results, oldest first.
+pub(crate) async fn tool_results(coordinator: &AgentRunCoordinator, agent_id: &str) -> Vec<String> {
+    coordinator.state.read().await.agents[agent_id]
+        .messages()
+        .iter()
+        .filter(|message| message.role == MessageRole::Tool)
+        .map(|message| message.content.text.clone())
+        .collect()
+}
+
+/// A running ledger run of `agent_id` in a new chat `session_id`, for tool
+/// calls made outside a coordinator run.
+pub(crate) async fn ledger_run(
+    coordinator: &AgentRunCoordinator,
+    agent_id: &str,
+    session_id: &str,
+) -> RunLink {
+    add_chat(coordinator, agent_id, session_id).await;
+    let record = RunRecord::running(
+        RunStart {
+            agent_id: agent_id.into(),
+            session_id: session_id.into(),
+            source: RunSource::Web,
+            source_ref: None,
+            idempotency_key: None,
+            text: "use a tool".into(),
+            model: "gpt-5.4".into(),
+            provider: None,
+            parent_run_id: None,
+        },
+        anima_core::primitives::now_millis(),
+    );
+    let link = RunLink {
+        run_id: record.id.clone(),
+        session_id: session_id.into(),
+        agent_id: agent_id.into(),
+    };
+    coordinator.state.write().await.runs.insert(record);
+    link
+}
+
+/// The user message a direct tool call is made for.
+pub(crate) fn tool_input(agent_id: &str, room_id: &str) -> Message {
+    Message {
+        id: "msg-tool-input".into(),
+        agent_id: agent_id.into(),
+        room_id: room_id.into(),
+        content: Content {
+            text: "use a tool".into(),
+            ..Content::default()
+        },
+        role: MessageRole::User,
+        created_at_ms: 1,
+    }
+}
+
+pub(crate) fn ask_before_writes() -> ApprovalPolicy {
+    ApprovalPolicy::default().with(RiskClass::Write, PolicyAction::Ask)
+}
+
+/// Timeouts that never fire during a test.
+pub(crate) fn patient() -> ApprovalTimeouts {
+    ApprovalTimeouts {
+        default: Duration::from_secs(30),
+        telegram: Duration::from_secs(15),
+    }
 }

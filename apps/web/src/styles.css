@@ -5,6 +5,7 @@
 @import './companion.css';
 @import './sessions.css';
 @import './live-runs.css';
+@import './approvals.css';
 
 @source '../../packages/ui/src/**/*.{ts,tsx}';
 

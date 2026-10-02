@@ -1,6 +1,7 @@
 import { vi } from 'vitest';
 import type {
   AgentEvent,
+  Approval,
   Run,
   RunLifecycleEventType,
   SnapshotRun,
@@ -46,8 +47,9 @@ export function snapshotEvent(
   runs: SnapshotRun[] = [],
   seq = 1,
   agentId = 'agent-main',
+  approvals: Approval[] = [],
 ): AgentEvent {
-  return { type: 'stream.snapshot', agentId, seq, at: 1, runs, approvals: [] };
+  return { type: 'stream.snapshot', agentId, seq, at: 1, runs, approvals };
 }
 
 export function resyncEvent(
@@ -170,6 +172,48 @@ export function toolFinishedEvent(
     resultPreview: result.resultPreview ?? '',
     truncated: result.truncated ?? false,
     recovered: false,
+  };
+}
+
+/** A pending `bash` approval of `run_1` in `chat:1`, unless overridden. */
+export function approvalFixture(
+  id: string,
+  overrides: Partial<Approval> = {},
+): Approval {
+  return {
+    id,
+    agentId: 'agent-main',
+    sessionId: 'chat:1',
+    runId: 'run_1',
+    toolCallId: 'call_1',
+    tool: 'bash',
+    class: 'exec',
+    arguments: '{"command":"git status"}',
+    argumentsTruncated: false,
+    suggestedMatcher: { kind: 'command_prefix', value: 'git status' },
+    matcherKinds: ['command_prefix', 'any'],
+    createdAtMs: 1,
+    expiresAtMs: 1_800_001,
+    status: 'pending',
+    revision: 1,
+    resolution: null,
+    ...overrides,
+  };
+}
+
+export function approvalEvent(
+  type: 'approval.requested' | 'approval.resolved',
+  approval: Approval,
+  seq: number,
+): AgentEvent {
+  return {
+    type,
+    agentId: approval.agentId,
+    sessionId: approval.sessionId,
+    runId: approval.runId,
+    seq,
+    at: 1,
+    approval,
   };
 }
 

@@ -118,7 +118,7 @@ pub(crate) struct SessionResponse {
     pub(crate) message_count: usize,
     pub(crate) preview: Option<String>,
     pub(crate) active_runs: usize,
-    /// Always 0 until approvals exist (M4).
+    /// Approvals waiting for the owner in this session (spec §3.2).
     pub(crate) pending_approvals: usize,
     pub(crate) unread: bool,
     pub(crate) capabilities: SessionCapabilitiesResponse,
@@ -168,7 +168,7 @@ impl From<&SessionView> for SessionResponse {
             message_count: view.message_count,
             preview: view.preview.clone(),
             active_runs: view.active_runs,
-            pending_approvals: 0,
+            pending_approvals: view.pending_approvals,
             unread: view.unread,
             capabilities: view.capabilities.into(),
             matched: view.matched.as_ref().map(|found| SessionMatchResponse {

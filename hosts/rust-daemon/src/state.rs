@@ -1,3 +1,4 @@
+mod approval_state;
 mod live_state;
 mod run_commit;
 pub(crate) mod run_stop;
@@ -6,6 +7,9 @@ mod session_state;
 mod swarm_relationships;
 mod swarm_runtime;
 mod swarm_tools;
+pub(crate) use self::approval_state::{
+    ApprovalAsk, ApprovalUndo, OwnerDecision, SettleRefusal, Settlement,
+};
 pub(crate) use self::run_commit::RunBuild;
 pub(crate) use self::run_commit::RunContextReport;
 pub(crate) use self::session_state::RunSessionRequest;
@@ -1170,7 +1174,7 @@ mod tests {
         }
 
         let snapshot = source.control_plane_snapshot();
-        assert_eq!(snapshot.version, 6);
+        assert_eq!(snapshot.version, 7);
         assert_eq!(
             snapshot.runs.len(),
             3,
@@ -1352,7 +1356,7 @@ mod tests {
             snapshot.version,
             crate::control_plane_store::CONTROL_PLANE_STORE_VERSION
         );
-        assert_eq!(snapshot.version, 6);
+        assert_eq!(snapshot.version, 7);
 
         let payload = serde_json::to_value(&snapshot).unwrap();
         assert_eq!(payload["inbound"][0]["processingState"], "stopped");
@@ -1374,7 +1378,7 @@ mod tests {
             .await
             .unwrap()
             .expect("the saved snapshot should load");
-        assert_eq!(loaded.version, 6);
+        assert_eq!(loaded.version, 7);
         assert_eq!(
             loaded.inbound[0].processing_state,
             InboundProcessingState::Stopped
@@ -1388,7 +1392,7 @@ mod tests {
 
         DaemonState::new()
             .restore_control_plane_snapshot(loaded)
-            .expect("a v6 snapshot holding stopped/suppressed values restores");
+            .expect("a v7 snapshot holding stopped/suppressed values restores");
         let _ = std::fs::remove_file(path);
     }
 
@@ -1498,6 +1502,8 @@ pub(crate) struct DaemonState {
     pub(crate) goals: HashMap<String, crate::jobs::GoalRecord>,
     pub(crate) runs: crate::runs::RunLedger,
     pub(crate) sessions: crate::sessions::SessionRegistry,
+    /// Pending and not-yet-mirrored approvals, policies, and rules (spec §7).
+    pub(crate) approvals: crate::approvals::ApprovalRegistry,
     pub(crate) history: crate::history::SharedHistory,
     /// Session creations per agent per minute (spec §14); not persisted.
     pub(crate) session_limiter: crate::sessions::SessionCreateLimiter,
@@ -1659,6 +1665,7 @@ impl DaemonState {
             goals: HashMap::new(),
             runs: crate::runs::RunLedger::default(),
             sessions: crate::sessions::SessionRegistry::default(),
+            approvals: crate::approvals::ApprovalRegistry::default(),
             history: crate::history::HistoryService::ephemeral(),
             session_limiter: crate::sessions::SessionCreateLimiter::default(),
             tool_grants_applied: std::collections::BTreeSet::new(),
@@ -1857,6 +1864,15 @@ impl DaemonState {
         snapshot.sessions = self.sessions.snapshot_records(&self.live_agent_ids());
         snapshot.tool_grants_applied = self.tool_grants_applied.iter().cloned().collect();
         snapshot.pending_history_deletions = self.pending_history_deletions.clone();
+        // A decided approval of a deleted session is never saved again:
+        // its history went with the session (Task 4).
+        let approvals = self.approvals.snapshot(&self.live_agent_ids(), |approval| {
+            self.sessions
+                .contains(&approval.agent_id, &approval.session_id)
+        });
+        snapshot.approvals = approvals.approvals;
+        snapshot.approval_policies = approvals.policies;
+        snapshot.approval_rules = approvals.rules;
         snapshot
     }
 
@@ -1985,6 +2001,21 @@ impl DaemonState {
             &self.live_agent_ids(),
             anima_core::primitives::now_millis(),
         );
+        // Spec §4.8: the runs that waited are interrupted above; the
+        // approvals they waited on expire next to them.
+        self.approvals = crate::approvals::ApprovalRegistry::restored(
+            crate::approvals::ApprovalSnapshot {
+                approvals: snapshot.approvals,
+                policies: snapshot.approval_policies,
+                rules: snapshot.approval_rules,
+            },
+            &self.live_agent_ids(),
+            anima_core::primitives::now_millis(),
+        );
+        // A deleted session's approvals never reach the history store.
+        let sessions = &self.sessions;
+        self.approvals
+            .retain_decided(|approval| sessions.contains(&approval.agent_id, &approval.session_id));
 
         if relabelled_messages > 0 || relabelled_runs > 0 || mapped_runs > 0 {
             info!(
@@ -2057,6 +2088,11 @@ impl DaemonState {
         }
         crate::runs::RunLedger::validate(&snapshot.runs)?;
         crate::sessions::SessionRegistry::validate(&snapshot.sessions)?;
+        crate::approvals::ApprovalRegistry::validate(
+            &snapshot.approvals,
+            &snapshot.approval_policies,
+            &snapshot.approval_rules,
+        )?;
         let mut swarm_ids = HashSet::new();
         for swarm in &snapshot.swarms {
             let swarm_id = &swarm.state.id;

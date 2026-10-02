@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   createDaemonClient,
+  isApprovalEvent,
   isRunLifecycleEvent,
   type AgentEvent,
 } from './index.js';
@@ -73,6 +74,63 @@ describe('agent events client', () => {
       expect.objectContaining({ event: 'step.delta', id: '1' }),
       expect.objectContaining({ event: 'run.completed', id: '2' }),
     ]);
+  });
+
+  it('types approval events and the approvals a snapshot carries', async () => {
+    const approval = {
+      id: 'apr_1',
+      agentId: 'agent/a',
+      sessionId: 'chat:1',
+      runId: 'run_1',
+      toolCallId: 'call-1',
+      tool: 'bash',
+      class: 'exec',
+      arguments: '{"command":"ls"}',
+      argumentsTruncated: false,
+      suggestedMatcher: { kind: 'command_prefix', value: 'ls' },
+      matcherKinds: ['command_prefix', 'any'],
+      createdAtMs: 5,
+      expiresAtMs: 1_800_005,
+      status: 'pending',
+      revision: 1,
+      resolution: null,
+    };
+    const resolved = {
+      ...approval,
+      status: 'allowed',
+      revision: 2,
+      resolution: {
+        decision: 'allow_once',
+        note: null,
+        matcher: null,
+        ruleId: null,
+        resolvedBy: 'owner',
+        resolvedAtMs: 9,
+      },
+    };
+    const client = createDaemonClient({
+      baseUrl: '',
+      fetch: async () =>
+        sseResponse([
+          `id: 1\nevent: stream.snapshot\ndata: ${JSON.stringify({ type: 'stream.snapshot', agentId: 'agent/a', seq: 1, at: 5, runs: [], approvals: [approval] })}\n\n`,
+          `id: 2\nevent: approval.resolved\ndata: ${JSON.stringify({ type: 'approval.resolved', agentId: 'agent/a', sessionId: 'chat:1', runId: 'run_1', seq: 2, at: 9, approval: resolved })}\n\n`,
+        ]),
+    });
+
+    const received: AgentEvent[] = [];
+    for await (const event of client.events.stream('agent/a'))
+      received.push(event);
+
+    const [snapshot, decided] = received;
+    expect(
+      snapshot.type === 'stream.snapshot' && snapshot.approvals[0].id,
+    ).toBe('apr_1');
+    expect(isApprovalEvent(decided)).toBe(true);
+    expect(isApprovalEvent(snapshot)).toBe(false);
+    expect(
+      decided.type === 'approval.resolved' &&
+        decided.approval.resolution?.resolvedBy,
+    ).toBe('owner');
   });
 });
 

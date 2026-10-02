@@ -1,5 +1,6 @@
 mod agencies;
 mod agents;
+mod approvals;
 mod connectors;
 mod gcalendar;
 mod memories;
@@ -21,6 +22,7 @@ pub(crate) use agents::{
     AgentSummariesEnvelope, AgentSummaryResponse, AgentUpdateRequest, AgentsEnvelope,
     GenerateProfileRequest,
 };
+pub(crate) use approvals::*;
 pub(crate) use connectors::*;
 pub(crate) use gcalendar::*;
 pub(crate) use memories::{

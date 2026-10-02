@@ -20,7 +20,7 @@ const TOO_MANY_STREAMS: &str = "Too many event streams are open for this agent";
 #[utoipa::path(get, path = "/api/agents/{agent_id}/events", tag = "runs",
     params(("agent_id" = String, Path)),
     responses(
-        (status = 200, description = "Server-Sent Events: `stream.snapshot` first, then the session, run, step, message, and tool events of the agent and its helpers; `stream.resync` when this stream fell behind", content_type = "text/event-stream"),
+        (status = 200, description = "Server-Sent Events: `stream.snapshot` first, then the session, run, step, message, tool, and approval events of the agent and its helpers; `stream.resync` when this stream fell behind", content_type = "text/event-stream"),
         (status = 403, description = "Local owner required", body = super::contracts::ErrorBody),
         (status = 404, description = "Agent not found", body = super::contracts::ErrorBody),
         (status = 429, description = "Sixteen streams are already open for this agent", body = super::contracts::ErrorBody)
@@ -33,7 +33,7 @@ pub(super) async fn agent_events(
     if let Err(response) = authorize(&state, &request, true) {
         return response;
     }
-    let (subscription, runs) = {
+    let (subscription, runs, approvals) = {
         let guard = state.daemon.read().await;
         if !guard.agents.contains_key(&agent_id) {
             return rejected(ApiError::not_found());
@@ -43,9 +43,11 @@ pub(super) async fn agent_events(
         let Ok(subscription) = guard.live.subscribe(&agent_id) else {
             return rejected(ApiError::too_many_requests(TOO_MANY_STREAMS));
         };
-        (subscription, guard.live_snapshot_runs(&agent_id))
+        let runs = guard.live_snapshot_runs(&agent_id);
+        let approvals = guard.live_snapshot_approvals(&runs);
+        (subscription, runs, approvals)
     };
-    let snapshot = live::snapshot_json(&agent_id, 1, &runs);
+    let snapshot = live::snapshot_json(&agent_id, 1, &runs, &approvals);
     let mut response = Sse::new(event_stream(agent_id, snapshot, subscription))
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(live::EVENT_KEEP_ALIVE_SECS)))
         .into_response();

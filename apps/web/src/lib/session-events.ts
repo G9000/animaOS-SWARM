@@ -2,6 +2,7 @@ import {
   isRunLifecycleEvent,
   isTerminalRunStatus,
   type AgentEvent,
+  type Approval,
   type LiveToolCard,
   type Run,
 } from '@animaOS-SWARM/sdk';
@@ -26,17 +27,26 @@ export interface LiveRun {
   phase: string | null;
   /** Owner messages steered into the run, in order. */
   steers: { messageId: string; text: string }[];
+  /** The run's calls waiting for the owner, oldest first (spec §7.3). */
+  approvals: Approval[];
 }
 
 export interface LiveState {
   /** The `seq` of the newest event applied from the current stream. */
   seq: number;
   runs: Readonly<Record<string, LiveRun>>;
+  /** Every pending approval this stream knows, by id (spec §7.3). */
+  approvals: Readonly<Record<string, Approval>>;
   /** Bumped by every snapshot and resync, so views refetch what they show. */
   epoch: number;
 }
 
-export const EMPTY_LIVE_STATE: LiveState = { seq: 0, runs: {}, epoch: 0 };
+export const EMPTY_LIVE_STATE: LiveState = {
+  seq: 0,
+  runs: {},
+  approvals: {},
+  epoch: 0,
+};
 
 /** A step's streamed text kept in the page; its full text arrives with the
  *  committed message. */
@@ -48,7 +58,72 @@ export const MAX_FINISHED_LIVE_RUNS = 50;
 export const MAX_LIVE_TOOL_CARDS = 50;
 
 export function emptyLiveRun(run: Run): LiveRun {
-  return { run, steps: [], tools: [], phase: null, steers: [] };
+  return { run, steps: [], tools: [], phase: null, steers: [], approvals: [] };
+}
+
+function byRequest(left: Approval, right: Approval): number {
+  return (
+    left.createdAtMs - right.createdAtMs || left.id.localeCompare(right.id)
+  );
+}
+
+/** Pending approvals, oldest first. */
+export function pendingApprovals(
+  approvals: LiveState['approvals'],
+): Approval[] {
+  return Object.values(approvals).sort(byRequest);
+}
+
+function runApprovals(
+  approvals: LiveState['approvals'],
+  runId: string,
+): Approval[] {
+  return pendingApprovals(approvals).filter(
+    (approval) => approval.runId === runId,
+  );
+}
+
+/** Adds a pending approval once, on its run if the stream has the run. A
+ *  run that already finished waits on nothing, so a late request is ignored. */
+function withApproval(state: LiveState, approval: Approval): LiveState {
+  if (approval.status !== 'pending' || state.approvals[approval.id])
+    return state;
+  const live = state.runs[approval.runId];
+  if (live && isTerminalRunStatus(live.run.status)) return state;
+  const approvals = { ...state.approvals, [approval.id]: approval };
+  return {
+    ...state,
+    approvals,
+    runs: live
+      ? {
+          ...state.runs,
+          [approval.runId]: {
+            ...live,
+            approvals: runApprovals(approvals, approval.runId),
+          },
+        }
+      : state.runs,
+  };
+}
+
+/** Removes approvals the stream holds, from their runs too; an id it never
+ *  held (a request settled before it was announced) is ignored. */
+function withoutApprovals(state: LiveState, ids: readonly string[]): LiveState {
+  const gone = ids.filter((id) => state.approvals[id]);
+  if (gone.length === 0) return state;
+  const approvals = { ...state.approvals };
+  const runs = { ...state.runs };
+  for (const id of gone) {
+    const { runId } = approvals[id];
+    delete approvals[id];
+    const live = runs[runId];
+    if (live)
+      runs[runId] = {
+        ...live,
+        approvals: live.approvals.filter((approval) => approval.id !== id),
+      };
+  }
+  return { ...state, approvals, runs };
 }
 
 /** Running or waiting for an approval: the session's reply is in progress. */
@@ -132,11 +207,23 @@ function withRun(state: LiveState, run: Run): LiveState {
         run,
         phase: isTerminalRunStatus(run.status) ? null : current.phase,
       }
-    : emptyLiveRun(run);
-  return {
+    : // An approval that arrived before its run joins it now.
+      {
+        ...emptyLiveRun(run),
+        approvals: runApprovals(state.approvals, run.id),
+      };
+  const updated: LiveState = {
     ...state,
     runs: withoutOldFinished({ ...state.runs, [run.id]: next }),
   };
+  if (!isTerminalRunStatus(run.status)) return updated;
+  // A finished run waits on nothing: drop what the stream still holds.
+  return withoutApprovals(
+    updated,
+    Object.values(updated.approvals)
+      .filter((approval) => approval.runId === run.id)
+      .map((approval) => approval.id),
+  );
 }
 
 function updateRun(
@@ -187,6 +274,9 @@ function upsertTool(
 
 export function applyEvent(state: LiveState, event: AgentEvent): LiveState {
   if (event.type === 'stream.snapshot') {
+    const approvals: Record<string, Approval> = {};
+    for (const approval of event.approvals)
+      if (approval.status === 'pending') approvals[approval.id] = approval;
     const runs: Record<string, LiveRun> = {};
     for (const item of event.runs) {
       runs[item.run.id] = {
@@ -201,9 +291,10 @@ export function applyEvent(state: LiveState, event: AgentEvent): LiveState {
             ]
           : [],
         tools: item.tools,
+        approvals: runApprovals(approvals, item.run.id),
       };
     }
-    return { seq: event.seq, runs, epoch: state.epoch + 1 };
+    return { seq: event.seq, runs, approvals, epoch: state.epoch + 1 };
   }
   // A seq at or below the last one applied is a repeat from this stream.
   if (event.seq <= state.seq) return state;
@@ -211,6 +302,10 @@ export function applyEvent(state: LiveState, event: AgentEvent): LiveState {
   if (event.type === 'stream.resync')
     return { ...next, epoch: state.epoch + 1 };
   if (isRunLifecycleEvent(event)) return withRun(next, event.run);
+  if (event.type === 'approval.requested')
+    return withApproval(next, event.approval);
+  if (event.type === 'approval.resolved')
+    return withoutApprovals(next, [event.approval.id]);
   const runId = event.runId;
   if (!runId) return next;
   switch (event.type) {

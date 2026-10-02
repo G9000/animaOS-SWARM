@@ -412,6 +412,7 @@ fn a_snapshot_lists_runs_with_their_live_state() {
             live: hub.runs().view(&run.id),
             record: run.clone(),
         }],
+        &[],
     );
 
     assert_eq!(value["type"], "stream.snapshot");
@@ -776,4 +777,45 @@ fn two_steps_reusing_one_tool_call_id_keep_a_card_each() {
     );
     assert_eq!(cards[1].status, "error");
     assert_eq!(cards[1].result_preview.as_deref(), Some("failed"));
+}
+
+#[test]
+fn approval_events_carry_the_approval_json() {
+    use crate::approvals::{ApprovalRequest, PendingApprovalStart};
+    use anima_core::ToolCall;
+    use std::collections::BTreeMap;
+
+    let call = ToolCall {
+        id: "call-1".into(),
+        name: "memory_add".into(),
+        args: BTreeMap::new(),
+    };
+    let approval = ApprovalRequest::pending(
+        PendingApprovalStart {
+            agent_id: "agent-1",
+            session_id: "chat:a",
+            run_id: "run_1",
+            call: &call,
+            timeout_ms: 1_000,
+        },
+        10,
+    );
+    let requested = LiveEvent::new(
+        "agent-1",
+        LiveEventBody::ApprovalRequested(approval.clone()),
+    )
+    .session("chat:a")
+    .run("run_1")
+    .to_json(3);
+    assert_eq!(requested["type"], "approval.requested");
+    assert_eq!(requested["sessionId"], "chat:a");
+    assert_eq!(requested["approval"]["id"], approval.id.as_str());
+    assert_eq!(requested["approval"]["status"], "pending");
+    assert_eq!(requested["approval"]["tool"], "memory_add");
+    assert_eq!(requested["approval"]["matcherKinds"], json!(["any"]));
+    assert_eq!(requested["approval"]["resolution"], json!(null));
+
+    let resolved = LiveEvent::new("agent-1", LiveEventBody::ApprovalResolved(approval)).to_json(4);
+    assert_eq!(resolved["type"], "approval.resolved");
+    assert_eq!(resolved["approval"]["revision"], 1);
 }

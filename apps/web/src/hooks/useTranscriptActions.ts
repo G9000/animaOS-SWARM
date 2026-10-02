@@ -1,6 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { Run, Session } from '@animaOS-SWARM/sdk';
 
+import {
+  decideApproval as sendApprovalDecision,
+  type ApprovalDecide,
+} from '../lib/approvals';
 import type { LiveState } from '../lib/session-events';
 import type {
   HelperTarget,
@@ -47,6 +51,10 @@ export interface TranscriptActionOptions {
   /** A manual Compact is in flight (S3b-C). */
   compacting: boolean;
   openSession: (target: HelperTarget) => void;
+  /** Sends an approval decision; the daemon call by default. */
+  decideApproval?: ApprovalDecide;
+  /** The companion shown: only its approvals can become rules. */
+  companionId?: string | null;
 }
 
 /**
@@ -71,8 +79,17 @@ export function useTranscriptActions({
   compact,
   compacting,
   openSession,
+  decideApproval,
+  companionId,
 }: TranscriptActionOptions): TranscriptActions {
-  const latest = { stopRun, cancelPending, sendAgain, compact, openSession };
+  const latest = {
+    stopRun,
+    cancelPending,
+    sendAgain,
+    compact,
+    openSession,
+    decideApproval,
+  };
   const latestRef = useRef(latest);
   useEffect(() => {
     latestRef.current = latest;
@@ -113,7 +130,21 @@ export function useTranscriptActions({
       helperSession: (step) =>
         helperSessionTarget(step, liveRunsRef.current, sessions),
       onOpenSession: (target) => latestRef.current.openSession(target),
+      onDecideApproval: (approval, input) =>
+        (latestRef.current.decideApproval ?? sendApprovalDecision)(
+          approval,
+          input,
+        ),
+      ...(companionId ? { companionAgentId: companionId } : {}),
     }),
-    [cancellable, canResend, compactable, sessions, resent, compacting],
+    [
+      cancellable,
+      canResend,
+      compactable,
+      sessions,
+      resent,
+      compacting,
+      companionId,
+    ],
   );
 }

@@ -1,3 +1,4 @@
+import type { Approval } from './approvals.js';
 import type { DaemonClient } from './client.js';
 import type { Run } from './runs.js';
 
@@ -47,7 +48,8 @@ export type AgentEvent =
   | (EventBase & {
       type: 'stream.snapshot';
       runs: SnapshotRun[];
-      approvals: unknown[];
+      /** The pending approvals of the snapshot's runs (spec §6). */
+      approvals: Approval[];
     })
   | (EventBase & { type: 'stream.resync'; missed: number })
   | (EventBase & {
@@ -87,6 +89,10 @@ export type AgentEvent =
       resultPreview: string;
       truncated: boolean;
       recovered: boolean;
+    })
+  | (EventBase & {
+      type: 'approval.requested' | 'approval.resolved';
+      approval: Approval;
     });
 
 const LIFECYCLE: ReadonlySet<string> = new Set<RunLifecycleEventType>([
@@ -103,6 +109,17 @@ export function isRunLifecycleEvent(
   event: AgentEvent,
 ): event is Extract<AgentEvent, { type: RunLifecycleEventType }> {
   return LIFECYCLE.has(event.type);
+}
+
+export function isApprovalEvent(
+  event: AgentEvent,
+): event is Extract<
+  AgentEvent,
+  { type: 'approval.requested' | 'approval.resolved' }
+> {
+  return (
+    event.type === 'approval.requested' || event.type === 'approval.resolved'
+  );
 }
 
 export class AgentEventsClient {

@@ -2,7 +2,20 @@
 
 This document is for the next agent picking up the companion console upgrade. Read it first; it tells you where everything is and what to do next.
 
-## Where things stand (2026-09-28)
+## Update 2026-10-02: M4 done, PR open
+
+- **M4 (Approvals) is complete** on `feat/companion-console`, and [PR #9](https://github.com/G9000/animaOS-SWARM/pull/9) to `main` is ready for review.
+  - All 13 tasks are done, then a whole-milestone final review (split into daemon and web+SDK reviewers) and one fix wave (`9de5ea3` web, `20c6221` daemon).
+  - Gates at `20c6221`: `bun x nx run rust-daemon:test --skipNxCache` passed 1,654 with 7 ignored; SDK and web test, typecheck and build are green (web 751 tests, SDK 63); `cargo fmt --check` and `nx format:check` are clean.
+  - Merge only when the owner says "merge".
+- **Next:** M5 (skills) per the master plan. Write its plan with an opus subagent from the spec, the master plan and the carry-forwards, run a pre-flight audit, then execute it the same way.
+- **Post-M4 follow-ups:**
+  - Tell Telegram and CLI users that an approval is waiting in the web console.
+  - When a request's save fails, its card can linger until the tab reconnects; this is accepted, as in M3.
+- **Ledger:** `.superpowers/sdd/2026-09-23-companion-console-m4/progress.md` holds every ruling.
+- **Commits are GPG-signed.** When gpg-agent's cache expires, a commit blocks on a pinentry dialog until the owner answers it.
+
+## Where things stood (2026-09-28)
 
 - **Done and merged to `main`:**
   - M0 (security groundwork), M1 (run coordinator), M2 (sessions), and M3 (live runs).

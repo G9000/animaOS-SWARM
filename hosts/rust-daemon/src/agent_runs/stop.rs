@@ -66,6 +66,27 @@ impl AgentRunCoordinator {
         agent_id: &str,
         run_id: &str,
     ) -> Result<RunRecord, ApiError> {
+        // The stop runs to its end (saved, announced, woken, and signalled, or
+        // taken back) even if whoever asked stops waiting: otherwise the
+        // approvals it settled could stay settled in memory, unsaved, with
+        // their waiting calls never woken.
+        let coordinator = self.clone();
+        let (agent_id, run_id) = (agent_id.to_string(), run_id.to_string());
+        let operation =
+            tokio::spawn(async move { coordinator.stop_run_to_the_end(&agent_id, &run_id).await });
+        match operation.await {
+            Ok(stopped) => stopped,
+            Err(error) => Err(ApiError::service_unavailable(format!(
+                "run stop failed: {error}"
+            ))),
+        }
+    }
+
+    async fn stop_run_to_the_end(
+        &self,
+        agent_id: &str,
+        run_id: &str,
+    ) -> Result<RunRecord, ApiError> {
         let transaction = self.control_plane_transaction().await;
         let planned = {
             let mut guard = self.state.write().await;
@@ -102,6 +123,14 @@ impl AgentRunCoordinator {
         }
         {
             let guard = self.state.read().await;
+            // Settled with the stop (spec §4.6): the streams hear it, then
+            // each waiting call, before any run is signalled.
+            for approval in &plan.approvals {
+                guard.publish_approval(approval);
+            }
+            for approval in &plan.approvals {
+                self.approval_waiters.wake(approval);
+            }
             for id in &plan.signal {
                 if let Some(control) = guard.live.runs().control(id) {
                     control.cancel.cancel();

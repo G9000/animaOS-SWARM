@@ -6,8 +6,9 @@ use serde_json::{json, Value};
 
 use super::registry::LiveRunView;
 use super::MAX_PREVIEW_BYTES;
+use crate::approvals::ApprovalRequest;
 use crate::history::role_name;
-use crate::routes::RunResponse;
+use crate::routes::{ApprovalResponse, RunResponse};
 use crate::runs::{RunRecord, RunStatus};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -58,6 +59,8 @@ pub(crate) enum LiveEventBody {
         truncated: bool,
         recovered: bool,
     },
+    ApprovalRequested(ApprovalRequest),
+    ApprovalResolved(ApprovalRequest),
 }
 
 impl LiveEventBody {
@@ -79,6 +82,8 @@ impl LiveEventBody {
             Self::MessageCreated { .. } => "message.created",
             Self::ToolStarted { .. } => "tool.started",
             Self::ToolFinished { .. } => "tool.finished",
+            Self::ApprovalRequested(_) => "approval.requested",
+            Self::ApprovalResolved(_) => "approval.resolved",
         }
     }
 }
@@ -203,6 +208,10 @@ impl LiveEvent {
                 value["truncated"] = json!(truncated);
                 value["recovered"] = json!(recovered);
             }
+            LiveEventBody::ApprovalRequested(approval)
+            | LiveEventBody::ApprovalResolved(approval) => {
+                value["approval"] = approval_json(approval);
+            }
         }
         value
     }
@@ -210,6 +219,11 @@ impl LiveEvent {
 
 fn run_json(record: &RunRecord) -> Value {
     serde_json::to_value(RunResponse::from(record)).unwrap_or(Value::Null)
+}
+
+/// An approval as streams and routes show it (spec §6, §7.3).
+pub(crate) fn approval_json(approval: &ApprovalRequest) -> Value {
+    serde_json::to_value(ApprovalResponse::from(approval)).unwrap_or(Value::Null)
 }
 
 /// The lifecycle event for `record`'s current status.
@@ -234,9 +248,13 @@ pub(crate) struct SnapshotRun {
 }
 
 /// The first event of every stream (spec §6): the active runs with their
-/// current step, text so far, and tool cards, and the pending approvals
-/// (none before M4).
-pub(crate) fn snapshot_json(agent_id: &str, seq: u64, runs: &[SnapshotRun]) -> Value {
+/// current step, text so far, and tool cards, and their pending approvals.
+pub(crate) fn snapshot_json(
+    agent_id: &str,
+    seq: u64,
+    runs: &[SnapshotRun],
+    approvals: &[ApprovalRequest],
+) -> Value {
     let runs = runs
         .iter()
         .map(|run| {
@@ -256,7 +274,7 @@ pub(crate) fn snapshot_json(agent_id: &str, seq: u64, runs: &[SnapshotRun]) -> V
         "seq": seq,
         "at": now_millis(),
         "runs": runs,
-        "approvals": [],
+        "approvals": approvals.iter().map(approval_json).collect::<Vec<_>>(),
     })
 }
 

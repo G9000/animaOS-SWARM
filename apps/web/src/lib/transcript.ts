@@ -1,5 +1,6 @@
 import { isTerminalRunStatus, type Run } from '@animaOS-SWARM/sdk';
 
+import type { ApprovalDecide } from './approvals';
 import { emptyLiveRun, stepRunId, type LiveRun } from './session-events';
 import type { ChatMessage } from './types';
 
@@ -76,6 +77,11 @@ export interface TranscriptActions {
   compacting?: boolean;
   helperSession?: (step: ToolStep) => HelperTarget | null;
   onOpenSession?: (target: HelperTarget) => void;
+  /** Sends the owner's decision from an inline approval card (spec §7.3). */
+  onDecideApproval?: ApprovalDecide;
+  /** The companion whose transcript this is: only its approvals offer
+   *  "Always allow", as rules for other agents are not managed here yet. */
+  companionAgentId?: string;
 }
 
 export interface TranscriptInput {
@@ -254,11 +260,13 @@ export function liveToolSteps(live: LiveRun): ToolStep[] {
   }));
 }
 
-/** Where a non-terminal status sits in the run lifecycle (spec §4.1). */
+/** Where a non-terminal status sits in the run lifecycle (spec §4.1).
+ *  Running and awaiting approval are both in flight and rank the same: the
+ *  stream's view of either wins (M4 Review Focus 5). */
 const NON_TERMINAL_ORDER: Record<string, number> = {
   queued: 0,
   running: 1,
-  awaiting_approval: 2,
+  awaiting_approval: 1,
 };
 
 /** Whether `next` is further along the (non-terminal) lifecycle than
