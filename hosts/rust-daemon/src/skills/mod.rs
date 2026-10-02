@@ -95,6 +95,7 @@ pub(crate) const SKILL_FILE_FRONT_MATTER_INVALID: &str =
     "SKILL.md front matter must be YAML with a name and a description";
 pub(crate) const SKILL_FILE_TOO_LARGE: &str = "SKILL.md is larger than 36 KiB";
 pub(crate) const SKILL_FILE_OUTSIDE: &str = "SKILL.md resolves outside the workspace";
+pub(crate) const SKILL_FILE_NOT_REGULAR: &str = "SKILL.md could not be read: not a regular file";
 pub(crate) const SKILLS_FOLDER_OUTSIDE: &str = "The skills folder resolves outside the workspace";
 pub(crate) const SKILL_FOLDER_NOT_LOWERCASE: &str = "Rename the folder to lowercase";
 
@@ -467,6 +468,10 @@ mod tests {
         assert_eq!(SKILL_SCAN_INTERVAL_MS, 60_000);
         assert_eq!(MAX_EXAMINED_SKILL_FOLDERS, 1_000);
         assert_eq!(SKILL_FOLDER_NOT_LOWERCASE, "Rename the folder to lowercase");
+        assert_eq!(
+            SKILL_FILE_NOT_REGULAR,
+            "SKILL.md could not be read: not a regular file"
+        );
         assert_eq!(
             SKILL_SLUG_INVALID,
             "slug must be 1–64 lowercase letters, digits, or hyphens, starting with a letter or digit, and not a reserved name (import, con, nul, …)"

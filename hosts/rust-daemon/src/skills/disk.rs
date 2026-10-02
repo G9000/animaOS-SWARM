@@ -10,12 +10,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use super::registry::ScannedFile;
 use super::{
     is_valid_slug, MAX_EXAMINED_SKILL_FOLDERS, MAX_SCANNED_SKILL_FOLDERS, MAX_SKILL_FILE_BYTES,
-    SKILLS_FOLDER, SKILLS_FOLDER_OUTSIDE, SKILLS_TRASH_FOLDER, SKILL_FILE_NAME, SKILL_FILE_OUTSIDE,
-    SKILL_FILE_TOO_LARGE, SKILL_FOLDER_NOT_LOWERCASE, SKILL_SLUG_INVALID,
+    SKILLS_FOLDER, SKILLS_FOLDER_OUTSIDE, SKILLS_TRASH_FOLDER, SKILL_FILE_NAME,
+    SKILL_FILE_NOT_REGULAR, SKILL_FILE_OUTSIDE, SKILL_FILE_TOO_LARGE, SKILL_FOLDER_NOT_LOWERCASE,
+    SKILL_SLUG_INVALID,
 };
 use crate::tools::{canonical_workspace_root, write_workspace_bytes};
 
@@ -68,8 +70,23 @@ fn read_in(root: &Path, slug: &str) -> Result<Option<Vec<u8>>, String> {
     if !canonical.starts_with(root) {
         return Err(SKILL_FILE_OUTSIDE.to_string());
     }
+    // Opening a FIFO or a device can block forever: only a regular file is
+    // opened, and it is checked again once open.
+    let regular = fs::metadata(&canonical)
+        .map_err(|error| format!("SKILL.md could not be read: {error}"))?
+        .is_file();
+    if !regular {
+        return Err(SKILL_FILE_NOT_REGULAR.to_string());
+    }
     let file = fs::File::open(&canonical)
         .map_err(|error| format!("SKILL.md could not be read: {error}"))?;
+    let still_regular = file
+        .metadata()
+        .map_err(|error| format!("SKILL.md could not be read: {error}"))?
+        .is_file();
+    if !still_regular {
+        return Err(SKILL_FILE_NOT_REGULAR.to_string());
+    }
     let mut bytes = Vec::new();
     file.take(MAX_SKILL_FILE_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
@@ -118,8 +135,25 @@ fn scan_in(root: &Path, slug: &str, previous: Option<&ScannedFile>) -> Option<Sc
     match read_in(root, slug) {
         Ok(Some(bytes)) => Some(ScannedFile::read(&bytes, modified)),
         Ok(None) => None,
-        Err(problem) => Some(ScannedFile::unreadable(problem, modified, len)),
+        Err(problem) => Some(ScannedFile::unreadable(
+            problem.clone(),
+            cache_time(&problem, modified),
+            len,
+        )),
     }
+}
+
+/// The modification time to cache a read problem under: only problems that
+/// a retry would repeat keep it; a transient I/O error (a sharing violation,
+/// a placeholder that failed to fetch) caches none, so the next scan reads
+/// the file again.
+fn cache_time(problem: &str, modified: Option<SystemTime>) -> Option<SystemTime> {
+    let stable = [
+        SKILL_FILE_TOO_LARGE,
+        SKILL_FILE_OUTSIDE,
+        SKILL_FILE_NOT_REGULAR,
+    ];
+    stable.contains(&problem).then_some(modified).flatten()
 }
 
 /// `name` when it is not a slug only because of its case.
@@ -176,29 +210,38 @@ pub(crate) fn scan_skills_folder(
         if registered.contains(&name) {
             continue;
         }
-        if is_valid_slug(&name) {
-            slugs.push(name);
-        } else if lowercase_slug(&name).is_some() {
-            case_only.push(name);
+        // The directory listing says what an entry is without another stat;
+        // a link is only resolved when it is examined.
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if !kind.is_dir() && !kind.is_symlink() {
+            continue;
+        }
+        let candidate = (name, kind.is_symlink());
+        if is_valid_slug(&candidate.0) {
+            slugs.push(candidate);
+        } else if lowercase_slug(&candidate.0).is_some() {
+            case_only.push(candidate);
         }
     }
     slugs.sort();
     case_only.sort();
 
     let mut examined = 0;
-    for slug in slugs {
+    for (slug, is_link) in slugs {
         if scanned.len() >= MAX_SCANNED_SKILL_FOLDERS || examined >= MAX_EXAMINED_SKILL_FOLDERS {
             break;
         }
-        if !folder.join(&slug).is_dir() {
+        examined += 1;
+        if is_link && !folder.join(&slug).is_dir() {
             continue;
         }
-        examined += 1;
         if let Some(file) = scan_in(&root, &slug, previous.get(&slug)) {
             scanned.insert(slug, file);
         }
     }
-    for name in case_only {
+    for (name, is_link) in case_only {
         if scanned.len() >= MAX_SCANNED_SKILL_FOLDERS || examined >= MAX_EXAMINED_SKILL_FOLDERS {
             break;
         }
@@ -206,10 +249,10 @@ pub(crate) fn scan_skills_folder(
             continue;
         };
         let path = folder.join(&name);
-        if !path.is_dir() {
+        examined += 1;
+        if is_link && !path.is_dir() {
             continue;
         }
-        examined += 1;
         if scanned.contains_key(&slug) || fs::symlink_metadata(path.join(SKILL_FILE_NAME)).is_err()
         {
             continue;
@@ -325,7 +368,16 @@ pub(crate) fn untrash_skill_folder(
     let trash = root.join(SKILLS_TRASH_FOLDER);
     existing_inside(&root, &root.join(TRASH_ROOT))?;
     existing_inside(&root, &trash)?;
-    let folder = root.join(SKILLS_FOLDER).join(slug);
+    let skills = root.join(SKILLS_FOLDER);
+    // The skills folder may be a link; a folder is never put back through it.
+    if let Ok(canonical) = skills.canonicalize() {
+        if !canonical.starts_with(&root) {
+            return Err(SKILLS_FOLDER_OUTSIDE.to_string());
+        }
+    } else if fs::symlink_metadata(&skills).is_ok() {
+        return Err(SKILLS_FOLDER_OUTSIDE.to_string());
+    }
+    let folder = skills.join(slug);
     if fs::symlink_metadata(&folder).is_ok() {
         return Err("a new folder took its place".to_string());
     }
@@ -342,7 +394,7 @@ mod tests {
     use super::*;
     use crate::skills::{
         compose_skill_file, skill_hash, MAX_SCANNED_SKILL_FOLDERS, MAX_SKILL_FILE_BYTES,
-        SKILL_FILE_NO_FRONT_MATTER, SKILL_FILE_TOO_LARGE,
+        SKILL_FILE_NOT_REGULAR, SKILL_FILE_NO_FRONT_MATTER, SKILL_FILE_TOO_LARGE,
     };
 
     fn workspace(label: &str) -> PathBuf {
@@ -688,6 +740,160 @@ mod tests {
         let _ = std::fs::remove_dir(&linked);
         let _ = std::fs::remove_dir(&skills_link);
         for path in [root, outside, other] {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+
+    #[test]
+    fn a_skill_file_that_is_not_a_regular_file_is_refused_without_opening_it() {
+        let root = workspace("not-regular");
+        std::fs::create_dir_all(root.join("skills/dir-skill/SKILL.md")).unwrap();
+        assert_eq!(
+            read_skill_bytes(&root, "dir-skill"),
+            Err(SKILL_FILE_NOT_REGULAR.to_string())
+        );
+        let scanned = scan_skill(&root, "dir-skill", None).unwrap().unwrap();
+        assert_eq!(scanned.problem(), Some(SKILL_FILE_NOT_REGULAR));
+        assert!(
+            scanned.modified.is_some(),
+            "a retry would repeat it: the time is cached"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_named_skill_md_is_refused_instead_of_blocking() {
+        let root = workspace("fifo");
+        let folder = root.join("skills/piped");
+        std::fs::create_dir_all(&folder).unwrap();
+        let made = std::process::Command::new("mkfifo")
+            .arg(folder.join("SKILL.md"))
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if made {
+            assert_eq!(
+                read_skill_bytes(&root, "piped"),
+                Err(SKILL_FILE_NOT_REGULAR.to_string())
+            );
+            let scanned = scan_skill(&root, "piped", None).unwrap().unwrap();
+            assert_eq!(scanned.problem(), Some(SKILL_FILE_NOT_REGULAR));
+        } else {
+            println!("mkfifo is unavailable here; skipping the FIFO check");
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn only_problems_a_retry_would_repeat_keep_their_cache_time() {
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(9);
+        for stable in [
+            SKILL_FILE_TOO_LARGE,
+            SKILL_FILE_OUTSIDE,
+            SKILL_FILE_NOT_REGULAR,
+        ] {
+            assert_eq!(cache_time(stable, Some(at)), Some(at), "{stable}");
+        }
+        assert_eq!(
+            cache_time("SKILL.md could not be read: sharing violation", Some(at)),
+            None
+        );
+    }
+
+    #[test]
+    fn an_io_error_is_not_reused_by_the_next_scan() {
+        let root = workspace("io-error");
+        let path = put(&root, "notes", &skill_text("notes"));
+        let metadata = std::fs::metadata(&path).unwrap();
+        // What an earlier scan stored for a transient failure: it holds no
+        // time, whatever the file's own.
+        let failed = ScannedFile::unreadable(
+            "SKILL.md could not be read: sharing violation",
+            cache_time(
+                "SKILL.md could not be read: sharing violation",
+                metadata.modified().ok(),
+            ),
+            metadata.len(),
+        );
+        assert_eq!(failed.modified, None);
+        let again = scan_skill(&root, "notes", Some(&failed)).unwrap().unwrap();
+        assert_eq!(again.problem(), None, "the file is read again");
+        assert_eq!(
+            again.hash.as_deref(),
+            Some(skill_hash(skill_text("notes").as_bytes()).as_str())
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_locked_file_is_read_again_once_it_is_free() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = workspace("locked");
+        let path = put(&root, "notes", &skill_text("notes"));
+        let lock = std::fs::File::options()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        let failed = scan_skill(&root, "notes", None).unwrap().unwrap();
+        assert!(
+            failed.problem().is_some(),
+            "a sharing violation is a problem"
+        );
+        assert_eq!(failed.modified, None, "and is not cached");
+        drop(lock);
+        let again = scan_skill(&root, "notes", Some(&failed)).unwrap().unwrap();
+        assert_eq!(again.problem(), None);
+        assert!(again.hash.is_some());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn untrash_refuses_a_skills_folder_that_is_a_link_out_of_the_workspace() {
+        let root = workspace("untrash-link");
+        let outside = workspace("untrash-link-outside");
+        put(&root, "notes", &skill_text("notes"));
+        let trashed = trash_skill_folder(&root, "notes", 42).unwrap().unwrap();
+        std::fs::remove_dir_all(root.join("skills")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("skills")).unwrap();
+
+        assert_eq!(
+            untrash_skill_folder(&root, "notes", &trashed),
+            Err(SKILLS_FOLDER_OUTSIDE.to_string())
+        );
+        assert!(!outside.join("notes").exists());
+        assert!(root.join(trash_relative_path(&trashed)).exists());
+        let _ = std::fs::remove_file(root.join("skills"));
+        for path in [root, outside] {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn untrash_refuses_a_skills_folder_that_is_a_junction_out_of_the_workspace() {
+        let root = workspace("untrash-junction");
+        let outside = workspace("untrash-junction-outside");
+        put(&root, "notes", &skill_text("notes"));
+        let trashed = trash_skill_folder(&root, "notes", 42).unwrap().unwrap();
+        std::fs::remove_dir_all(root.join("skills")).unwrap();
+        let skills_link = root.join("skills");
+
+        if junction(&skills_link, &outside) {
+            assert_eq!(
+                untrash_skill_folder(&root, "notes", &trashed),
+                Err(SKILLS_FOLDER_OUTSIDE.to_string())
+            );
+            assert!(!outside.join("notes").exists());
+            assert!(root.join(trash_relative_path(&trashed)).exists());
+        } else {
+            println!("mklink /J is unavailable here; skipping the junction check");
+        }
+        let _ = std::fs::remove_dir(&skills_link);
+        for path in [root, outside] {
             let _ = std::fs::remove_dir_all(path);
         }
     }
