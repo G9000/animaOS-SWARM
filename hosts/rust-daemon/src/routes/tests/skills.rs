@@ -687,3 +687,148 @@ async fn importing_a_skill_file_creates_a_draft() {
         "import is a reserved slug"
     );
 }
+
+#[tokio::test]
+async fn a_session_message_can_carry_an_enabled_skill() {
+    use crate::sessions::{SessionKind, SessionOrigin, SessionRecord, TitleSource};
+    use crate::skills::{
+        SKILL_CANNOT_STEER, SKILL_NOT_IN_TELEGRAM, SKILL_NOT_RUNNABLE, UNKNOWN_SKILL,
+    };
+
+    let (state, _) = daemon("routes-skill-run");
+    let agent = {
+        let mut guard = state.write().await;
+        let agent = guard
+            .create_agent(test_config("companion"))
+            .unwrap()
+            .state
+            .id;
+        for (id, kind, origin) in [
+            ("chat:plans", SessionKind::Chat, SessionOrigin::Web),
+            (
+                "telegram:conn-1",
+                SessionKind::Telegram,
+                SessionOrigin::Telegram,
+            ),
+        ] {
+            guard.sessions.insert(SessionRecord::new(
+                &agent,
+                id,
+                kind,
+                origin,
+                "Plans".into(),
+                TitleSource::Owner,
+                1,
+            ));
+        }
+        agent
+    };
+    let app = router(state.clone(), DaemonConfig::default());
+    send(&app, "PUT", "/api/skills/notes", Some(notes())).await;
+    send(
+        &app,
+        "PUT",
+        "/api/skills/off",
+        Some(json!({"name": "off", "description": "d", "body": "b", "enabled": false})),
+    )
+    .await;
+    let start = |session: &str, key: &str, body: Value| {
+        Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/api/agents/{agent}/sessions/{}/runs",
+                session.replace(':', "%3A")
+            ))
+            .header("host", "127.0.0.1:8080")
+            .header("origin", OWNER_ORIGIN)
+            .header("content-type", "application/json")
+            .header("idempotency-key", key)
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+
+    let accepted = app
+        .clone()
+        .oneshot(start(
+            "chat:plans",
+            "k1",
+            json!({"text": "/notes go", "skill": "notes"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+    let run_id = {
+        let body = json_body(accepted).await;
+        assert_eq!(body["run"]["input"]["skill"], "notes");
+        body["run"]["id"].as_str().unwrap().to_string()
+    };
+
+    for (session, key, body, message) in [
+        (
+            "chat:plans",
+            "k2",
+            json!({"text": "x", "skill": "ghost"}),
+            UNKNOWN_SKILL,
+        ),
+        (
+            "chat:plans",
+            "k3",
+            json!({"text": "x", "skill": "off"}),
+            SKILL_NOT_RUNNABLE,
+        ),
+        (
+            "chat:plans",
+            "k4",
+            json!({"text": "x", "skill": "notes", "mode": "steer"}),
+            SKILL_CANNOT_STEER,
+        ),
+        (
+            "telegram:conn-1",
+            "k5",
+            json!({"text": "x", "skill": "notes"}),
+            SKILL_NOT_IN_TELEGRAM,
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(start(session, key, body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{message}");
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert_eq!(json_body(response).await["error"], message);
+    }
+
+    // A retried key still gets its run after the skill was turned off; a new
+    // message with it is refused.
+    let off = send(
+        &app,
+        "PATCH",
+        "/api/skills/notes",
+        Some(json!({"enabled": false})),
+    )
+    .await;
+    assert_eq!(off.status(), StatusCode::OK);
+    let replayed = app
+        .clone()
+        .oneshot(start(
+            "chat:plans",
+            "k1",
+            json!({"text": "/notes go", "skill": "notes"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replayed.status(), StatusCode::OK);
+    assert_eq!(json_body(replayed).await["run"]["id"], run_id.as_str());
+    let refused = app
+        .clone()
+        .oneshot(start(
+            "chat:plans",
+            "k7",
+            json!({"text": "/notes again", "skill": "notes"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_body(refused).await["error"], SKILL_NOT_RUNNABLE);
+}

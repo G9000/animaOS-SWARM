@@ -170,6 +170,9 @@ pub(crate) struct AcceptRun {
     /// `Web`, or `Telegram` for a Telegram session's owner turn.
     pub(crate) source: RunSource,
     pub(crate) source_ref: Option<String>,
+    /// The skill the message was sent with (spec §4.2, §8.3); recorded as
+    /// the run's `input.skill`.
+    pub(crate) skill: Option<String>,
 }
 
 /// What accepting a message did.
@@ -474,7 +477,7 @@ impl AgentRunCoordinator {
             if guard.runs.queued_count(&request.agent_id) >= MAX_QUEUED_RUNS_PER_AGENT {
                 return Err(ApiError::too_many_requests(QUEUE_FULL));
             }
-            let record = RunRecord::queued(
+            let mut record = RunRecord::queued(
                 RunStart {
                     agent_id: request.agent_id.clone(),
                     session_id: request.session_id.clone(),
@@ -488,6 +491,7 @@ impl AgentRunCoordinator {
                 },
                 self.acceptance_clock.next(),
             );
+            record.input.skill = request.skill.clone();
             // A new chat shows its first message's title from the moment it is
             // accepted, and keeps it if the run fails (M2 T17 Minor 14).
             let previous_title = retitle
@@ -755,20 +759,41 @@ impl AgentRunCoordinator {
         text: String,
         idempotency_key: String,
     ) -> QueuedRunStart {
+        self.web_start_with_skill(agent_id, room_id, text, idempotency_key, None)
+    }
+
+    /// `web_start` for a message sent with a skill (spec §8.3): its user
+    /// message carries `metadata.skill`, which the run turns into the
+    /// skill's instructions.
+    pub(crate) fn web_start_with_skill(
+        &self,
+        agent_id: String,
+        room_id: String,
+        text: String,
+        idempotency_key: String,
+        skill: Option<String>,
+    ) -> QueuedRunStart {
         let coordinator = self.clone();
         let room = room_id.clone();
         let start: StartFn = Box::new(
             move |run_id: String| -> BoxFuture<'static, Result<(), QueuedStartError>> {
                 Box::pin(async move {
+                    let mut metadata = BTreeMap::from([(
+                        CLIENT_REQUEST_ID_METADATA_KEY.to_string(),
+                        DataValue::String(idempotency_key.clone()),
+                    )]);
+                    if let Some(skill) = skill {
+                        metadata.insert(
+                            crate::skills::SKILL_METADATA_KEY.to_string(),
+                            DataValue::String(skill),
+                        );
+                    }
                     let request = AgentRunRequest {
                         agent_id,
                         content: Content {
                             text,
                             attachments: None,
-                            metadata: Some(BTreeMap::from([(
-                                CLIENT_REQUEST_ID_METADATA_KEY.to_string(),
-                                DataValue::String(idempotency_key.clone()),
-                            )])),
+                            metadata: Some(metadata),
                         },
                         room: RunRoom::Stable(room_id),
                         idempotency_key: Some(idempotency_key),

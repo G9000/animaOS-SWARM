@@ -1,14 +1,13 @@
 //! Owner-approved skills (spec §8): `SKILL.md` files under
 //! `<workspace>/skills/<slug>/`, the control-plane registry that pins each
 //! one to the hash the owner approved, the drafts waiting for the owner, and
-//! what a run sees of them. Later M5 tasks add `registry`, `disk`,
-//! `service`, `scanner`, `drafts`, and `runtime`.
-#![allow(dead_code)] // M5 Task 9 removes this once the routes, tools, and runs use every item.
+//! what a run sees of them.
 
 pub(crate) mod disk;
 pub(crate) mod drafts;
 pub(crate) mod file;
 pub(crate) mod registry;
+pub(crate) mod runtime;
 pub(crate) mod scanner;
 pub(crate) mod service;
 #[cfg(test)]
@@ -16,16 +15,11 @@ pub(crate) mod test_support;
 
 use serde::{Deserialize, Serialize};
 
-#[allow(unused_imports)] // M5 Tasks 7–8 use them.
-pub(crate) use drafts::{ApprovedDraft, DraftApproval, Proposal};
-#[allow(unused_imports)] // M5 Tasks 2–9 use them.
+pub(crate) use drafts::{DraftApproval, Proposal};
 pub(crate) use file::{compose_skill_file, parse_skill_file, skill_hash, SkillFile};
-#[allow(unused_imports)] // M5 Tasks 3–9 use them.
-pub(crate) use registry::{status_for, DraftView, ScannedFile, SkillRegistry, SkillSnapshot};
-#[allow(unused_imports)] // M5 Tasks 5–9 use them.
+pub(crate) use registry::{DraftView, ScannedFile, SkillRegistry, SkillSnapshot};
 pub(crate) use scanner::SkillScanner;
-#[allow(unused_imports)] // M5 Tasks 5–9 use them.
-pub(crate) use service::{LoadedSkill, SkillContent, SkillDetail, SkillError, SkillService};
+pub(crate) use service::{LoadedSkill, SkillContent, SkillError, SkillService};
 
 /// A `SKILL.md`'s Markdown body, after its front matter (spec §8.1, §16).
 pub(crate) const MAX_SKILL_BODY_BYTES: usize = 32 * 1024;

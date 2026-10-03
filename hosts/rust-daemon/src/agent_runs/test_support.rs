@@ -366,6 +366,7 @@ pub(crate) fn accept(agent_id: &str, session_id: &str, key: &str) -> AcceptRun {
         mode: SessionRunMode::Queue,
         source: RunSource::Web,
         source_ref: None,
+        skill: None,
     }
 }
 

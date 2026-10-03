@@ -9,15 +9,17 @@ use anima_core::{DataValue, ToolCall};
 use tokio::sync::{RwLock, Semaphore};
 
 use super::test_support::{
-    chat_request, companion_config, ledger_run, tool_input, tool_results, ScriptedModel, Step,
+    accept, add_chat, chat_request, companion_config, ledger_run, tool_input, tool_results,
+    wait_for, ScriptedModel, Step,
 };
 use super::AgentRunCoordinator;
 use crate::skills::test_support::{
     broken_store, content, skill_text, temp_workspace, with_workspace, write_skill,
 };
 use crate::skills::{
-    proposed_reply, DraftSource, HELPERS_CANNOT_PROPOSE_SKILLS, PROPOSAL_NOT_SAVED,
-    SKILLS_NEED_WORKSPACE, SKILLS_UNAVAILABLE, SKILL_CHANGED, SKILL_INSTRUCTIONS_HEADER,
+    proposed_reply, skill_not_found, DraftSource, HELPERS_CANNOT_PROPOSE_SKILLS,
+    PROPOSAL_NOT_SAVED, SKILLS_NEED_WORKSPACE, SKILLS_UNAVAILABLE, SKILL_CHANGED,
+    SKILL_INDEX_HEADER, SKILL_INSTRUCTIONS_HEADER,
 };
 use crate::state::DaemonState;
 
@@ -314,4 +316,182 @@ fn a_helper_gets_load_skill_but_never_propose_skill() {
         .map(|tool| tool.name)
         .collect();
     assert_eq!(names, ["load_skill"]);
+}
+
+fn system_of(model: &ScriptedModel, index: usize) -> String {
+    model.requests()[index].system.clone()
+}
+
+#[tokio::test]
+async fn the_index_lists_enabled_active_skills_as_data() {
+    let model = ScriptedModel::new(vec![Step::Text(vec!["ok"])]);
+    let (coordinator, agent_id, root) =
+        skilled(model.clone(), &["load_skill", "calculate"], "index").await;
+    let skills = coordinator.skills();
+    skills.save("notes", content("notes")).await.unwrap();
+    skills.save("off", content("off")).await.unwrap();
+    skills.set_enabled("off", false).await.unwrap();
+    skills.save("changed", content("changed")).await.unwrap();
+    write_skill(&root, "changed", &skill_text("changed by hand"));
+    skills.scan().await.unwrap();
+
+    coordinator
+        .run(chat_request(&agent_id, "chat:x", "hello"))
+        .await
+        .unwrap();
+
+    let system = system_of(&model, 0);
+    assert!(
+        system.contains(&format!(
+            "[skills]: {SKILL_INDEX_HEADER}\n- /notes \"notes\": About notes"
+        )),
+        "{system}"
+    );
+    assert!(!system.contains("/off"), "a skill turned off is not listed");
+    assert!(
+        !system.contains("/changed"),
+        "a changed skill is not listed"
+    );
+}
+
+#[tokio::test]
+async fn an_agent_without_load_skill_gets_no_index() {
+    let model = ScriptedModel::new(vec![Step::Text(vec!["ok"])]);
+    let (coordinator, agent_id, _) = skilled(model.clone(), &["calculate"], "no-index").await;
+    coordinator
+        .skills()
+        .save("notes", content("notes"))
+        .await
+        .unwrap();
+
+    coordinator
+        .run(chat_request(&agent_id, "chat:x", "hello"))
+        .await
+        .unwrap();
+
+    assert!(!system_of(&model, 0).contains(SKILL_INDEX_HEADER));
+}
+
+async fn accept_skill(
+    coordinator: &AgentRunCoordinator,
+    agent_id: &str,
+    key: &str,
+    text: &str,
+    skill: Option<&str>,
+) -> String {
+    let start = coordinator.web_start_with_skill(
+        agent_id.into(),
+        "chat:1".into(),
+        text.into(),
+        key.into(),
+        skill.map(str::to_string),
+    );
+    let mut request = accept(agent_id, "chat:1", key);
+    request.text = text.into();
+    request.skill = skill.map(str::to_string);
+    match coordinator.accept_run(request, start).await.unwrap() {
+        super::AcceptedRun::Created(record) => record.id,
+        other => panic!("expected a new run, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_skill_message_carries_its_instructions_for_one_run() {
+    let model = ScriptedModel::new(vec![Step::Text(vec!["planned"]), Step::Text(vec!["plain"])]);
+    let (coordinator, agent_id, _) = skilled(model.clone(), &["calculate"], "skill-run").await;
+    add_chat(&coordinator, &agent_id, "chat:1").await;
+    coordinator
+        .skills()
+        .save("notes", content("Notes"))
+        .await
+        .unwrap();
+
+    let run_id = accept_skill(
+        &coordinator,
+        &agent_id,
+        "k1",
+        "/notes plan the week",
+        Some("notes"),
+    )
+    .await;
+    wait_for(&coordinator, &run_id, crate::runs::RunStatus::Completed).await;
+    let plain = accept_skill(&coordinator, &agent_id, "k2", "and now?", None).await;
+    wait_for(&coordinator, &plain, crate::runs::RunStatus::Completed).await;
+
+    let first = system_of(&model, 0);
+    assert!(
+        first.contains(
+            "[skill]: The owner asked to use the skill /notes (\"Notes\") for this message."
+        ),
+        "{first}"
+    );
+    assert!(first.contains("Do Notes."));
+    assert!(
+        !system_of(&model, 1).contains("[skill]:"),
+        "only for its own run"
+    );
+    let guard = coordinator.state.read().await;
+    assert_eq!(
+        guard.runs.get(&run_id).unwrap().input.skill.as_deref(),
+        Some("notes")
+    );
+    let user = guard.agents[&agent_id]
+        .messages()
+        .iter()
+        .find(|message| message.content.text == "/notes plan the week")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        user.content.metadata.unwrap().get("skill"),
+        Some(&DataValue::String("notes".into()))
+    );
+}
+
+#[tokio::test]
+async fn a_skill_changed_after_acceptance_is_not_injected() {
+    let model = ScriptedModel::new(vec![Step::Text(vec!["ok"])]);
+    let (coordinator, agent_id, root) =
+        skilled(model.clone(), &["calculate"], "skill-changed").await;
+    add_chat(&coordinator, &agent_id, "chat:1").await;
+    coordinator
+        .skills()
+        .save("notes", content("Notes"))
+        .await
+        .unwrap();
+    write_skill(&root, "notes", &skill_text("Injected"));
+
+    let run_id = accept_skill(&coordinator, &agent_id, "k1", "/notes go", Some("notes")).await;
+    wait_for(&coordinator, &run_id, crate::runs::RunStatus::Completed).await;
+
+    let system = system_of(&model, 0);
+    assert!(
+        system.contains(&format!("[skill]: The owner asked to use the skill /notes, but it is not available now ({SKILL_CHANGED}).")),
+        "{system}"
+    );
+    assert!(!system.contains("Do Injected."));
+}
+
+#[tokio::test]
+async fn a_skill_message_does_not_fall_back_to_a_name() {
+    let model = ScriptedModel::new(vec![Step::Text(vec!["ok"])]);
+    let (coordinator, agent_id, _) = skilled(model.clone(), &["calculate"], "skill-no-name").await;
+    add_chat(&coordinator, &agent_id, "chat:1").await;
+    coordinator
+        .skills()
+        .save("plan", content("notes"))
+        .await
+        .unwrap();
+
+    let run_id = accept_skill(&coordinator, &agent_id, "k1", "/notes go", Some("notes")).await;
+    wait_for(&coordinator, &run_id, crate::runs::RunStatus::Completed).await;
+
+    let system = system_of(&model, 0);
+    assert!(
+        system.contains(&format!(
+            "[skill]: The owner asked to use the skill /notes, but it is not available now ({}).",
+            skill_not_found("notes")
+        )),
+        "{system}"
+    );
+    assert!(!system.contains("Do notes."));
 }

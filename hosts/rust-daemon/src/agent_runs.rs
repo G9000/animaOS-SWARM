@@ -1570,6 +1570,8 @@ impl AgentRunCoordinator {
                 ..Default::default()
             });
         }
+        // Spec §8.3: the skills index and a `/skill` message's instructions.
+        self.apply_skills(&mut runtime, &content).await;
         runtime.set_run_id(run_id.clone());
         runtime.set_run_observer(live_run.observer());
         runtime.set_run_control(live_run.control());
