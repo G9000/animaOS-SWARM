@@ -28,14 +28,20 @@ pub(crate) struct ToolGrantSet {
     pub(crate) write_class: &'static [&'static str],
 }
 
-/// Grant sets in the order they shipped. M5 (`load_skill`, `propose_skill`)
-/// and M6 (`list_automations`, `create_automation`, `pause_automation`)
-/// append theirs.
-pub(crate) const TOOL_GRANTS: &[ToolGrantSet] = &[ToolGrantSet {
-    id: "m3-search-conversations",
-    read_class: &["search_conversations"],
-    write_class: &[],
-}];
+/// Grant sets in the order they shipped. M6 (`list_automations`,
+/// `create_automation`, `pause_automation`) appends its own.
+pub(crate) const TOOL_GRANTS: &[ToolGrantSet] = &[
+    ToolGrantSet {
+        id: "m3-search-conversations",
+        read_class: &["search_conversations"],
+        write_class: &[],
+    },
+    ToolGrantSet {
+        id: "m5-skills",
+        read_class: &["load_skill"],
+        write_class: &["propose_skill"],
+    },
+];
 
 /// Legacy check-ins ran in a fresh `room-*` room per tick. Those rooms become
 /// the automation's `schedule:<id>` session, and so do their ledger runs;
@@ -1260,12 +1266,56 @@ mod tests {
                 .map(|tool| tool.name)
                 .collect::<Vec<_>>()
         };
-        assert_eq!(names(&companion_id), ["calculate", "search_conversations"]);
+        assert_eq!(
+            names(&companion_id),
+            ["calculate", "search_conversations", "load_skill"]
+        );
         assert_eq!(
             names(&helper_id),
             ["calculate"],
             "the migration grant never reaches a helper agent"
         );
+    }
+
+    #[test]
+    fn the_skills_grant_adds_load_skill_and_for_writers_propose_skill() {
+        let registry = crate::tools::ToolRegistry::new();
+        let mut reader = config("reader", &[]);
+        reader.tools = Some(registry.resolve_descriptors(["read_file"]).unwrap());
+        let mut writer = config("writer", &[]);
+        writer.tools = Some(registry.resolve_descriptors(["write_file"]).unwrap());
+        let mut state = DaemonState::new();
+        let reader_id = state.create_agent(reader).unwrap().state.id;
+        let writer_id = state.create_agent(writer).unwrap().state.id;
+
+        state.apply_pending_tool_grants(TOOL_GRANTS);
+
+        let names = |id: &str| {
+            state
+                .get_agent(id)
+                .unwrap()
+                .state
+                .config
+                .tools
+                .unwrap_or_default()
+                .into_iter()
+                .map(|tool| tool.name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(&reader_id),
+            ["read_file", "search_conversations", "load_skill"]
+        );
+        assert_eq!(
+            names(&writer_id),
+            [
+                "write_file",
+                "search_conversations",
+                "load_skill",
+                "propose_skill"
+            ]
+        );
+        assert!(state.tool_grants_applied.contains("m5-skills"));
     }
 
     #[test]

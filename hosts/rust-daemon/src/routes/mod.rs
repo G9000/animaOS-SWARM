@@ -15,11 +15,13 @@ mod http;
 mod jobs;
 mod mail;
 mod memories;
+mod multipart;
 mod oauth_apps;
 mod profile;
 mod runs;
 mod schedules;
 mod sessions;
+mod skills;
 mod swarms;
 mod workspace;
 mod workspace_agent_yaml;
@@ -176,6 +178,10 @@ use crate::runtime_model::provider_summaries;
         approvals::list_approvals, approvals::decide_approval, approvals::get_approval_policy,
         approvals::put_approval_policy, approvals::list_approval_rules, approvals::create_approval_rule,
         approvals::delete_approval_rule,
+        skills::list_skills, skills::get_skill, skills::put_skill, skills::patch_skill,
+        skills::delete_skill, skills::approve_skill,
+        skills::list_skill_drafts, skills::approve_skill_draft, skills::reject_skill_draft,
+        skills::import_skill,
     ),
     components(schemas(self::contracts::AgentSummariesEnvelope)),
     tags(
@@ -191,6 +197,7 @@ use crate::runtime_model::provider_summaries;
         (name = "sessions", description = "Agent sessions and their transcripts"),
         (name = "runs", description = "Live runs: the agent event stream, session runs, and stop"),
         (name = "approvals", description = "Tool approvals: pending requests, decisions, policies, and rules"),
+        (name = "skills", description = "Owner-approved skills, drafts, and imports"),
         (name = "workspace", description = "Workspace configuration and onboarding"),
     )
 )]
@@ -535,6 +542,31 @@ fn router_with_services_with_policies(
         .route(
             "/api/agents/{agent_id}/approval-rules/{rule_id}",
             axum::routing::delete(approvals::delete_approval_rule),
+        )
+        .route("/api/skills", get(skills::list_skills))
+        .route(
+            "/api/skills/import",
+            axum::routing::post(skills::import_skill),
+        )
+        .route("/api/skill-drafts", get(skills::list_skill_drafts))
+        .route(
+            "/api/skill-drafts/{draft_id}/approve",
+            axum::routing::post(skills::approve_skill_draft),
+        )
+        .route(
+            "/api/skill-drafts/{draft_id}/reject",
+            axum::routing::post(skills::reject_skill_draft),
+        )
+        .route(
+            "/api/skills/{slug}",
+            get(skills::get_skill)
+                .put(skills::put_skill)
+                .patch(skills::patch_skill)
+                .delete(skills::delete_skill),
+        )
+        .route(
+            "/api/skills/{slug}/approve",
+            axum::routing::post(skills::approve_skill),
         )
         .route("/api/ready", get(ready_entry))
         .route(
@@ -1939,6 +1971,7 @@ mod tests {
     mod jobs;
     mod runs;
     mod sessions;
+    mod skills;
     mod swarm_reliability;
 
     use super::{router, router_with_services, router_with_services_with_policies};

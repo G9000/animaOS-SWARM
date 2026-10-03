@@ -19,6 +19,7 @@ use crate::agent_runs::{
 use crate::connectors::runtime::ConnectorManagerError;
 use crate::runs::{RunSource, MAX_RUN_ATTACHMENTS, MAX_RUN_INPUT_TEXT_BYTES};
 use crate::sessions::{is_valid_session_id, SessionKind};
+use crate::skills::{SKILL_CANNOT_STEER, SKILL_NOT_IN_TELEGRAM};
 
 const DEFAULT_RUN_PAGE: usize = 20;
 const MAX_RUN_PAGE: usize = 50;
@@ -98,10 +99,6 @@ fn validate_input(input: &StartRunRequest) -> Result<(), ApiError> {
         // Attachments arrive in M9; until then no id is known.
         return Err(ApiError::bad_request_static("unknown attachment ids"));
     }
-    if input.skill.is_some() {
-        // Skills arrive in M5.
-        return Err(ApiError::bad_request_static("unknown skill"));
-    }
     Ok(())
 }
 
@@ -130,7 +127,7 @@ fn run_limit(uri: &Uri) -> Result<usize, ApiError> {
     responses(
         (status = 200, description = "The key was used for this message within 24 hours: the original run, nothing created; a retried steer still waiting in the run it joined is that run with steer.status pending", body = RunEnvelope),
         (status = 202, description = "Accepted: the queued run, or the active run a steer joined (with steer.status pending)", body = RunEnvelope),
-        (status = 400, description = "Missing or invalid key, empty text with no attachments, text over 32 KiB, over 10 or unknown attachments, unknown skill, steer on a kind that cannot steer, or a body over 256 KiB", body = ErrorBody),
+        (status = 400, description = "Missing or invalid key, empty text with no attachments, text over 32 KiB, over 10 or unknown attachments, an unknown skill, one that is off or waiting for review, a skill with steer, a skill in a Telegram session, steer on a kind that cannot steer, or a body over 256 KiB", body = ErrorBody),
         (status = 403, description = "Local owner required", body = ErrorBody),
         (status = 404, description = "Agent or session not found", body = ErrorBody),
         (status = 409, description = "The kind cannot receive messages (a job or helper session, or a Telegram session without its connector), the agent is a helper or is being deleted, or the key was used for a different message", body = ErrorBody),
@@ -159,6 +156,23 @@ pub(super) async fn start_session_run(
     if let Err(error) = validate_input(&input) {
         return rejected(error);
     }
+    if let Some(skill) = input.skill.as_deref() {
+        if matches!(input.mode, StartRunMode::Steer) {
+            return rejected(ApiError::bad_request_static(SKILL_CANNOT_STEER));
+        }
+        // Advisory: the run itself rereads and hash-checks the skill. A
+        // retried key still gets its run (audit m11).
+        if let Err(message) = state.agent_runs.skills().check_runnable(skill).await {
+            return match state
+                .agent_runs
+                .replayed_run(&agent_id, &session_id, &input.text, &idempotency_key)
+                .await
+            {
+                Some(answer) => accepted_response(answer),
+                None => rejected(ApiError::bad_request_static(message)),
+            };
+        }
+    }
     // Which flow runs the message; `accept_run` re-checks the session under
     // the control-plane transaction.
     let target = {
@@ -181,6 +195,9 @@ pub(super) async fn start_session_run(
     let Some((room_id, connector)) = target else {
         return rejected(ApiError::not_found());
     };
+    if input.skill.is_some() && connector.is_some() {
+        return rejected(ApiError::bad_request_static(SKILL_NOT_IN_TELEGRAM));
+    }
     let (source, source_ref, start): (RunSource, Option<String>, QueuedRunStart) = match connector {
         // A Telegram session's message is the connector's owner turn (spec §4.2).
         Some(Some(connector_id)) => {
@@ -230,11 +247,12 @@ pub(super) async fn start_session_run(
         None => (
             RunSource::Web,
             None,
-            state.agent_runs.web_start(
+            state.agent_runs.web_start_with_skill(
                 agent_id.clone(),
                 room_id,
                 input.text.clone(),
                 idempotency_key.clone(),
+                input.skill.clone(),
             ),
         ),
     };
@@ -253,6 +271,7 @@ pub(super) async fn start_session_run(
                 mode,
                 source,
                 source_ref,
+                skill: input.skill,
             },
             start,
         )

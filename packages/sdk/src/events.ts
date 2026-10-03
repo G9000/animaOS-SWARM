@@ -93,6 +93,12 @@ export type AgentEvent =
   | (EventBase & {
       type: 'approval.requested' | 'approval.resolved';
       approval: Approval;
+    })
+  | (EventBase & {
+      type: 'skill.updated';
+      /** The skill that changed; null when a rescan found changes. */
+      slug: string | null;
+      draftId: string | null;
     });
 
 const LIFECYCLE: ReadonlySet<string> = new Set<RunLifecycleEventType>([
@@ -120,6 +126,13 @@ export function isApprovalEvent(
   return (
     event.type === 'approval.requested' || event.type === 'approval.resolved'
   );
+}
+
+/** A skill or draft changed (spec §6): read the skills again. */
+export function isSkillEvent(
+  event: AgentEvent,
+): event is Extract<AgentEvent, { type: 'skill.updated' }> {
+  return event.type === 'skill.updated';
 }
 
 export class AgentEventsClient {

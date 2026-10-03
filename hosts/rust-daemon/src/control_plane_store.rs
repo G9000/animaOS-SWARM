@@ -18,9 +18,13 @@ use crate::schedules::ScheduledPromptRecord;
 /// Snapshot format version. Version 5 adds sessions (companion console M2);
 /// version 6 adds the live-run fields (M3: accepted `queued` runs and each
 /// run's `replyMessageId`); version 7 adds approvals, approval policies and
-/// rules, and session allowances (M4). Older daemons refuse a newer version,
-/// so the first start of a new version writes a backup (spec §13.3).
-pub(crate) const CONTROL_PLANE_STORE_VERSION: u32 = 7;
+/// rules, and session allowances (M4); version 8 adds the skills registry and
+/// skill drafts (M5). Older daemons refuse a newer version, so the first
+/// start of a new version writes a backup (spec §13.3).
+pub(crate) const CONTROL_PLANE_STORE_VERSION: u32 = 8;
+/// The version that added approvals: older snapshots are backed up as
+/// `.pre-approvals.bak` at the latest, this one as `.pre-skills.bak`.
+pub(crate) const APPROVALS_STORE_VERSION: u32 = 7;
 /// The version that added the live-run fields: older snapshots are backed
 /// up as `.pre-live-runs.bak`, this one as `.pre-approvals.bak`.
 pub(crate) const LIVE_RUNS_STORE_VERSION: u32 = 6;
@@ -35,6 +39,8 @@ pub(crate) const PRE_SESSIONS_BACKUP_SUFFIX: &str = ".pre-sessions.bak";
 pub(crate) const PRE_LIVE_RUNS_BACKUP_SUFFIX: &str = ".pre-live-runs.bak";
 /// Suffix of the JSON backup taken before the approvals upgrade.
 pub(crate) const PRE_APPROVALS_BACKUP_SUFFIX: &str = ".pre-approvals.bak";
+/// Suffix of the JSON backup taken before the skills upgrade.
+pub(crate) const PRE_SKILLS_BACKUP_SUFFIX: &str = ".pre-skills.bak";
 const CONTROL_PLANE_SNAPSHOT_KEY: &str = "control_plane";
 
 #[derive(Clone, Debug)]
@@ -126,6 +132,12 @@ pub(crate) struct ControlPlaneSnapshot {
     pub(crate) approval_policies: Vec<crate::approvals::AgentApprovalPolicy>,
     #[serde(default)]
     pub(crate) approval_rules: Vec<crate::approvals::ApprovalRule>,
+    /// The skills registry (spec §8.1); workspace-wide.
+    #[serde(default)]
+    pub(crate) skills: Vec<crate::skills::SkillRecord>,
+    /// Skill drafts waiting for the owner and decided ones (spec §8.2).
+    #[serde(default)]
+    pub(crate) skill_drafts: Vec<crate::skills::SkillDraft>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -238,6 +250,17 @@ pub(crate) fn pre_approvals_backup_path(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
+/// Where the JSON snapshot is backed up before the skills upgrade (from
+/// version `APPROVALS_STORE_VERSION`).
+pub(crate) fn pre_skills_backup_path(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_default();
+    name.push(PRE_SKILLS_BACKUP_SUFFIX);
+    path.with_file_name(name)
+}
+
 /// Where the JSON snapshot of `loaded_version` is backed up before it is
 /// upgraded: each upgrade keeps its own file, so a later upgrade never
 /// overwrites an earlier one's backup.
@@ -246,10 +269,12 @@ pub(crate) fn pre_upgrade_backup_path(path: &Path, loaded_version: u32) -> PathB
         pre_sessions_backup_path(path)
     } else if loaded_version < LIVE_RUNS_STORE_VERSION {
         pre_live_runs_backup_path(path)
-    } else {
-        // A future version 8 must add its own branch above, or its upgrade
-        // would overwrite `.pre-approvals.bak`.
+    } else if loaded_version < APPROVALS_STORE_VERSION {
         pre_approvals_backup_path(path)
+    } else {
+        // A future version 9 must add its own branch above, or its upgrade
+        // would overwrite `.pre-skills.bak`.
+        pre_skills_backup_path(path)
     }
 }
 
@@ -462,6 +487,8 @@ impl ControlPlaneSnapshot {
             approvals: vec![],
             approval_policies: vec![],
             approval_rules: vec![],
+            skills: vec![],
+            skill_drafts: vec![],
         }
     }
 }
@@ -589,7 +616,7 @@ mod tests {
         let snapshot = ControlPlaneSnapshot::new(vec![], vec![]);
         let payload = serde_json::to_value(snapshot).expect("snapshot should serialize");
 
-        assert_eq!(payload["version"], 7);
+        assert_eq!(payload["version"], 8);
         assert_eq!(payload["connectors"], serde_json::json!([]));
         assert_eq!(payload["credentialCleanup"], serde_json::json!([]));
         assert_eq!(payload["inbound"], serde_json::json!([]));
@@ -598,6 +625,8 @@ mod tests {
         assert_eq!(payload["runs"], serde_json::json!([]));
         assert_eq!(payload["sessions"], serde_json::json!([]));
         assert_eq!(payload["pendingHistoryDeletions"], serde_json::json!([]));
+        assert_eq!(payload["skills"], serde_json::json!([]));
+        assert_eq!(payload["skillDrafts"], serde_json::json!([]));
         assert_eq!(payload["approvals"], serde_json::json!([]));
         assert_eq!(payload["approvalPolicies"], serde_json::json!([]));
         assert_eq!(payload["approvalRules"], serde_json::json!([]));
@@ -712,6 +741,7 @@ mod tests {
         );
         assert_eq!(super::postgres_backup_key(4), "control_plane.backup.4");
         assert_eq!(super::postgres_backup_key(5), "control_plane.backup.5");
+        assert_eq!(super::postgres_backup_key(7), "control_plane.backup.7");
     }
 
     /// Controller ruling (M3 pre-flight audit I2): each upgrade keeps its own
@@ -741,6 +771,14 @@ mod tests {
         assert_eq!(
             super::pre_approvals_backup_path(path),
             super::pre_upgrade_backup_path(path, 6)
+        );
+        assert_eq!(
+            super::pre_upgrade_backup_path(path, 7),
+            std::path::PathBuf::from("/data/control-plane.json.pre-skills.bak")
+        );
+        assert_eq!(
+            super::pre_skills_backup_path(path),
+            super::pre_upgrade_backup_path(path, 7)
         );
     }
 
@@ -785,6 +823,34 @@ mod tests {
             std::fs::read_to_string(super::pre_live_runs_backup_path(&path)).unwrap(),
             m3_backup,
             "the M3 upgrade's backup survives the M4 upgrade"
+        );
+        assert_no_temp_residue(&path);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_version_seven_backup_leaves_the_earlier_backups_alone() {
+        let path = test_snapshot_path("skills-backup");
+        let m4_backup = "{\"version\":6,\"agents\":[],\"swarms\":[]}";
+        std::fs::write(super::pre_approvals_backup_path(&path), m4_backup).unwrap();
+        let original = "{
+  \"version\": 7,
+  \"agents\": [],
+  \"swarms\": []
+}
+";
+        std::fs::write(&path, original).unwrap();
+        let config = super::ControlPlaneStoreConfig::Json(path.clone());
+
+        let location = super::write_pre_upgrade_backup(&config, 7).await.unwrap();
+
+        let backup = super::pre_skills_backup_path(&path);
+        assert_eq!(location, backup.display().to_string());
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), original);
+        assert_eq!(
+            std::fs::read_to_string(super::pre_approvals_backup_path(&path)).unwrap(),
+            m4_backup,
+            "the M4 upgrade's backup survives the M5 upgrade"
         );
         assert_no_temp_residue(&path);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());

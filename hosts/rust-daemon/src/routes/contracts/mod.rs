@@ -9,6 +9,7 @@ mod runs;
 mod schedules;
 mod sessions;
 mod shared;
+mod skills;
 mod swarms;
 mod workspace;
 
@@ -43,6 +44,7 @@ pub(crate) use shared::{
     data_value_to_json, DeleteResponse, ErrorBody, HealthResponse, ReadinessResponse, TaskRequest,
     TaskResultResponse,
 };
+pub(crate) use skills::*;
 pub(crate) use swarms::{
     SwarmCreateRequest, SwarmEnvelope, SwarmEventResponse, SwarmRunEnvelope, SwarmStateResponse,
     SwarmsEnvelope,

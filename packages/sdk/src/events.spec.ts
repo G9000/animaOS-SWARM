@@ -4,6 +4,7 @@ import {
   createDaemonClient,
   isApprovalEvent,
   isRunLifecycleEvent,
+  isSkillEvent,
   type AgentEvent,
 } from './index.js';
 
@@ -136,4 +137,27 @@ describe('agent events client', () => {
 
 afterEach(() => {
   vi.restoreAllMocks();
+});
+
+describe('isSkillEvent', () => {
+  it('recognizes skill.updated', () => {
+    const event: AgentEvent = {
+      type: 'skill.updated',
+      agentId: 'agent-1',
+      seq: 4,
+      at: 5,
+      slug: 'notes',
+      draftId: null,
+    };
+    expect(isSkillEvent(event)).toBe(true);
+    expect(
+      isSkillEvent({
+        type: 'stream.resync',
+        agentId: 'a',
+        seq: 1,
+        at: 1,
+        missed: 2,
+      }),
+    ).toBe(false);
+  });
 });

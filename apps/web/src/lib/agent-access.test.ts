@@ -15,6 +15,7 @@ const COMMON_TOOLS = [
   'get_current_time',
   'calculate',
   'search_conversations',
+  'load_skill',
 ];
 
 const OBSERVE_TOOLS = [
@@ -32,6 +33,7 @@ const COLLABORATE_TOOLS = [
   'edit_file',
   'multi_edit',
   'todo_write',
+  'propose_skill',
 ];
 
 const OPERATE_TOOLS = [

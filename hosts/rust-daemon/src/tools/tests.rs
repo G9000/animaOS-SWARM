@@ -296,6 +296,12 @@ fn registry_defines_every_registered_tool_schema() {
         ("get_current_time", &[][..], &[][..]),
         ("calculate", &["expression"][..], &[][..]),
         ("search_conversations", &["query"][..], &["limit"][..]),
+        ("load_skill", &["name"][..], &[][..]),
+        (
+            "propose_skill",
+            &["name", "description", "body"][..],
+            &["slug"][..],
+        ),
         ("read_file", &["file_path"][..], &["offset", "limit"][..]),
         ("list_dir", &["path"][..], &[][..]),
         ("glob", &["pattern"][..], &["path"][..]),

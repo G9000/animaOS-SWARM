@@ -61,6 +61,12 @@ pub(crate) enum LiveEventBody {
     },
     ApprovalRequested(ApprovalRequest),
     ApprovalResolved(ApprovalRequest),
+    /// A skill or a draft changed, or a scan found something new (spec §6);
+    /// clients read their lists again. Workspace-wide: no session or run.
+    SkillUpdated {
+        slug: Option<String>,
+        draft_id: Option<String>,
+    },
 }
 
 impl LiveEventBody {
@@ -84,6 +90,7 @@ impl LiveEventBody {
             Self::ToolFinished { .. } => "tool.finished",
             Self::ApprovalRequested(_) => "approval.requested",
             Self::ApprovalResolved(_) => "approval.resolved",
+            Self::SkillUpdated { .. } => "skill.updated",
         }
     }
 }
@@ -211,6 +218,10 @@ impl LiveEvent {
             LiveEventBody::ApprovalRequested(approval)
             | LiveEventBody::ApprovalResolved(approval) => {
                 value["approval"] = approval_json(approval);
+            }
+            LiveEventBody::SkillUpdated { slug, draft_id } => {
+                value["slug"] = json!(slug);
+                value["draftId"] = json!(draft_id);
             }
         }
         value

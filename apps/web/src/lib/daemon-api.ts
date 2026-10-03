@@ -26,6 +26,8 @@ import {
   type SessionMessage,
   type SessionMessageOptions,
   type SessionUpdateInput,
+  type SkillDraftApproval,
+  type SkillInput,
   type StartRunInput,
 } from '@animaOS-SWARM/sdk';
 
@@ -393,6 +395,27 @@ export const daemon = {
     setupClient.approvals.addRule(agentId, input),
   removeApprovalRule: (agentId: string, ruleId: string) =>
     setupClient.approvals.removeRule(agentId, ruleId),
+  /** Skills (spec §8.4); the daemon rescans the folder on these reads. */
+  listSkills: (options: { signal?: AbortSignal } = {}) =>
+    setupClient.skills.list(options),
+  skill: (slug: string, options: { signal?: AbortSignal } = {}) =>
+    setupClient.skills.get(slug, options),
+  saveSkill: (slug: string, input: SkillInput) =>
+    setupClient.skills.save(slug, input),
+  setSkillEnabled: (slug: string, enabled: boolean) =>
+    setupClient.skills.setEnabled(slug, enabled),
+  deleteSkill: (slug: string) => setupClient.skills.remove(slug),
+  approveSkill: (slug: string, hash: string) =>
+    setupClient.skills.approve(slug, hash),
+  listSkillDrafts: (options: {
+    status: 'pending' | 'decided';
+    signal?: AbortSignal;
+  }) => setupClient.skills.drafts(options),
+  approveSkillDraft: (id: string, approval: SkillDraftApproval = {}) =>
+    setupClient.skills.approveDraft(id, approval),
+  rejectSkillDraft: (id: string) => setupClient.skills.rejectDraft(id),
+  importSkill: (file: File) =>
+    setupClient.skills.importFile(file, { filename: file.name }),
   listAgentSummaries: () => setupClient.agents.listSummaries(),
   cancelAgentJob: (id: string, jobId: string, input: { revision: number }) =>
     setupClient.agents.cancelJob(id, jobId, input),

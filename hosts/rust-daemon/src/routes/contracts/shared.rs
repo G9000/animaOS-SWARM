@@ -125,6 +125,8 @@ impl TaskRequest {
             .map(|metadata| {
                 metadata
                     .into_iter()
+                    // A skill is chosen only through the run route's checks.
+                    .filter(|(key, _)| key != crate::skills::SKILL_METADATA_KEY)
                     .map(|(key, value)| {
                         Ok::<(String, DataValue), &'static str>((key, json_to_data_value(value)?))
                     })
@@ -349,5 +351,27 @@ pub(crate) fn data_value_to_json(value: &DataValue) -> Value {
                 .map(|(key, value)| (key.clone(), data_value_to_json(value)))
                 .collect(),
         ),
+    }
+}
+
+#[cfg(test)]
+mod skill_metadata_tests {
+    use super::TaskRequest;
+
+    #[test]
+    fn a_legacy_run_request_cannot_choose_a_skill() {
+        let request: TaskRequest = serde_json::from_value(serde_json::json!({
+            "text": "hi",
+            "metadata": { "skill": "notes", "topic": "x" }
+        }))
+        .unwrap();
+        for content in [
+            request.clone().into_domain().unwrap(),
+            request.into_domain_with_client_retry_key().unwrap(),
+        ] {
+            let metadata = content.metadata.unwrap();
+            assert!(!metadata.contains_key(crate::skills::SKILL_METADATA_KEY));
+            assert!(metadata.contains_key("topic"));
+        }
     }
 }

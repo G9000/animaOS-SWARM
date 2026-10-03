@@ -4,6 +4,7 @@ mod filesystem;
 mod mail;
 mod memory;
 mod process;
+mod skills;
 mod team;
 #[cfg(test)]
 mod tests;
@@ -410,6 +411,44 @@ impl ToolRegistry {
                 ]),
             ),
             conversations::search_conversations,
+        );
+        registry.register(
+            tool_descriptor(
+                "load_skill",
+                "Read an owner-approved workspace skill's instructions by its name or /slug before relying on it. Works only while the skill is turned on and unchanged since the owner approved it.",
+                object_parameters(vec![required_parameter(
+                    "name",
+                    non_blank_string_parameter("The skill's name or slug, as the skills list shows it"),
+                )]),
+            ),
+            skills::load_skill,
+        );
+        registry.register(
+            tool_descriptor(
+                "propose_skill",
+                "Propose a reusable skill (instructions saved as skills/<slug>/SKILL.md) for the owner to review on the Skills page. Nothing becomes a skill until the owner approves it.",
+                object_parameters(vec![
+                    required_parameter(
+                        "name",
+                        non_blank_string_parameter("Short skill name, at most 64 characters"),
+                    ),
+                    required_parameter(
+                        "description",
+                        non_blank_string_parameter("When to use the skill, at most 300 characters"),
+                    ),
+                    required_parameter(
+                        "body",
+                        non_blank_string_parameter("The skill's Markdown instructions, at most 32 KiB"),
+                    ),
+                    optional_parameter(
+                        "slug",
+                        string_parameter(
+                            "Folder name: lowercase letters, digits, and hyphens; derived from the name when absent",
+                        ),
+                    ),
+                ]),
+            ),
+            skills::propose_skill,
         );
         registry.register(
             tool_descriptor(

@@ -6,6 +6,7 @@
 @import './sessions.css';
 @import './live-runs.css';
 @import './approvals.css';
+@import './skills.css';
 
 @source '../../packages/ui/src/**/*.{ts,tsx}';
 

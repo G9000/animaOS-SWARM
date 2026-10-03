@@ -21,6 +21,8 @@ export interface SessionSend {
   conversation: string;
   text: string;
   mode: RunMode;
+  /** The skill a `/skill` message was sent with (spec §8.3). */
+  skill?: string;
   /** Telegram errors are scrubbed of bot tokens before they are shown. */
   telegram: boolean;
   createdAtMs: number;
@@ -250,7 +252,11 @@ export class SendQueue {
       result = await daemon.startRun(
         send.agentId,
         send.sessionId,
-        { text: send.text, mode: send.mode },
+        {
+          text: send.text,
+          mode: send.mode,
+          ...(send.skill ? { skill: send.skill } : {}),
+        },
         send.key,
       );
     } catch (error) {

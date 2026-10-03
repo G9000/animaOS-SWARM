@@ -57,6 +57,7 @@ export {
   AgentEventsClient,
   isApprovalEvent,
   isRunLifecycleEvent,
+  isSkillEvent,
 } from './events.js';
 export type {
   AgentEvent,
@@ -90,6 +91,26 @@ export type {
   PolicyClass,
   RiskClass,
 } from './approvals.js';
+export {
+  MAX_SKILL_BODY_BYTES,
+  MAX_SKILL_DESCRIPTION_CHARS,
+  MAX_SKILL_NAME_CHARS,
+  SKILL_SLUG_PATTERN,
+  SkillsClient,
+} from './skills.js';
+export type {
+  ApprovedSkillDraft,
+  Skill,
+  SkillDetail,
+  SkillDraft,
+  SkillDraftApproval,
+  SkillDraftProposer,
+  SkillDraftSource,
+  SkillDraftStatus,
+  SkillFile,
+  SkillInput,
+  SkillStatus,
+} from './skills.js';
 export { ChatGptClient } from './chatgpt.js';
 export type { ChatGptLogin, ChatGptStatus } from './chatgpt.js';
 export type {

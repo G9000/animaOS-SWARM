@@ -31,7 +31,7 @@ use crate::tools::ToolRegistry;
 use serde::Deserialize;
 use utoipa::ToSchema;
 
-const STATUS_INVALID: &str = "status must be pending or decided";
+pub(super) const STATUS_INVALID: &str = "status must be pending or decided";
 const CURSOR_INVALID: &str = "cursor is not valid";
 const LIMIT_INVALID: &str = "limit must be between 1 and 100";
 

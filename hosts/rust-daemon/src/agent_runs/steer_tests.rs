@@ -24,6 +24,7 @@ fn message(agent_id: &str, key: &str, text: &str, mode: SessionRunMode) -> Accep
         mode,
         source: RunSource::Web,
         source_ref: None,
+        skill: None,
     }
 }
 

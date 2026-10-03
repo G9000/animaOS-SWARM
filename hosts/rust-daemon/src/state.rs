@@ -4,6 +4,7 @@ mod run_commit;
 pub(crate) mod run_stop;
 mod runtime_events;
 mod session_state;
+mod skill_state;
 mod swarm_relationships;
 mod swarm_runtime;
 mod swarm_tools;
@@ -1174,7 +1175,7 @@ mod tests {
         }
 
         let snapshot = source.control_plane_snapshot();
-        assert_eq!(snapshot.version, 7);
+        assert_eq!(snapshot.version, 8);
         assert_eq!(
             snapshot.runs.len(),
             3,
@@ -1356,7 +1357,7 @@ mod tests {
             snapshot.version,
             crate::control_plane_store::CONTROL_PLANE_STORE_VERSION
         );
-        assert_eq!(snapshot.version, 7);
+        assert_eq!(snapshot.version, 8);
 
         let payload = serde_json::to_value(&snapshot).unwrap();
         assert_eq!(payload["inbound"][0]["processingState"], "stopped");
@@ -1378,7 +1379,7 @@ mod tests {
             .await
             .unwrap()
             .expect("the saved snapshot should load");
-        assert_eq!(loaded.version, 7);
+        assert_eq!(loaded.version, 8);
         assert_eq!(
             loaded.inbound[0].processing_state,
             InboundProcessingState::Stopped
@@ -1392,7 +1393,7 @@ mod tests {
 
         DaemonState::new()
             .restore_control_plane_snapshot(loaded)
-            .expect("a v7 snapshot holding stopped/suppressed values restores");
+            .expect("a v8 snapshot holding stopped/suppressed values restores");
         let _ = std::fs::remove_file(path);
     }
 
@@ -1504,6 +1505,8 @@ pub(crate) struct DaemonState {
     pub(crate) sessions: crate::sessions::SessionRegistry,
     /// Pending and not-yet-mirrored approvals, policies, and rules (spec §7).
     pub(crate) approvals: crate::approvals::ApprovalRegistry,
+    /// Skill records, drafts, and the last scan (spec §8).
+    pub(crate) skills: crate::skills::SkillRegistry,
     pub(crate) history: crate::history::SharedHistory,
     /// Session creations per agent per minute (spec §14); not persisted.
     pub(crate) session_limiter: crate::sessions::SessionCreateLimiter,
@@ -1666,6 +1669,7 @@ impl DaemonState {
             runs: crate::runs::RunLedger::default(),
             sessions: crate::sessions::SessionRegistry::default(),
             approvals: crate::approvals::ApprovalRegistry::default(),
+            skills: crate::skills::SkillRegistry::default(),
             history: crate::history::HistoryService::ephemeral(),
             session_limiter: crate::sessions::SessionCreateLimiter::default(),
             tool_grants_applied: std::collections::BTreeSet::new(),
@@ -1873,6 +1877,9 @@ impl DaemonState {
         snapshot.approvals = approvals.approvals;
         snapshot.approval_policies = approvals.policies;
         snapshot.approval_rules = approvals.rules;
+        let skills = self.skills.snapshot();
+        snapshot.skills = skills.skills;
+        snapshot.skill_drafts = skills.drafts;
         snapshot
     }
 
@@ -2016,6 +2023,14 @@ impl DaemonState {
         let sessions = &self.sessions;
         self.approvals
             .retain_decided(|approval| sessions.contains(&approval.agent_id, &approval.session_id));
+        // Spec §8.1: statuses as saved until the first scan.
+        self.skills = crate::skills::SkillRegistry::restored(
+            crate::skills::SkillSnapshot {
+                skills: snapshot.skills,
+                drafts: snapshot.skill_drafts,
+            },
+            anima_core::primitives::now_millis(),
+        );
 
         if relabelled_messages > 0 || relabelled_runs > 0 || mapped_runs > 0 {
             info!(
@@ -2093,6 +2108,7 @@ impl DaemonState {
             &snapshot.approval_policies,
             &snapshot.approval_rules,
         )?;
+        crate::skills::SkillRegistry::validate(&snapshot.skills, &snapshot.skill_drafts)?;
         let mut swarm_ids = HashSet::new();
         for swarm in &snapshot.swarms {
             let swarm_id = &swarm.state.id;

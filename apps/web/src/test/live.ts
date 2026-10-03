@@ -307,3 +307,11 @@ export function scriptedAgentEvents() {
   );
   return { streams, latest: () => streams[streams.length - 1] };
 }
+
+export function skillEvent(
+  seq: number,
+  slug: string | null = 'notes',
+  agentId = 'agent-main',
+): AgentEvent {
+  return { type: 'skill.updated', agentId, seq, at: 1, slug, draftId: null };
+}

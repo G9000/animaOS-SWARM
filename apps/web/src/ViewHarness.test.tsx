@@ -38,6 +38,7 @@ import {
   BOOTSTRAP_SUMMARY_POLL_MS,
 } from './hooks/useDaemonBootstrap';
 import { sessionFixture } from './test/sessions';
+import { skillFixture } from './test/skills';
 import {
   approvalEvent,
   approvalFixture,
@@ -475,6 +476,7 @@ beforeEach(() => {
   vi.spyOn(daemon, 'importLegacySchedules').mockResolvedValue({
     schedules: [],
   });
+  vi.spyOn(daemon, 'listSkills').mockResolvedValue([]);
   routes = mockSessionRoutes();
   mockRuns();
   // No stream events unless a test scripts them; the harness polls.
@@ -1609,6 +1611,42 @@ it('keeps the composer usable while the session has a reply in progress', async 
     'agent-main',
     'room-7',
     { text: 'And one more', mode: 'queue' },
+    expect.any(String),
+  );
+});
+
+it('sends a /skill message from the composer with its skill', async () => {
+  const user = userEvent.setup();
+  vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+  vi.spyOn(daemon, 'listAgents').mockResolvedValue({
+    agents: [snapshot('agent-main', 'Nova', 1)],
+  });
+  vi.mocked(daemon.listSkills).mockResolvedValue([
+    skillFixture('notes', { description: 'Take notes' }),
+  ]);
+  mockProviders();
+  routes.sessions.push(
+    sessionFixture('room-7', {
+      title: 'Weekend plans',
+      origin: 'api',
+      lastActivityAtMs: Date.now(),
+    }),
+  );
+  window.history.replaceState(null, '', '/#/s/room-7');
+  render(<ViewHarness />);
+
+  const input = await screen.findByPlaceholderText('Message Nova…');
+  await waitFor(() => expect(input).toBeEnabled());
+  await user.type(input, '/no');
+  expect(
+    await screen.findByRole('option', { name: /\/notes <request>/ }),
+  ).toBeVisible();
+  await user.type(input, 'tes plan the week{Enter}');
+
+  expect(daemon.startRun).toHaveBeenCalledWith(
+    'agent-main',
+    'room-7',
+    { text: '/notes plan the week', mode: 'queue', skill: 'notes' },
     expect.any(String),
   );
 });

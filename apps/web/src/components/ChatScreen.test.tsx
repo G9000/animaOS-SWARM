@@ -624,6 +624,31 @@ describe('Composer commands and live replies', () => {
     );
   });
 
+  it('completes a skill command for its request instead of sending it', () => {
+    const props = composerProps({
+      draft: '/no',
+      commands: [
+        ...SLASH_COMMANDS,
+        {
+          name: 'notes',
+          description: 'Take notes',
+          placeholder: '<request>',
+          skill: 'notes',
+        },
+      ],
+    });
+    render(<Composer {...props} />);
+
+    expect(screen.getByRole('option', { selected: true })).toHaveTextContent(
+      '/notes <request>',
+    );
+    fireEvent.keyDown(screen.getByRole('textbox', { name: 'Message Nova' }), {
+      key: 'Enter',
+    });
+    expect(props.setDraft).toHaveBeenCalledWith('/notes ');
+    expect(props.onSend).not.toHaveBeenCalled();
+  });
+
   it('closes the menu when the textarea loses focus and reopens it on refocus with a matching draft', () => {
     const props = composerProps({ draft: '/co' });
     render(<Composer {...props} />);
