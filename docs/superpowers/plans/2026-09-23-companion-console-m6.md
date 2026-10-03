@@ -60,16 +60,16 @@
 
 ## File map
 
-| Area            | Files                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Daemon schedule | `hosts/rust-daemon/src`: create `schedules/{cron.rs,timing.rs,automations.rs,history.rs,run_now_tests.rs}`, `state/automation_state.rs`; modify `schedules.rs`, `skills/mod.rs` (three `pub(crate)`), `state.rs`, `connectors/runtime.rs` (one test literal)                                                                                                                                                             |
-| Daemon storage  | modify `control_plane_store.rs`, `app/persistence.rs`, `history/{mod.rs,sqlite.rs,postgres.rs,memory.rs,conformance.rs,outbox.rs}`, `sessions/pruning.rs`, and the version-8 assertions in `state.rs`, `approvals/registry.rs`, `skills/registry.rs`, `agent_runs/live_tests.rs`                                                                                                                                         |
-| Daemon events   | modify `live/events.rs`, `live/tests.rs`                                                                                                                                                                                                                                                                                                                                                                                |
-| Daemon tools    | create `tools/automations.rs`, `agent_runs/{automations.rs,automation_tests.rs}`; modify `tools.rs`, `tools/tests.rs`, `agent_runs.rs` (two module lines, one filter), `sessions/migration.rs`                                                                                                                                                                                                                         |
-| Daemon routes   | create `routes/tests/automations.rs`; modify `routes/schedules.rs`, `routes/contracts/schedules.rs`, `routes/mod.rs`, `tests/schedule_api.rs`, `hosts/rust-daemon/README.md`                                                                                                                                                                                                                                             |
-| SDK             | `packages/sdk/src`: create `automations.ts`, `automations.spec.ts`; modify `events.ts`, `events.spec.ts`, `client.ts`, `index.ts`                                                                                                                                                                                                                                                                                       |
+| Area            | Files                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Daemon schedule | `hosts/rust-daemon/src`: create `schedules/{cron.rs,timing.rs,automations.rs,history.rs,run_now_tests.rs}`, `state/automation_state.rs`; modify `schedules.rs`, `skills/mod.rs` (three `pub(crate)`), `state.rs`, `connectors/runtime.rs` (one test literal)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| Daemon storage  | modify `control_plane_store.rs`, `app/persistence.rs`, `history/{mod.rs,sqlite.rs,postgres.rs,memory.rs,conformance.rs,outbox.rs}`, `sessions/pruning.rs`, and the version-8 assertions in `state.rs`, `approvals/registry.rs`, `skills/registry.rs`, `agent_runs/live_tests.rs`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| Daemon events   | modify `live/events.rs`, `live/tests.rs`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| Daemon tools    | create `tools/automations.rs`, `agent_runs/{automations.rs,automation_tests.rs}`; modify `tools.rs`, `tools/tests.rs`, `agent_runs.rs` (two module lines, one filter), `sessions/migration.rs`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| Daemon routes   | create `routes/tests/automations.rs`; modify `routes/schedules.rs`, `routes/contracts/schedules.rs`, `routes/mod.rs`, `tests/schedule_api.rs`, `hosts/rust-daemon/README.md`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| SDK             | `packages/sdk/src`: create `automations.ts`, `automations.spec.ts`; modify `events.ts`, `events.spec.ts`, `client.ts`, `index.ts`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | Web             | `apps/web/src`: create `lib/{schedule-parse.ts,schedule-parse.test.ts,automations.ts,automations.test.ts}`, `hooks/{useAutomations.ts,useAutomations.test.tsx}`, `pages/{AutomationsPage.tsx,AutomationsPage.test.tsx}`, `components/automations/{AutomationEditor.tsx,AutomationHistory.tsx}`, `components/sessions/AutomationNoticeCard.tsx`, `test/automations.ts`, `automations.css`; modify `test/live.ts`, `lib/{session-events.ts,session-events.test.ts,daemon-api.ts,agent-access.ts,agent-access.test.ts,transcript.ts}`, `hooks/useTranscriptActions.ts`, `components/sessions/{RunActivity.tsx,RunActivity.test.tsx,SessionView.tsx,SessionView.test.tsx}`, `components/{WorkspaceShell.tsx,WorkspaceShell.test.tsx,icons.tsx}`, `ViewHarness.tsx`, `ViewHarness.test.tsx`, `styles.css` |
-| Docs            | `docs/superpowers/plans/2026-09-23-companion-console.md` (the M6 status row, Task 13, controller only)                                                                                                                                                                                                                                                                                                                  |
+| Docs            | `docs/superpowers/plans/2026-09-23-companion-console.md` (the M6 status row, Task 13, controller only)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 
 ## Task list
 
@@ -2458,7 +2458,7 @@ In `hosts/rust-daemon/src/schedules.rs`:
                 counters: AutomationCounters::default(),
 ```
 
-   The `prompt` is moved into the literal above these lines; compute `let name = automations::default_name(&prompt);` before the literal and write `name,` instead if the borrow checker objects.
+The `prompt` is moved into the literal above these lines; compute `let name = automations::default_name(&prompt);` before the literal and write `name,` instead if the borrow checker objects.
 
 4. In `claim_due`, add `manual: false,` to the `ScheduleLastFired { … }` literal.
 
@@ -2598,7 +2598,7 @@ In `hosts/rust-daemon/src/state.rs`:
     pub(crate) schedule_fires: crate::schedules::FireLog,
 ```
 
-   and in `with_model_adapter_and_events_and_limits` after `skills: crate::skills::SkillRegistry::default(),`:
+and in `with_model_adapter_and_events_and_limits` after `skills: crate::skills::SkillRegistry::default(),`:
 
 ```text
             schedule_fires: crate::schedules::FireLog::default(),
@@ -2623,7 +2623,7 @@ In `hosts/rust-daemon/src/state.rs`:
                 .map_err(|problem| format!("schedule '{}' {problem}", schedule.id))?;
 ```
 
-   and after `crate::skills::SkillRegistry::validate(…)?;`:
+and after `crate::skills::SkillRegistry::validate(…)?;`:
 
 ```rust
         crate::schedules::FireLog::validate(&snapshot.schedule_fires)?;
@@ -2699,7 +2699,7 @@ pub(crate) const PRE_AUTOMATIONS_BACKUP_SUFFIX: &str = ".pre-automations.bak";
     pub(crate) schedule_fires: Vec<crate::schedules::ScheduleFireRecord>,
 ```
 
-   and in `with_connector_state_and_cleanup` after `skill_drafts: vec![],`:
+and in `with_connector_state_and_cleanup` after `skill_drafts: vec![],`:
 
 ```text
             schedule_fires: vec![],
@@ -2756,7 +2756,7 @@ pub(crate) fn pre_upgrade_backup_path(path: &Path, loaded_version: u32) -> PathB
         );
 ```
 
-   after `a_version_seven_backup_leaves_the_earlier_backups_alone` add:
+after `a_version_seven_backup_leaves_the_earlier_backups_alone` add:
 
 ```rust
     #[tokio::test]
@@ -2783,7 +2783,7 @@ pub(crate) fn pre_upgrade_backup_path(path: &Path, loaded_version: u32) -> PathB
     }
 ```
 
-   and in `snapshot_serializes_current_version_with_empty_connector_collections` change `assert_eq!(payload["version"], 8);` to `9` and add `assert_eq!(payload["scheduleFires"], serde_json::json!([]));`.
+and in `snapshot_serializes_current_version_with_empty_connector_collections` change `assert_eq!(payload["version"], 8);` to `9` and add `assert_eq!(payload["scheduleFires"], serde_json::json!([]));`.
 
 Change `assert_eq!(payload["version"], 8);` in `hosts/rust-daemon/src/approvals/registry.rs` and in `hosts/rust-daemon/src/skills/registry.rs`, and `assert_eq!(snapshot.version, 8);` in `hosts/rust-daemon/src/agent_runs/live_tests.rs`, to `9`.
 
@@ -4699,7 +4699,7 @@ pub(crate) use automations::{
     }
 ```
 
-   (`…` stands for each method's existing parameter list, unchanged.) Task 3's `name: automations::default_name(&prompt), …` lines in the old `create` literal go with the old body.
+(`…` stands for each method's existing parameter list, unchanged.) Task 3's `name: automations::default_name(&prompt), …` lines in the old `create` literal go with the old body.
 
 5. `validate_prompt`, `validate_target`, `validate_trigger`, and `next_schedule_id` stay private functions of `schedules.rs`; `automations.rs` reaches them as a child module.
 
@@ -6157,6 +6157,7 @@ pub(crate) use automations::{
     TOO_MANY_AUTOMATIONS,
 };
 ```
+
 2. Add to `ScheduleError`, after `Busy(&'static str),`:
 
 ```text
@@ -6206,7 +6207,7 @@ use crate::schedules::{
     },
 ```
 
-   and to its `From` impl:
+and to its `From` impl:
 
 ```text
             ScheduleTriggerRequest::Cron {
@@ -6379,7 +6380,7 @@ pub(crate) struct AutomationCountersResponse {
     pub(crate) running: bool,
 ```
 
-   In `From<ScheduledPromptRecord> for ScheduleResponse`, compute before the `trigger` match `let name = display_name(&value); let running = is_running(&value);`, and add to the `Self { … }` literal:
+In `From<ScheduledPromptRecord> for ScheduleResponse`, compute before the `trigger` match `let name = display_name(&value); let running = is_running(&value);`, and add to the `Self { … }` literal:
 
 ```text
             name,
@@ -6756,16 +6757,16 @@ Every automation route requires local-owner authorization (the list too, since M
 
 **Limits.** An agent has at most 20 automations (a legacy browser import is exempt). Prompts may not contain invisible Unicode tag or direction-override characters, and names may not contain any invisible format character or line break. A companion with `create_automation` (a write-class tool, allowed by default) can schedule its own future runs; each one shows in its chat with Undo and on the Automations page, must be at least 5 minutes apart over its next 10 fires, and counts toward the 20. Set the companion's write policy to `ask` to approve each one. Silent check-in pairs (`CHECKIN_OK` replies) leave the control plane's hot tail once they are mirrored and older than 24 hours, wherever they sit in their session; the history store keeps them.
 
-| Method   | Path                                                       | Description |
-| -------- | ---------------------------------------------------------- | ----------- |
-| `GET`    | `/api/agents/{agent_id}/schedules`                         | `{ schedules }`, oldest first. |
-| `POST`   | `/api/agents/{agent_id}/schedules`                         | Create `{ prompt, trigger, target?, name?, activeHours?, enabled? }` (target defaults to `workspace`, the automation's own thread), or `{ preset: "heartbeat", timeZone, … }` (every 30 minutes from 08:00 to 22:00 in `timeZone`; any other field named replaces the preset's). `201` with `{ schedule }` (`200` when a legacy import key already made it). `400` for an invalid field (`prompt and trigger are required unless preset is heartbeat`, `timeZone is required for the heartbeat preset`, or the trigger's problem); `409` (`This companion already has 20 automations; delete one first`) or for an unavailable Telegram target; `503` when it cannot be saved. |
-| `PATCH`  | `/api/agents/{agent_id}/schedules/{schedule_id}`           | Change `{ prompt?, trigger?, target?, enabled?, name?, activeHours? }` (`activeHours: null` clears them); the next fire is computed again when the trigger or the active hours change, or when it is turned back on (a one-time automation whose time passed needs a new `atMs`). |
-| `DELETE` | `/api/agents/{agent_id}/schedules/{schedule_id}`           | Delete; returns `{ deleted: true }`. Its check-in session can then be deleted; its fire records stay until its agent is deleted. |
-| `POST`   | `/api/agents/{agent_id}/schedules/import`                  | Import legacy browser check-ins (unchanged). |
-| `POST`   | `/api/agents/{agent_id}/schedules/{schedule_id}/run`       | Run now: `202` with `{ schedule }`. The due time and the switch stay, and the fire is recorded as `manual`. `404`; `409` (`This automation is already running`); `429` (`Too many automations are running; try again shortly`, at eight running automations); `503`. |
-| `GET`    | `/api/agents/{agent_id}/schedules/{schedule_id}/history`   | `{ runs }`, newest first, `?limit=` 1–50 (default 50): `{ id, scheduleId, agentId, firedAtMs, finishedAtMs, outcome, runId, sessionId, errorCode, manual }`. `400` (`limit must be from 1 to 50`); `404`; `503` (`automation history is unavailable`) when the history store cannot be read. |
-| `POST`   | `/api/schedules/preview`                                    | `{ trigger, activeHours? }` → `{ nextRuns }`, the next three fire times (one for `once`), so the browser never computes schedules. `400` with the trigger's problem. |
+| Method   | Path                                                     | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| -------- | -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `GET`    | `/api/agents/{agent_id}/schedules`                       | `{ schedules }`, oldest first.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `POST`   | `/api/agents/{agent_id}/schedules`                       | Create `{ prompt, trigger, target?, name?, activeHours?, enabled? }` (target defaults to `workspace`, the automation's own thread), or `{ preset: "heartbeat", timeZone, … }` (every 30 minutes from 08:00 to 22:00 in `timeZone`; any other field named replaces the preset's). `201` with `{ schedule }` (`200` when a legacy import key already made it). `400` for an invalid field (`prompt and trigger are required unless preset is heartbeat`, `timeZone is required for the heartbeat preset`, or the trigger's problem); `409` (`This companion already has 20 automations; delete one first`) or for an unavailable Telegram target; `503` when it cannot be saved. |
+| `PATCH`  | `/api/agents/{agent_id}/schedules/{schedule_id}`         | Change `{ prompt?, trigger?, target?, enabled?, name?, activeHours? }` (`activeHours: null` clears them); the next fire is computed again when the trigger or the active hours change, or when it is turned back on (a one-time automation whose time passed needs a new `atMs`).                                                                                                                                                                                                                                                                                                                                                                                              |
+| `DELETE` | `/api/agents/{agent_id}/schedules/{schedule_id}`         | Delete; returns `{ deleted: true }`. Its check-in session can then be deleted; its fire records stay until its agent is deleted.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `POST`   | `/api/agents/{agent_id}/schedules/import`                | Import legacy browser check-ins (unchanged).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `POST`   | `/api/agents/{agent_id}/schedules/{schedule_id}/run`     | Run now: `202` with `{ schedule }`. The due time and the switch stay, and the fire is recorded as `manual`. `404`; `409` (`This automation is already running`); `429` (`Too many automations are running; try again shortly`, at eight running automations); `503`.                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `GET`    | `/api/agents/{agent_id}/schedules/{schedule_id}/history` | `{ runs }`, newest first, `?limit=` 1–50 (default 50): `{ id, scheduleId, agentId, firedAtMs, finishedAtMs, outcome, runId, sessionId, errorCode, manual }`. `400` (`limit must be from 1 to 50`); `404`; `503` (`automation history is unavailable`) when the history store cannot be read.                                                                                                                                                                                                                                                                                                                                                                                   |
+| `POST`   | `/api/schedules/preview`                                 | `{ trigger, activeHours? }` → `{ nextRuns }`, the next three fire times (one for `once`), so the browser never computes schedules. `400` with the trigger's problem.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 ```
 
 - [ ] **Step 7: Run the tests to verify they pass**
@@ -7945,7 +7946,10 @@ describe('automations client', () => {
     ).toEqual([1, 2, 3]);
 
     expect(requests.map(({ url, init }) => [url, init?.body])).toEqual([
-      ['/api/agents/agent%2Fa/schedules/schedule%2F1/history?limit=10', undefined],
+      [
+        '/api/agents/agent%2Fa/schedules/schedule%2F1/history?limit=10',
+        undefined,
+      ],
       ['/api/agents/agent%2Fa/schedules/schedule%2F1/history', undefined],
       [
         '/api/schedules/preview',
@@ -8139,7 +8143,8 @@ function only<T extends object>(
   keys: readonly (keyof T)[],
 ): Partial<T> {
   const picked: Partial<T> = {};
-  for (const key of keys) if (value[key] !== undefined) picked[key] = value[key];
+  for (const key of keys)
+    if (value[key] !== undefined) picked[key] = value[key];
   return picked;
 }
 
@@ -8634,9 +8639,9 @@ describe('automation labels', () => {
         timeZone: 'Europe/London',
       }),
     ).toBe('cron 0 9 * * 1-5 (Europe/London)');
-    expect(describeTrigger({ type: 'once', atMs: 0 }).startsWith('once, ')).toBe(
-      true,
-    );
+    expect(
+      describeTrigger({ type: 'once', atMs: 0 }).startsWith('once, '),
+    ).toBe(true);
     const hours = { start: '08:00', end: '22:00', timeZone: 'UTC' };
     expect(describeActiveHours({ ...hours, days: [0, 1, 2, 3, 4, 5, 6] })).toBe(
       '08:00–22:00, every day (UTC)',
@@ -8742,7 +8747,12 @@ describe('useAutomations', () => {
           epoch: 0,
           enabled: props.enabled,
         }),
-      { initialProps: { enabled: false, agentId: 'agent-main' as string | null } },
+      {
+        initialProps: {
+          enabled: false,
+          agentId: 'agent-main' as string | null,
+        },
+      },
     );
     rerender({ enabled: true, agentId: null });
     expect(daemon.listAutomations).not.toHaveBeenCalled();
@@ -8974,7 +8984,9 @@ function onDay(
   clock: { hour: number; minute: number },
 ): number {
   const today = wallClock(options.nowMs, options.timeZone);
-  const date = new Date(Date.UTC(today.year, today.month - 1, today.day + days));
+  const date = new Date(
+    Date.UTC(today.year, today.month - 1, today.day + days),
+  );
   return zonedTimeToUtc(
     date.getUTCFullYear(),
     date.getUTCMonth() + 1,
@@ -9122,7 +9134,9 @@ export function describeTrigger(trigger: AutomationTrigger): string {
     case 'interval': {
       const ms = trigger.intervalMs;
       if (ms % 86_400_000 === 0)
-        return ms === 86_400_000 ? 'every day' : `every ${ms / 86_400_000} days`;
+        return ms === 86_400_000
+          ? 'every day'
+          : `every ${ms / 86_400_000} days`;
       if (ms % 3_600_000 === 0)
         return ms === 3_600_000
           ? 'every hour'
@@ -9458,7 +9472,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DaemonHttpError } from '@animaOS-SWARM/sdk';
 
 import type { AutomationsView } from '../hooks/useAutomations';
-import { AGENT_CREATED_NOTE, PHRASE_NOT_UNDERSTOOD, localTimeZone } from '../lib/automations';
+import {
+  AGENT_CREATED_NOTE,
+  PHRASE_NOT_UNDERSTOOD,
+  localTimeZone,
+} from '../lib/automations';
 import { daemon } from '../lib/daemon-api';
 import { automationFixture, automationRunFixture } from '../test/automations';
 import { AutomationsPage } from './AutomationsPage';
@@ -9507,7 +9525,11 @@ const agentMade = automationFixture('schedule-1', {
     days: [1, 2, 3, 4, 5],
     timeZone: 'UTC',
   },
-  lastOutcome: { status: 'error', occurredAtMs: 5, errorCode: 'schedule_run_failed' },
+  lastOutcome: {
+    status: 'error',
+    occurredAtMs: 5,
+    errorCode: 'schedule_run_failed',
+  },
   lastFiredAtMs: 5,
   counters: { runs: 3, failures: 2, consecutiveFailures: 2 },
   createdBy: {
@@ -9541,7 +9563,9 @@ describe('AutomationsPage', () => {
 
     const row = screen.getByRole('article', { name: '<b>Stretch</b>' });
     expect(within(row).getByText('<b>Stretch</b>')).toBeInTheDocument();
-    expect(within(row).getByText('**Remind** me to stretch')).toBeInTheDocument();
+    expect(
+      within(row).getByText('**Remind** me to stretch'),
+    ).toBeInTheDocument();
     expect(
       within(row).getByText('every 30 min · 08:00–22:00, weekdays (UTC)'),
     ).toBeInTheDocument();
@@ -9550,7 +9574,9 @@ describe('AutomationsPage', () => {
     expect(within(row).getByText(AGENT_CREATED_NOTE)).toBeInTheDocument();
     const paused = screen.getByRole('article', { name: 'Heartbeat' });
     expect(within(paused).getAllByText('Paused').length).toBeGreaterThan(0);
-    expect(screen.getByRole('button', { name: 'Add heartbeat' })).toBeDisabled();
+    expect(
+      screen.getByRole('button', { name: 'Add heartbeat' }),
+    ).toBeDisabled();
     expect(document.querySelector('.automations-page strong')).toBeNull();
   });
 
@@ -9576,7 +9602,9 @@ describe('AutomationsPage', () => {
 
     await user.click(within(row).getByRole('button', { name: 'Delete' }));
     expect(view.remove).not.toHaveBeenCalled();
-    await user.click(within(row).getByRole('button', { name: 'Confirm delete' }));
+    await user.click(
+      within(row).getByRole('button', { name: 'Confirm delete' }),
+    );
     expect(view.remove).toHaveBeenCalledWith(agentMade);
   });
 
@@ -9584,14 +9612,21 @@ describe('AutomationsPage', () => {
     const user = userEvent.setup();
     const preview = vi
       .mocked(daemon.previewAutomation)
-      .mockResolvedValue([Date.UTC(2026, 0, 5, 10), Date.UTC(2026, 0, 5, 12), Date.UTC(2026, 0, 5, 14)]);
+      .mockResolvedValue([
+        Date.UTC(2026, 0, 5, 10),
+        Date.UTC(2026, 0, 5, 12),
+        Date.UTC(2026, 0, 5, 14),
+      ]);
     const view = fakeView();
     renderPage(view);
 
     await user.click(screen.getByRole('button', { name: 'New automation' }));
     const form = screen.getByRole('form', { name: 'New automation' });
     await user.type(within(form).getByLabelText('Name'), 'Stretch');
-    await user.type(within(form).getByLabelText('Prompt'), 'Remind me to stretch');
+    await user.type(
+      within(form).getByLabelText('Prompt'),
+      'Remind me to stretch',
+    );
     await user.type(within(form).getByLabelText('When'), 'every 2 hours');
 
     const runs = await within(form).findByRole('region', { name: 'Next runs' });
@@ -9600,7 +9635,9 @@ describe('AutomationsPage', () => {
       { trigger: { type: 'interval', intervalMs: 7_200_000 } },
       { signal: expect.any(AbortSignal) },
     );
-    await user.click(within(form).getByRole('button', { name: 'Create automation' }));
+    await user.click(
+      within(form).getByRole('button', { name: 'Create automation' }),
+    );
 
     expect(view.create).toHaveBeenCalledWith({
       prompt: 'Remind me to stretch',
@@ -9630,7 +9667,10 @@ describe('AutomationsPage', () => {
       new DaemonHttpError(400, { error: 'minute: must be from 0 to 59' }),
     );
     await user.click(within(form).getByLabelText('Use a cron expression'));
-    await user.type(within(form).getByLabelText('Cron expression'), '61 * * * *');
+    await user.type(
+      within(form).getByLabelText('Cron expression'),
+      '61 * * * *',
+    );
 
     expect(
       await within(form).findByText('minute: must be from 0 to 59'),
@@ -9648,7 +9688,9 @@ describe('AutomationsPage', () => {
     await user.click(within(form).getByLabelText('Only run between'));
     await user.click(within(form).getByLabelText('Sun'));
     await user.click(within(form).getByLabelText('Sat'));
-    await user.click(within(form).getByRole('button', { name: 'Create automation' }));
+    await user.click(
+      within(form).getByRole('button', { name: 'Create automation' }),
+    );
 
     expect(view.create).toHaveBeenCalledWith({
       prompt: 'Check',
@@ -9678,7 +9720,9 @@ describe('AutomationsPage', () => {
     await user.clear(prompt);
     await user.type(prompt, 'Stand up');
     await user.click(within(form).getByLabelText('Only run between'));
-    await user.click(within(form).getByRole('button', { name: 'Save changes' }));
+    await user.click(
+      within(form).getByRole('button', { name: 'Save changes' }),
+    );
 
     expect(view.update).toHaveBeenCalledWith(agentMade, {
       name: '<b>Stretch</b>',
@@ -9724,14 +9768,19 @@ describe('AutomationsPage', () => {
       'schedule-1',
       { signal: expect.any(AbortSignal) },
     );
-    await user.click(within(drawer).getByRole('button', { name: 'Close history' }));
+    await user.click(
+      within(drawer).getByRole('button', { name: 'Close history' }),
+    );
     expect(screen.queryByRole('complementary')).toBeNull();
   });
 
   it('opens the editor of a focused automation', () => {
-    const { onFocusHandled } = renderPage(fakeView({ automations: [agentMade] }), {
-      focusId: 'schedule-1',
-    });
+    const { onFocusHandled } = renderPage(
+      fakeView({ automations: [agentMade] }),
+      {
+        focusId: 'schedule-1',
+      },
+    );
     expect(
       screen.getByRole('form', { name: 'Edit <b>Stretch</b>' }),
     ).toBeInTheDocument();
@@ -9842,7 +9891,10 @@ export function AutomationEditor({
     ? { start, end, days: [...days].sort((a, b) => a - b), timeZone }
     : null;
   const shown = trigger ?? (cronMode ? null : (automation?.trigger ?? null));
-  const previewKey = JSON.stringify([phraseProblem ? null : shown, activeHours]);
+  const previewKey = JSON.stringify([
+    phraseProblem ? null : shown,
+    activeHours,
+  ]);
 
   useEffect(() => {
     const [previewed, hours] = JSON.parse(previewKey) as [
@@ -10049,7 +10101,11 @@ export function AutomationEditor({
         </select>
       </label>
       <div className="automation-actions">
-        <button type="submit" className="studio-tool-button" disabled={!canSave}>
+        <button
+          type="submit"
+          className="studio-tool-button"
+          disabled={!canSave}
+        >
           {automation ? 'Save changes' : 'Create automation'}
         </button>
         <button type="button" className="studio-tool-button" onClick={onCancel}>
@@ -10210,9 +10266,9 @@ export function AutomationsPage({
   onFocusHandled,
   onOpenSession,
 }: AutomationsPageProps) {
-  const [editing, setEditing] = useState<{ automation: Automation | null } | null>(
-    null,
-  );
+  const [editing, setEditing] = useState<{
+    automation: Automation | null;
+  } | null>(null);
   const [historyId, setHistoryId] = useState<string | null>(null);
   const [confirming, setConfirming] = useState<string | null>(null);
 
@@ -10627,117 +10683,117 @@ Recommended implementer tier: standard (complete components; the tests fix the c
 Add to `apps/web/src/components/sessions/RunActivity.test.tsx` (import `automationFixture` from `../../test/automations` and `automationNoticeFor` from `../../lib/automations`), inside `describe('ToolBlock', …)`:
 
 ```tsx
-  it('shows a notice card with Undo for a created automation, even collapsed', async () => {
-    const user = userEvent.setup();
-    const made = automationFixture('schedule-1', {
-      name: 'Stretch',
-      createdBy: {
-        kind: 'agent',
-        agentId: 'agent-main',
-        sessionId: 'chat:1',
-        runId: 'run_1',
-        toolCallId: 'call-automation',
-      },
-    });
-    const undo = vi.fn().mockResolvedValue(false);
-    render(
-      <ToolBlock
-        steps={[
-          step,
-          { ...step, name: 'create_automation', toolCallId: 'call-automation' },
-        ]}
-        active={false}
-        actions={{
-          automationNotice: (candidate) => automationNoticeFor(candidate, [made]),
-          onUndoAutomation: undo,
-        }}
-      />,
-    );
-
-    const card = screen.getByRole('note', { name: 'Automation Stretch' });
-    expect(within(card).getByText(/every 30 min/)).toBeVisible();
-    await user.click(within(card).getByRole('button', { name: 'Undo' }));
-    expect(undo).toHaveBeenCalledWith(made);
-    // A refused Undo can be tried again.
-    expect(
-      await within(card).findByRole('button', { name: 'Undo' }),
-    ).toBeEnabled();
-    expect(screen.getAllByRole('note')).toHaveLength(1);
+it('shows a notice card with Undo for a created automation, even collapsed', async () => {
+  const user = userEvent.setup();
+  const made = automationFixture('schedule-1', {
+    name: 'Stretch',
+    createdBy: {
+      kind: 'agent',
+      agentId: 'agent-main',
+      sessionId: 'chat:1',
+      runId: 'run_1',
+      toolCallId: 'call-automation',
+    },
   });
+  const undo = vi.fn().mockResolvedValue(false);
+  render(
+    <ToolBlock
+      steps={[
+        step,
+        { ...step, name: 'create_automation', toolCallId: 'call-automation' },
+      ]}
+      active={false}
+      actions={{
+        automationNotice: (candidate) => automationNoticeFor(candidate, [made]),
+        onUndoAutomation: undo,
+      }}
+    />,
+  );
+
+  const card = screen.getByRole('note', { name: 'Automation Stretch' });
+  expect(within(card).getByText(/every 30 min/)).toBeVisible();
+  await user.click(within(card).getByRole('button', { name: 'Undo' }));
+  expect(undo).toHaveBeenCalledWith(made);
+  // A refused Undo can be tried again.
+  expect(
+    await within(card).findByRole('button', { name: 'Undo' }),
+  ).toBeEnabled();
+  expect(screen.getAllByRole('note')).toHaveLength(1);
+});
 ```
 
 Add to `apps/web/src/hooks/useTranscriptActions.test.tsx` (import `automationFixture` from `../test/automations`), inside `describe('useTranscriptActions', …)`:
 
 ```tsx
-  it('finds the automation a tool call made and undoes it', async () => {
-    const made = automationFixture('schedule-1', {
-      createdBy: {
-        kind: 'agent',
-        agentId: 'agent-main',
-        sessionId: 'room-7',
-        runId: 'run_7',
-        toolCallId: 'call_a',
-      },
-    });
-    const undoAutomation = vi.fn().mockResolvedValue(true);
-    const { result } = actionsFor({ automations: [made], undoAutomation });
-    const created: ToolStep = {
-      ...helperStep(null),
-      name: 'create_automation',
+it('finds the automation a tool call made and undoes it', async () => {
+  const made = automationFixture('schedule-1', {
+    createdBy: {
+      kind: 'agent',
+      agentId: 'agent-main',
+      sessionId: 'room-7',
+      runId: 'run_7',
       toolCallId: 'call_a',
-      status: 'success',
-      helper: null,
-    };
-
-    expect(result.current.automationNotice?.(created)).toBe(made);
-    await act(async () => {
-      expect(await result.current.onUndoAutomation?.(made)).toBe(true);
-    });
-    expect(undoAutomation).toHaveBeenCalledWith(made);
-    expect(actionsFor({}).result.current.onUndoAutomation).toBeUndefined();
+    },
   });
+  const undoAutomation = vi.fn().mockResolvedValue(true);
+  const { result } = actionsFor({ automations: [made], undoAutomation });
+  const created: ToolStep = {
+    ...helperStep(null),
+    name: 'create_automation',
+    toolCallId: 'call_a',
+    status: 'success',
+    helper: null,
+  };
+
+  expect(result.current.automationNotice?.(created)).toBe(made);
+  await act(async () => {
+    expect(await result.current.onUndoAutomation?.(made)).toBe(true);
+  });
+  expect(undoAutomation).toHaveBeenCalledWith(made);
+  expect(actionsFor({}).result.current.onUndoAutomation).toBeUndefined();
+});
 ```
 
 Add to `apps/web/src/components/sessions/SessionView.test.tsx` (import `automationFixture` from `../../test/automations`):
 
 ```tsx
-  it('names a check-in’s schedule and opens its automation', async () => {
-    const user = userEvent.setup();
-    const automation = automationFixture('daily');
-    const props = renderView({
-      session: sessionFixture('schedule:daily', {
-        kind: 'checkin',
-        origin: 'schedule',
-        title: 'Check-in · goals',
-      }),
-      automation,
-      onEditAutomation: vi.fn(),
-    });
-
-    expect(screen.getByText('Check-in · every 30 min')).toBeVisible();
-    await user.click(screen.getByRole('button', { name: 'Edit automation' }));
-    expect(props.onEditAutomation).toHaveBeenCalledWith(automation);
+it('names a check-in’s schedule and opens its automation', async () => {
+  const user = userEvent.setup();
+  const automation = automationFixture('daily');
+  const props = renderView({
+    session: sessionFixture('schedule:daily', {
+      kind: 'checkin',
+      origin: 'schedule',
+      title: 'Check-in · goals',
+    }),
+    automation,
+    onEditAutomation: vi.fn(),
   });
+
+  expect(screen.getByText('Check-in · every 30 min')).toBeVisible();
+  await user.click(screen.getByRole('button', { name: 'Edit automation' }));
+  expect(props.onEditAutomation).toHaveBeenCalledWith(automation);
+});
 ```
 
 In `apps/web/src/components/WorkspaceShell.test.tsx`, change `shows the conversation for pages that arrive in later releases` to use `{ kind: 'page', page: 'memory' }`, and add after `names the destination plainly when nothing waits`:
 
 ```tsx
-  it('opens Automations from the navigation', async () => {
-    const user = userEvent.setup();
-    render(<Shell automations={<div>Automations page</div>} />);
-    const nav = screen.getByRole('navigation', {
-      name: 'Workspace navigation',
-    });
-
-    await user.click(within(nav).getByRole('button', { name: 'Automations' }));
-
-    expect(screen.getByText('Automations page')).toBeVisible();
-    expect(screen.getByText('Workspace canvas')).not.toBeVisible();
-    expect(
-      within(nav).getByRole('button', { name: 'Automations' }),
-    ).toHaveAttribute('aria-current', 'page');
+it('opens Automations from the navigation', async () => {
+  const user = userEvent.setup();
+  render(<Shell automations={<div>Automations page</div>} />);
+  const nav = screen.getByRole('navigation', {
+    name: 'Workspace navigation',
   });
+
+  await user.click(within(nav).getByRole('button', { name: 'Automations' }));
+
+  expect(screen.getByText('Automations page')).toBeVisible();
+  expect(screen.getByText('Workspace canvas')).not.toBeVisible();
+  expect(
+    within(nav).getByRole('button', { name: 'Automations' }),
+  ).toHaveAttribute('aria-current', 'page');
+});
 ```
 
 If another assertion in that file lists the destinations in order, add `Automations` after `Approvals`.
@@ -10848,26 +10904,28 @@ export function AutomationNoticeCard({
 In `apps/web/src/components/sessions/RunActivity.tsx`, add `import { AutomationNoticeCard } from './AutomationNoticeCard';` and `import type { Automation } from '@animaOS-SWARM/sdk';`, and in `ToolBlock`, after `const keys = stepKeys(steps);`:
 
 ```tsx
-  // Spec §15.2: an automation the companion created stays visible with
-  // Undo, even when the block is collapsed.
-  const notices: Automation[] = [];
-  for (const candidate of steps) {
-    const automation = actions?.automationNotice?.(candidate) ?? null;
-    if (automation && !notices.some((known) => known.id === automation.id))
-      notices.push(automation);
-  }
+// Spec §15.2: an automation the companion created stays visible with
+// Undo, even when the block is collapsed.
+const notices: Automation[] = [];
+for (const candidate of steps) {
+  const automation = actions?.automationNotice?.(candidate) ?? null;
+  if (automation && !notices.some((known) => known.id === automation.id))
+    notices.push(automation);
+}
 ```
 
 and as the last child of the `tool-block` `div` (after the `expanded && count > 0` list):
 
 ```tsx
-      {notices.map((automation) => (
-        <AutomationNoticeCard
-          key={automation.id}
-          automation={automation}
-          onUndo={actions?.onUndoAutomation}
-        />
-      ))}
+{
+  notices.map((automation) => (
+    <AutomationNoticeCard
+      key={automation.id}
+      automation={automation}
+      onUndo={actions?.onUndoAutomation}
+    />
+  ));
+}
 ```
 
 In `apps/web/src/hooks/useTranscriptActions.ts`:
@@ -10895,7 +10953,7 @@ In `apps/web/src/hooks/useTranscriptActions.ts`:
         : {}),
 ```
 
-   and add `automations` and `undoAutomation !== undefined` (as a boolean `canUndo` computed above the memo) to its dependency list.
+and add `automations` and `undoAutomation !== undefined` (as a boolean `canUndo` computed above the memo) to its dependency list.
 
 Append to `apps/web/src/automations.css`:
 
@@ -10938,24 +10996,26 @@ In `apps/web/src/components/sessions/SessionView.tsx`:
 3. Pass `automation` and `onEditAutomation` from `SessionView` (destructure with defaults `automation = null`) to `SessionHeader`, add both to its props type, render the badge as:
 
 ```tsx
-      <span className="session-kind-badge">
-        {SESSION_KIND_LABELS[session.kind]}
-        {automation ? ` · ${describeTrigger(automation.trigger)}` : ''}
-      </span>
+<span className="session-kind-badge">
+  {SESSION_KIND_LABELS[session.kind]}
+  {automation ? ` · ${describeTrigger(automation.trigger)}` : ''}
+</span>
 ```
 
-   and, after the Export button:
+and, after the Export button:
 
 ```tsx
-      {automation && onEditAutomation && (
-        <button
-          type="button"
-          className={ghostBtnCls}
-          onClick={() => onEditAutomation(automation)}
-        >
-          Edit automation
-        </button>
-      )}
+{
+  automation && onEditAutomation && (
+    <button
+      type="button"
+      className={ghostBtnCls}
+      onClick={() => onEditAutomation(automation)}
+    >
+      Edit automation
+    </button>
+  );
+}
 ```
 
 In `apps/web/src/components/icons.tsx`, after `PulseIcon`:
@@ -10974,7 +11034,7 @@ export const ClockIcon = (p: IconProps) =>
 In `apps/web/src/components/WorkspaceShell.tsx`:
 
 1. Add `'automations',` after `'approvals',` in `AVAILABLE_PAGES`, import `ClockIcon`, and add `{ page: 'automations', label: 'Automations', icon: <ClockIcon size={16} /> },` after the Approvals entry of `PRIMARY_DESTINATIONS`.
-2. Add the prop (destructured `automations = null`, typed `/** The Automations page, shown at \`#/automations\`. */ automations?: ReactNode | null;`) after `approvals`, and in the page switch, after the `approvals` branch:
+2. Add the prop (destructured `automations = null`, typed `/** The Automations page, shown at \`#/automations\`. \*/ automations?: ReactNode | null;`) after `approvals`, and in the page switch, after the `approvals` branch:
 
 ```text
               ) : page === 'automations' ? (
@@ -10989,18 +11049,17 @@ In `apps/web/src/ViewHarness.tsx` (wiring lines only):
 2. After the `useSkillCommands` call:
 
 ```tsx
-  const automations = useAutomations({
-    agentId,
-    version: live.state.automationsVersion,
-    epoch: live.state.epoch,
-    enabled: connection === 'online',
-  });
-  const [automationFocus, setAutomationFocus] = useState<string | null>(null);
-  const clearAutomationFocus = useCallback(() => setAutomationFocus(null), []);
+const automations = useAutomations({
+  agentId,
+  version: live.state.automationsVersion,
+  epoch: live.state.epoch,
+  enabled: connection === 'online',
+});
+const [automationFocus, setAutomationFocus] = useState<string | null>(null);
+const clearAutomationFocus = useCallback(() => setAutomationFocus(null), []);
 ```
 
-   (`useCallback` and `useState` are already imported; add them to the React import if not.)
-3. In the `useTranscriptActions({ … })` options, after `companionId: agentId,`:
+(`useCallback` and `useState` are already imported; add them to the React import if not.) 3. In the `useTranscriptActions({ … })` options, after `companionId: agentId,`:
 
 ```text
     automations: automations.automations,
@@ -11010,14 +11069,16 @@ In `apps/web/src/ViewHarness.tsx` (wiring lines only):
 4. Before `const sessionView = (`:
 
 ```tsx
-  const checkinId =
-    viewedSession?.kind === 'checkin' ? checkinScheduleId(viewedSession.id) : null;
-  const checkinAutomation = checkinId
-    ? (automations.automations.find((item) => item.id === checkinId) ?? null)
+const checkinId =
+  viewedSession?.kind === 'checkin'
+    ? checkinScheduleId(viewedSession.id)
     : null;
+const checkinAutomation = checkinId
+  ? (automations.automations.find((item) => item.id === checkinId) ?? null)
+  : null;
 ```
 
-   and to `<SessionView … />`, after `actions={transcriptActions}`:
+and to `<SessionView … />`, after `actions={transcriptActions}`:
 
 ```text
       automation={checkinAutomation}
@@ -11128,7 +11189,7 @@ with the following only if every gate command passed (fill in the Nx test count 
 | M6 Automations | `2026-09-23-companion-console-m6.md` | done (Nx rust-daemon:test <count> passed; sdk + web test, typecheck, build green at <sha>) |
 ```
 
-If the Rust gate ran only through the fallback, use `implemented — Nx gate pending (disk)` as the status. Also change the master plan's Global Constraints sentence `Only new third-party dependency allowed: \`croner\` (cron parsing) in \`hosts/rust-daemon\`.` to `No new third-party dependency: M6 implements 5-field cron in-house on the existing \`chrono\` and \`chrono-tz\`.` and drop `croner` from its Tech Stack line. Then run `bun x nx format:write --files=docs/superpowers/plans/2026-09-23-companion-console.md` (it realigns the table). The controller commits this file:
+If the Rust gate ran only through the fallback, use `implemented — Nx gate pending (disk)` as the status. Also change the master plan's Global Constraints sentence `Only new third-party dependency allowed: \`croner\` (cron parsing) in \`hosts/rust-daemon\`.`to`No new third-party dependency: M6 implements 5-field cron in-house on the existing \`chrono\` and \`chrono-tz\`.`and drop`croner`from its Tech Stack line. Then run`bun x nx format:write --files=docs/superpowers/plans/2026-09-23-companion-console.md` (it realigns the table). The controller commits this file:
 
 ```bash
 git add docs/superpowers/plans/2026-09-23-companion-console.md
@@ -11183,3 +11244,25 @@ Recommended implementer tier: the controller runs this task.
 - The deliberate deviations: silent check-in pruning against spec §13.2's letter (Task 4) and the list route's new authorization (Task 7); check no other test or client relies on the old behavior (the CLI and TUI do not call the schedule routes).
 - History (Tasks 4, 7): the outbox drops a deleted agent's fires in `unmirrored_schedule_fires` before writing; the memory store's 100,000-row cap applies to fires too; the Postgres methods are untested here (`#[ignore]`).
 - Web (Tasks 10–12): the editor's preview is asynchronous (the page tests default it to a promise that never settles and await it where they read it); the harness's top-level `listAutomations` mock and the empty-reload bail-out keep the existing suite quiet; two harness tests change (`#/automations` no longer shows the chat).
+
+## Controller rulings (binding; no separate pre-flight audit, to save cost)
+
+The controller ruled on the plan writer's risk list directly. The per-task reviews check the code.
+
+1. **Pruning silent check-ins (spec §13.2 deviation):** accepted. Silent check-in pairs are pruned from the hot tail once mirrored and older than 24 hours. Without this, heartbeats would grow the snapshot forever.
+2. **`create_automation` default:** it stays in the write class and is allowed by default. The mitigations are the notice card with Undo, the creator shown on the page, the 20-per-agent limit, the 5-minute minimum, hidden-text refusal, and README advice to set `write: ask`. No per-tool default is added to the M4 policy model.
+3. **Outcome commit and rollback:** the Task 6 implementer and reviewer must show, with tests, that a failed save restores exactly the previous counters and fire records, including during restart reconciliation.
+4. **Lock order for Run now:** taking the scheduler's `jobs` mutex before the control-plane transaction is accepted only if nothing ever takes `jobs` while holding the transaction. Task 6 adds a comment saying so, and its reviewer greps for it.
+5. **Cron cost:**
+   - Task 1 bounds the next-fire search, so a pathological expression or window can't stall the scheduler.
+   - Task 2 bounds the work for an active-hours window that never matches.
+   - Any expression that can't fire within the bound is refused when it's created.
+   - Both bounds are tested.
+6. **Behavior changes for existing clients:** accepted. Owner auth on the schedule list, history rows deleted with their agent, and counter updates in reconciliation tests.
+7. **Web tests:** the preview stub that never settles is accepted. The two harness tests change for `#/automations`.
+8. **Postgres:** the store methods stay `#[ignore]`; hand-check the SQL against the migration.
+9. **Lessons from M4 and M5 apply to every task:**
+   - Owner mutations run their transaction/save/undo body in `tokio::spawn`.
+   - No test depends on wall-clock races.
+   - Model-written text (automation names and prompts from the companion's tool) is refused for hidden Unicode with the M5 rule.
+   - Every owner-facing string is a named constant, tested once.
