@@ -350,13 +350,11 @@ describe('SkillsPage', () => {
           ]
         : [],
     );
-    const save = vi
-      .spyOn(daemon, 'saveSkill')
-      .mockRejectedValue(
-        new DaemonHttpError(409, {
-          error: 'The daemon words this its own way',
-        }),
-      );
+    const save = vi.spyOn(daemon, 'saveSkill').mockRejectedValue(
+      new DaemonHttpError(409, {
+        error: 'The daemon words this its own way',
+      }),
+    );
     renderPage();
     await screen.findByRole('region', { name: 'Skills' });
 
