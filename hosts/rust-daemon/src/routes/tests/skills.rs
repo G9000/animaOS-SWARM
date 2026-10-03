@@ -473,6 +473,10 @@ async fn drafts_are_listed_approved_and_rejected_through_the_routes() {
         json_body(invalid).await["error"],
         crate::routes::approvals::STATUS_INVALID
     );
+    let malformed = send(&app, "GET", "/api/skill-drafts?status=%ZZ", None).await;
+    assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(malformed.headers()["cache-control"], "no-store");
+    assert_eq!(json_body(malformed).await["error"], "malformed query");
     assert_eq!(
         send(&app, "POST", "/api/skill-drafts/skd_missing/reject", None)
             .await

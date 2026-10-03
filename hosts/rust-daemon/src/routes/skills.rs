@@ -316,11 +316,11 @@ pub(super) async fn list_skill_drafts(State(state): State<AppState>, request: Re
     if let Err(response) = authorize(&state, &request, true) {
         return response;
     }
-    let decided = match request_query(request.uri())
-        .ok()
-        .and_then(|params| params.get("status").cloned())
-        .as_deref()
-    {
+    let params = match request_query(request.uri()) {
+        Ok(params) => params,
+        Err(()) => return rejected(ApiError::bad_request_static("malformed query")),
+    };
+    let decided = match params.get("status").map(String::as_str) {
         None | Some("") | Some("pending") => false,
         Some("decided") => true,
         Some(_) => return rejected(ApiError::bad_request_static(STATUS_INVALID)),

@@ -179,17 +179,30 @@ impl Searcher {
     }
 }
 
+/// An RFC 7230 token: one or more visible ASCII characters, none a separator.
+fn is_token(text: &str) -> bool {
+    !text.is_empty()
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && !b"()<>@,;:\\\"/[]?={}".contains(&byte))
+}
+
 /// `name` and `filename` from a part's headers; the part must be
-/// `Content-Disposition: form-data` with a `name`.
+/// `Content-Disposition: form-data` with a non-empty `name`. Folded header
+/// lines, a second `Content-Disposition`, and a repeated `name` or `filename`
+/// are refused, so no parser can read the part differently.
 fn disposition(headers: &str) -> Option<(String, Option<String>)> {
     let mut value = None;
     for line in headers.split("\r\n") {
-        if line.contains(['\r', '\n']) {
+        if line.contains(['\r', '\n']) || line.starts_with([' ', '\t']) {
             return None;
         }
         let (key, rest) = line.split_once(':')?;
-        if value.is_none() && key.trim().eq_ignore_ascii_case("content-disposition") {
-            value = Some(rest);
+        if !is_token(key) {
+            return None;
+        }
+        if key.eq_ignore_ascii_case("content-disposition") && value.replace(rest).is_some() {
+            return None;
         }
     }
     let mut segments = split_params(value?)?.into_iter();
@@ -203,13 +216,16 @@ fn disposition(headers: &str) -> Option<(String, Option<String>)> {
         }
         let (key, raw) = segment.split_once('=')?;
         let value = param_value(raw)?;
-        match key.trim().to_ascii_lowercase().as_str() {
-            "name" => name = Some(value),
-            "filename" => filename = Some(value),
-            _ => {}
+        let slot = match key.trim().to_ascii_lowercase().as_str() {
+            "name" => &mut name,
+            "filename" => &mut filename,
+            _ => continue,
+        };
+        if slot.replace(value).is_some() {
+            return None;
         }
     }
-    Some((name?, filename))
+    Some((name.filter(|name: &String| !name.is_empty())?, filename))
 }
 
 /// Every part of a form, in order, within [`FormLimits::SMALL`].
@@ -286,6 +302,11 @@ pub(crate) fn parse_form_with(
             // A real delimiter ends its line or closes the form; text such
             // as `\r\n--boundary-extra` inside the part is content.
             let after = &body[end..];
+            // Transport padding after a delimiter is refused, as it is after
+            // the first one.
+            if after.starts_with(b" ") || after.starts_with(b"\t") {
+                return Err(FORM_MALFORMED);
+            }
             if after.starts_with(b"\r\n") || after.starts_with(b"--") {
                 position = end;
                 break end - closing.needle.len();
@@ -432,6 +453,22 @@ mod tests {
             // A header line with a bare carriage return.
             "--b\r\nContent-Disposition: form-data; name=\"f\"\r\nX: a\rb\r\n\r\nx\r\n--b--\r\n"
                 .to_string(),
+            // A folded header line cannot smuggle in a Content-Disposition.
+            "--b\r\nX-Foo: bar\r\n Content-Disposition: form-data; name=\"evil\"\r\n\r\nx\r\n--b--\r\n".to_string(),
+            "--b\r\nContent-Disposition: form-data; name=\"x\"\r\n ; filename=\"a:b\"\r\n\r\nx\r\n--b--\r\n".to_string(),
+            // A header name with whitespace, or none.
+            "--b\r\nX Foo: a\r\nContent-Disposition: form-data; name=\"f\"\r\n\r\nx\r\n--b--\r\n".to_string(),
+            "--b\r\n: a\r\nContent-Disposition: form-data; name=\"f\"\r\n\r\nx\r\n--b--\r\n".to_string(),
+            // Two dispositions, or a repeated name or filename.
+            "--b\r\nContent-Disposition: form-data; name=\"a\"\r\nContent-Disposition: form-data; name=\"b\"\r\n\r\nx\r\n--b--\r\n".to_string(),
+            "--b\r\nContent-Disposition: form-data; name=\"a\"; name=\"file\"\r\n\r\nx\r\n--b--\r\n".to_string(),
+            "--b\r\nContent-Disposition: form-data; name=\"a\"; filename=\"1\"; filename=\"2\"\r\n\r\nx\r\n--b--\r\n".to_string(),
+            // An empty name.
+            "--b\r\nContent-Disposition: form-data; name=\"\"\r\n\r\nx\r\n--b--\r\n".to_string(),
+            "--b\r\nContent-Disposition: form-data; name=\r\n\r\nx\r\n--b--\r\n".to_string(),
+            // Transport padding after a later delimiter.
+            "--b\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nv\r\n--b \r\nContent-Disposition: form-data; name=\"c\"\r\n\r\nw\r\n--b--".to_string(),
+            "--b\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nv\r\n--b\t\r\nContent-Disposition: form-data; name=\"c\"\r\n\r\nw\r\n--b--".to_string(),
             // Not form-data.
             "--b\r\nContent-Disposition: attachment; name=\"f\"\r\n\r\nx\r\n--b--\r\n".to_string(),
         ] {
