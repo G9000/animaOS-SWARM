@@ -38,7 +38,7 @@
 | M2 Sessions                | `2026-09-23-companion-console-m2.md` | done (Nx rust-daemon:test 1,287 passed; sdk + web test, typecheck, build green at 5b020c4) |
 | M3 Live runs               | `2026-09-23-companion-console-m3.md` | done (Nx rust-daemon:test 1,564 passed; sdk + web test, typecheck, build green at 6737da3) |
 | M4 Approvals               | `2026-09-23-companion-console-m4.md` | done (Nx rust-daemon:test 1654 passed; sdk + web test, typecheck, build green at 20c6221)  |
-| M5 Skills                  | (written before M5)                  | pending                                                                                    |
+| M5 Skills                  | `2026-09-23-companion-console-m5.md` | done (Nx rust-daemon:test 1775 passed; sdk + web test, typecheck, build green at e9d57f9)  |
 | M6 Automations             | (written before M6)                  | pending                                                                                    |
 | M7 Memory                  | (written before M7)                  | pending                                                                                    |
 | M8 Usage, logs, health     | (written before M8)                  | pending                                                                                    |

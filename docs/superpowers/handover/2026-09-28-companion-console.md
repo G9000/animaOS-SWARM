@@ -2,6 +2,19 @@
 
 This document is for the next agent picking up the companion console upgrade. Read it first; it tells you where everything is and what to do next.
 
+## Update 2026-10-03: M5 done, PR open
+
+- **M5 (Skills) is complete** on `feat/companion-console`, and a PR to `main` is open.
+- **Work done:** all 13 tasks, then the final review (daemon and web+SDK reviewers) and one fix wave (`2060912` web, `0b08b2b` daemon).
+- **Gates at `e9d57f9`, all green:**
+  - `rust-daemon:test`: 1,775 passed, 7 ignored.
+  - SDK and web test, typecheck and build (web 807 tests).
+  - `cargo fmt --check` and `nx format:check`.
+- **Merging:** only when the owner says "merge".
+- **Next:** M6 (automations), following the master plan. Write the plan, run a pre-flight audit, write the rulings, then execute.
+- **Ledger:** every M5 ruling is in `.superpowers/sdd/2026-09-23-companion-console-m5/progress.md`.
+- **Post-M5 follow-up:** skip a scan while the previous scan's blocking work is still running (hung-drive case).
+
 ## Update 2026-10-02 (latest): M5 in progress (Tasks 1–7 committed)
 
 - **Done:** the M5 audit rulings are committed in the plan (`be0029f`). Tasks 1–5 are implemented, reviewed and fixed. Tasks 6 (`5729eab`, skill routes) and 7 (`61c6123`, draft/import routes and the multipart reader) are committed but **not yet reviewed**.
