@@ -31,7 +31,8 @@ pub(crate) use automations::{
 };
 #[cfg(test)]
 pub(crate) use automations::{
-    HEARTBEAT_NEEDS_TIME_ZONE, MAX_AUTOMATIONS_PER_AGENT, TOO_MANY_AUTOMATIONS,
+    AGENT_AUTOMATION_TOO_FREQUENT, HEARTBEAT_NEEDS_TIME_ZONE, MAX_AUTOMATIONS_PER_AGENT,
+    TOO_MANY_AUTOMATIONS,
 };
 pub(crate) use history::{FireLog, ScheduleFireRecord};
 
@@ -912,6 +913,7 @@ async fn record_outcome(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn next_due_at_ms(
     trigger: &ScheduleTrigger,
     from_ms: u64,

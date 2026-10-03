@@ -28,8 +28,7 @@ pub(crate) struct ToolGrantSet {
     pub(crate) write_class: &'static [&'static str],
 }
 
-/// Grant sets in the order they shipped. M6 (`list_automations`,
-/// `create_automation`, `pause_automation`) appends its own.
+/// Grant sets in the order they shipped.
 pub(crate) const TOOL_GRANTS: &[ToolGrantSet] = &[
     ToolGrantSet {
         id: "m3-search-conversations",
@@ -40,6 +39,11 @@ pub(crate) const TOOL_GRANTS: &[ToolGrantSet] = &[
         id: "m5-skills",
         read_class: &["load_skill"],
         write_class: &["propose_skill"],
+    },
+    ToolGrantSet {
+        id: "m6-automations",
+        read_class: &["list_automations"],
+        write_class: &["create_automation", "pause_automation"],
     },
 ];
 
@@ -1268,7 +1272,12 @@ mod tests {
         };
         assert_eq!(
             names(&companion_id),
-            ["calculate", "search_conversations", "load_skill"]
+            [
+                "calculate",
+                "search_conversations",
+                "load_skill",
+                "list_automations"
+            ]
         );
         assert_eq!(
             names(&helper_id),
@@ -1304,7 +1313,12 @@ mod tests {
         };
         assert_eq!(
             names(&reader_id),
-            ["read_file", "search_conversations", "load_skill"]
+            [
+                "read_file",
+                "search_conversations",
+                "load_skill",
+                "list_automations"
+            ]
         );
         assert_eq!(
             names(&writer_id),
@@ -1312,10 +1326,14 @@ mod tests {
                 "write_file",
                 "search_conversations",
                 "load_skill",
-                "propose_skill"
+                "propose_skill",
+                "list_automations",
+                "create_automation",
+                "pause_automation"
             ]
         );
         assert!(state.tool_grants_applied.contains("m5-skills"));
+        assert!(state.tool_grants_applied.contains("m6-automations"));
     }
 
     #[test]

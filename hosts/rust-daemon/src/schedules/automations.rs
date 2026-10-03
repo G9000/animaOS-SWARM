@@ -439,7 +439,6 @@ impl AutomationService {
         Ok(records)
     }
 
-    #[allow(dead_code)] // M6 Task 8's tools call it.
     pub(crate) async fn get(
         &self,
         agent_id: &str,
@@ -455,6 +454,24 @@ impl AutomationService {
             .filter(|item| item.agent_id == agent_id)
             .cloned()
             .ok_or(ScheduleError::NotFound)
+    }
+
+    /// The agent's Telegram chat as a target: its active connector with an
+    /// approved chat (the first by id when there are several).
+    pub(crate) async fn telegram_target(&self, agent_id: &str) -> Option<ScheduleTarget> {
+        let state = self.state.read().await;
+        state
+            .connectors
+            .values()
+            .filter(|connector| {
+                connector.agent_id == agent_id
+                    && connector.is_active()
+                    && connector.approved_chat.is_some()
+            })
+            .min_by(|left, right| left.id.cmp(&right.id))
+            .map(|connector| ScheduleTarget::Connector {
+                connector_id: connector.id.clone(),
+            })
     }
 
     /// The automation's latest fires, newest first: the control plane's
@@ -697,7 +714,6 @@ impl AutomationService {
     }
 
     /// Turns an automation off; `(record, false)` when it already was.
-    #[allow(dead_code)] // M6 Task 8's tools call it.
     pub(crate) async fn pause(
         &self,
         agent_id: &str,

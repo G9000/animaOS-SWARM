@@ -302,6 +302,13 @@ fn registry_defines_every_registered_tool_schema() {
             &["name", "description", "body"][..],
             &["slug"][..],
         ),
+        (
+            "create_automation",
+            &["prompt", "schedule"][..],
+            &["name", "timeZone", "target", "activeHours"][..],
+        ),
+        ("list_automations", &[][..], &[][..]),
+        ("pause_automation", &["id"][..], &[][..]),
         ("read_file", &["file_path"][..], &["offset", "limit"][..]),
         ("list_dir", &["path"][..], &[][..]),
         ("glob", &["pattern"][..], &["path"][..]),

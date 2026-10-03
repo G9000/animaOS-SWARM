@@ -237,6 +237,7 @@ impl CronSchedule {
     /// so after a fire inside a repeated (fall-back) hour that hour's times
     /// do not fire again. `None` when none falls within `CRON_SEARCH_DAYS`
     /// days.
+    #[cfg(test)]
     pub(crate) fn next_after(&self, time_zone: Tz, after_ms: u64) -> Option<u64> {
         self.next_after_floor(time_zone, after_ms, after_ms)
     }
