@@ -99,6 +99,12 @@ export type AgentEvent =
       /** The skill that changed; null when a rescan found changes. */
       slug: string | null;
       draftId: string | null;
+    })
+  | (EventBase & {
+      type: 'automation.updated';
+      scheduleId: string;
+      /** The automation is gone. */
+      deleted: boolean;
     });
 
 const LIFECYCLE: ReadonlySet<string> = new Set<RunLifecycleEventType>([
@@ -133,6 +139,13 @@ export function isSkillEvent(
   event: AgentEvent,
 ): event is Extract<AgentEvent, { type: 'skill.updated' }> {
   return event.type === 'skill.updated';
+}
+
+/** An automation changed, fired, or finished (spec �6): read them again. */
+export function isAutomationEvent(
+  event: AgentEvent,
+): event is Extract<AgentEvent, { type: 'automation.updated' }> {
+  return event.type === 'automation.updated';
 }
 
 export class AgentEventsClient {

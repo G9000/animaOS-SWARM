@@ -10,6 +10,7 @@ import { SessionsClient } from './sessions.js';
 import { RunsClient } from './runs.js';
 import { ApprovalsClient } from './approvals.js';
 import { SkillsClient } from './skills.js';
+import { AutomationsClient } from './automations.js';
 import { AgentEventsClient } from './events.js';
 import type { DaemonCapabilities } from './capabilities.js';
 
@@ -79,6 +80,7 @@ export class DaemonClient {
   readonly events: AgentEventsClient;
   readonly approvals: ApprovalsClient;
   readonly skills: SkillsClient;
+  readonly automations: AutomationsClient;
 
   private readonly baseUrl: string;
   private readonly fetchImpl: FetchLike;
@@ -105,6 +107,7 @@ export class DaemonClient {
     this.events = new AgentEventsClient(this);
     this.approvals = new ApprovalsClient(this);
     this.skills = new SkillsClient(this);
+    this.automations = new AutomationsClient(this);
   }
 
   async health(): Promise<DaemonHealth> {

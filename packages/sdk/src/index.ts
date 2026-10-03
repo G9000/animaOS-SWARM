@@ -56,6 +56,7 @@ export type {
 export {
   AgentEventsClient,
   isApprovalEvent,
+  isAutomationEvent,
   isRunLifecycleEvent,
   isSkillEvent,
 } from './events.js';
@@ -111,6 +112,27 @@ export type {
   SkillInput,
   SkillStatus,
 } from './skills.js';
+export {
+  AUTOMATION_PREVIEW_RUNS,
+  AutomationsClient,
+  MAX_AUTOMATION_HISTORY,
+  MAX_AUTOMATION_NAME_CHARS,
+  MAX_AUTOMATIONS_PER_AGENT,
+} from './automations.js';
+export type {
+  ActiveHours,
+  Automation,
+  AutomationCounters,
+  AutomationCreator,
+  AutomationInput,
+  AutomationOutcome,
+  AutomationPatch,
+  AutomationRun,
+  AutomationRunOutcome,
+  AutomationTarget,
+  AutomationTrigger,
+  HeartbeatInput,
+} from './automations.js';
 export { ChatGptClient } from './chatgpt.js';
 export type { ChatGptLogin, ChatGptStatus } from './chatgpt.js';
 export type {
