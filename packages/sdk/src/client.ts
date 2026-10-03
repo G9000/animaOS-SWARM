@@ -9,6 +9,7 @@ import { SwarmsClient } from './swarms.js';
 import { SessionsClient } from './sessions.js';
 import { RunsClient } from './runs.js';
 import { ApprovalsClient } from './approvals.js';
+import { SkillsClient } from './skills.js';
 import { AgentEventsClient } from './events.js';
 import type { DaemonCapabilities } from './capabilities.js';
 
@@ -77,6 +78,7 @@ export class DaemonClient {
   readonly runs: RunsClient;
   readonly events: AgentEventsClient;
   readonly approvals: ApprovalsClient;
+  readonly skills: SkillsClient;
 
   private readonly baseUrl: string;
   private readonly fetchImpl: FetchLike;
@@ -102,6 +104,7 @@ export class DaemonClient {
     this.runs = new RunsClient(this);
     this.events = new AgentEventsClient(this);
     this.approvals = new ApprovalsClient(this);
+    this.skills = new SkillsClient(this);
   }
 
   async health(): Promise<DaemonHealth> {
