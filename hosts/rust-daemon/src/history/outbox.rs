@@ -1,5 +1,5 @@
-//! History outbox (spec §13.1): committed messages, terminal runs, and decided
-//! approvals reach the history store within about a second, in batches,
+//! History outbox (spec §13.1): committed messages, terminal runs, decided
+//! approvals, and automation fire records reach the history store within about a second, in batches,
 //! idempotently by id, with retries and backoff. Records stay in the control plane until mirrored, and
 //! saved state is what is mirrored: the outbox reads the control plane under the
 //! control-plane transaction. The exceptions are timeout and stop settlements
@@ -33,6 +33,8 @@ pub(crate) const HISTORY_FLUSH_BATCH: usize = 500;
 pub(crate) const HISTORY_RUN_BATCH: usize = 200;
 /// Decided approvals per store write.
 pub(crate) const HISTORY_APPROVAL_BATCH: usize = 200;
+/// Automation fire records per store write.
+pub(crate) const HISTORY_FIRE_BATCH: usize = 200;
 /// The longest wait between retries while the store fails.
 pub(crate) const HISTORY_MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// Failing this long is a readiness issue (spec §13.1).
@@ -93,6 +95,7 @@ pub(crate) struct FlushReport {
     pub(crate) messages: usize,
     pub(crate) runs: usize,
     pub(crate) approvals: usize,
+    pub(crate) fires: usize,
     pub(crate) deletions: usize,
     pub(crate) reconciled: usize,
 }
@@ -329,7 +332,8 @@ impl HistoryService {
         }
         self.write_queue(state, transactions, report).await?;
         self.write_runs(state, transactions, report).await?;
-        self.write_approvals(state, transactions, report).await
+        self.write_approvals(state, transactions, report).await?;
+        self.write_schedule_fires(state, transactions, report).await
     }
 
     /// Writes queued items in order until the queue is empty. Each applied
@@ -443,6 +447,36 @@ impl HistoryService {
             let removed = state.write().await.approvals.mark_mirrored(&approvals);
             report.approvals += removed;
             if removed == 0 || approvals.len() < HISTORY_APPROVAL_BATCH {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Writes automation fire records in batches, read under the
+    /// control-plane transaction so only saved outcomes are mirrored; each
+    /// one the store then holds unchanged leaves the control plane, and a
+    /// deleted agent's are dropped instead (spec §9.1, §13.1).
+    async fn write_schedule_fires(
+        &self,
+        state: &SharedDaemonState,
+        transactions: &Mutex<()>,
+        report: &mut FlushReport,
+    ) -> Result<(), HistoryError> {
+        loop {
+            let fires = {
+                let _transaction = transactions.lock().await;
+                state
+                    .write()
+                    .await
+                    .unmirrored_schedule_fires(HISTORY_FIRE_BATCH)
+            };
+            if fires.is_empty() {
+                return Ok(());
+            }
+            self.store.upsert_schedule_runs(&fires).await?;
+            let removed = state.write().await.schedule_fires.mark_mirrored(&fires);
+            report.fires += removed;
+            if removed == 0 || fires.len() < HISTORY_FIRE_BATCH {
                 return Ok(());
             }
         }
@@ -738,6 +772,7 @@ mod tests {
                 messages: 2,
                 runs: 1,
                 approvals: 0,
+                fires: 0,
                 deletions: 0,
                 reconciled: 0
             }
@@ -1315,6 +1350,54 @@ mod tests {
             "a deleted session's approval is never written"
         );
         assert!(state.read().await.approvals.get(&orphan).is_none());
+    }
+
+    #[tokio::test]
+    async fn fires_reach_the_store_and_leave_the_control_plane() {
+        let store = Arc::new(FlakyHistoryStore::new());
+        let (state, coordinator, agent_id) = state_with(HistoryService::new(store.clone())).await;
+        let transactions = coordinator.control_plane_transactions();
+        let kept = crate::schedules::history::tests_support_fire(&agent_id);
+        let mut orphan = kept.clone();
+        orphan.id = "schedule:s1:20".into();
+        orphan.agent_id = "agent-deleted".into();
+        {
+            let mut guard = state.write().await;
+            guard.schedule_fires.record(kept.clone());
+            guard.schedule_fires.record(orphan);
+        }
+        let history = state.read().await.history.clone();
+        store.set_failing(true);
+
+        assert!(history
+            .flush_once(&state, &transactions, now_millis())
+            .await
+            .is_err());
+        assert_eq!(
+            state.read().await.schedule_fires.snapshot(),
+            vec![kept.clone()],
+            "a failing store keeps the fire; the deleted agent's was dropped, not written"
+        );
+
+        store.set_failing(false);
+        let report = history
+            .flush_once(&state, &transactions, now_millis())
+            .await
+            .unwrap();
+        assert_eq!(report.fires, 1);
+        assert_eq!(
+            store.page_schedule_runs(&agent_id, "s1", 50).await.unwrap(),
+            vec![kept]
+        );
+        assert!(
+            store
+                .page_schedule_runs("agent-deleted", "s1", 50)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a deleted agent's fire is dropped, never written"
+        );
+        assert_eq!(state.read().await.schedule_fires.len(), 0);
     }
 
     // The hand-simulated agent-delete test that used to live here (Task 12) is

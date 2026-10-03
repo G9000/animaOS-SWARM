@@ -12,6 +12,7 @@ use super::{
 };
 use crate::approvals::ApprovalRequest;
 use crate::runs::RunRecord;
+use crate::schedules::ScheduleFireRecord;
 
 const UPSERT_MESSAGE: &str = "
 INSERT INTO history_messages (id, agent_id, session_id, role, text, hidden, created_at_ms, ordinal, record)
@@ -52,6 +53,21 @@ WHERE ($1::text IS NULL OR agent_id = $1) AND created_at_ms >= $2
   AND ($3::bigint IS NULL OR created_at_ms < $3 OR (created_at_ms = $3 AND id COLLATE \"C\" < $4))
 ORDER BY created_at_ms DESC, id COLLATE \"C\" DESC
 LIMIT $5";
+
+const UPSERT_SCHEDULE_RUN: &str = "
+INSERT INTO history_schedule_runs (id, schedule_id, agent_id, fired_at_ms, record)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (id) DO UPDATE SET
+    schedule_id = EXCLUDED.schedule_id,
+    agent_id = EXCLUDED.agent_id,
+    fired_at_ms = EXCLUDED.fired_at_ms,
+    record = EXCLUDED.record";
+
+const PAGE_SCHEDULE_RUNS: &str = "
+SELECT record FROM history_schedule_runs
+WHERE agent_id = $1 AND schedule_id = $2
+ORDER BY fired_at_ms DESC, id COLLATE \"C\" DESC
+LIMIT $3";
 
 impl From<sqlx::Error> for HistoryError {
     fn from(error: sqlx::Error) -> Self {
@@ -201,6 +217,45 @@ impl HistoryStore for PostgresHistoryStore {
             .await?;
         rows.iter()
             .map(|row| -> Result<ApprovalRequest, HistoryError> {
+                let record: serde_json::Value = row.try_get("record")?;
+                Ok(serde_json::from_value(record)?)
+            })
+            .collect()
+    }
+
+    async fn upsert_schedule_runs(&self, fires: &[ScheduleFireRecord]) -> Result<(), HistoryError> {
+        if fires.is_empty() {
+            return Ok(());
+        }
+        let mut transaction = self.pool.begin().await?;
+        for fire in fires {
+            sqlx::query(UPSERT_SCHEDULE_RUN)
+                .bind(&fire.id)
+                .bind(&fire.schedule_id)
+                .bind(&fire.agent_id)
+                .bind(to_i64(fire.fired_at_ms)?)
+                .bind(serde_json::to_value(fire)?)
+                .execute(&mut *transaction)
+                .await?;
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn page_schedule_runs(
+        &self,
+        agent_id: &str,
+        schedule_id: &str,
+        limit: usize,
+    ) -> Result<Vec<ScheduleFireRecord>, HistoryError> {
+        let rows = sqlx::query(PAGE_SCHEDULE_RUNS)
+            .bind(agent_id)
+            .bind(schedule_id)
+            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter()
+            .map(|row| -> Result<ScheduleFireRecord, HistoryError> {
                 let record: serde_json::Value = row.try_get("record")?;
                 Ok(serde_json::from_value(record)?)
             })
@@ -397,12 +452,13 @@ impl HistoryStore for PostgresHistoryStore {
 
     async fn delete_agent(&self, agent_id: &str) -> Result<(), HistoryError> {
         let mut transaction = self.pool.begin().await?;
-        // Usage rows stay (spec §3.3); approvals go with their agent.
+        // Usage rows stay (spec §3.3); approvals and automation fires go with their agent.
         for table in [
             "history_messages",
             "history_runs",
             "history_attachments",
             "history_approvals",
+            "history_schedule_runs",
         ] {
             sqlx::query(&format!("DELETE FROM {table} WHERE agent_id = $1"))
                 .bind(agent_id)
@@ -421,6 +477,7 @@ mod tests {
         assert_history_store_approval_conformance, assert_history_store_checkin_text_conformance,
         assert_history_store_conformance, assert_history_store_diacritics_conformance,
         assert_history_store_indexed_text_cap_conformance,
+        assert_history_store_schedule_run_conformance,
         assert_history_store_session_search_conformance,
     };
 
@@ -442,6 +499,7 @@ mod tests {
         assert_history_store_indexed_text_cap_conformance(&store).await;
         assert_history_store_diacritics_conformance(&store).await;
         assert_history_store_approval_conformance(&store).await;
+        assert_history_store_schedule_run_conformance(&store).await;
         assert_eq!(store.label(), "postgres");
     }
 }

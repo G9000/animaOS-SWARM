@@ -15,6 +15,7 @@ use super::{
 };
 use crate::approvals::ApprovalRequest;
 use crate::runs::RunRecord;
+use crate::schedules::ScheduleFireRecord;
 
 /// `PRAGMA user_version` of the schema this daemon writes.
 pub(crate) const SQLITE_HISTORY_SCHEMA_VERSION: i64 = 1;
@@ -131,6 +132,21 @@ WHERE (?1 IS NULL OR agent_id = ?1) AND created_at_ms >= ?2
   AND (?3 IS NULL OR created_at_ms < ?3 OR (created_at_ms = ?3 AND id < ?4))
 ORDER BY created_at_ms DESC, id DESC
 LIMIT ?5";
+
+const UPSERT_SCHEDULE_RUN: &str = "
+INSERT INTO schedule_runs (id, schedule_id, agent_id, fired_at_ms, record)
+VALUES (?1, ?2, ?3, ?4, ?5)
+ON CONFLICT (id) DO UPDATE SET
+    schedule_id = excluded.schedule_id,
+    agent_id = excluded.agent_id,
+    fired_at_ms = excluded.fired_at_ms,
+    record = excluded.record";
+
+const PAGE_SCHEDULE_RUNS: &str = "
+SELECT record FROM schedule_runs
+WHERE agent_id = ?1 AND schedule_id = ?2
+ORDER BY fired_at_ms DESC, id DESC
+LIMIT ?3";
 
 const PAGE_MESSAGES: &str = "
 SELECT agent_id, session_id, hidden, record FROM messages
@@ -663,6 +679,65 @@ impl HistoryStore for SqliteHistoryStore {
         .await
     }
 
+    async fn upsert_schedule_runs(&self, fires: &[ScheduleFireRecord]) -> Result<(), HistoryError> {
+        if fires.is_empty() {
+            return Ok(());
+        }
+        let rows = fires
+            .iter()
+            .map(
+                |fire| -> Result<(String, String, String, i64, String), HistoryError> {
+                    Ok((
+                        fire.id.clone(),
+                        fire.schedule_id.clone(),
+                        fire.agent_id.clone(),
+                        to_i64(fire.fired_at_ms)?,
+                        serde_json::to_string(fire)?,
+                    ))
+                },
+            )
+            .collect::<Result<Vec<_>, HistoryError>>()?;
+        self.run(move |connection| {
+            let transaction = connection.transaction()?;
+            {
+                let mut statement = transaction.prepare_cached(UPSERT_SCHEDULE_RUN)?;
+                for (id, schedule_id, agent_id, fired_at_ms, record) in &rows {
+                    statement.execute(params![id, schedule_id, agent_id, fired_at_ms, record])?;
+                }
+            }
+            transaction.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn page_schedule_runs(
+        &self,
+        agent_id: &str,
+        schedule_id: &str,
+        limit: usize,
+    ) -> Result<Vec<ScheduleFireRecord>, HistoryError> {
+        let (agent_id, schedule_id) = (agent_id.to_string(), schedule_id.to_string());
+        self.run(move |connection| {
+            let mut statement = connection.prepare_cached(PAGE_SCHEDULE_RUNS)?;
+            let records = statement
+                .query_map(
+                    params![
+                        agent_id,
+                        schedule_id,
+                        i64::try_from(limit).unwrap_or(i64::MAX)
+                    ],
+                    |row| row.get::<_, String>(0),
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            records
+                .iter()
+                .map(|record| serde_json::from_str(record).map_err(HistoryError::from))
+                .collect()
+        })
+        .await
+    }
+
     async fn delete_session(&self, agent_id: &str, session_id: &str) -> Result<(), HistoryError> {
         let (agent_id, session_id) = (agent_id.to_string(), session_id.to_string());
         self.run(move |connection| {
@@ -683,8 +758,14 @@ impl HistoryStore for SqliteHistoryStore {
         let agent_id = agent_id.to_string();
         self.run(move |connection| {
             let transaction = connection.transaction()?;
-            // Usage rows stay (spec §3.3); approvals go with their agent.
-            for table in ["messages", "runs", "attachments", "approvals"] {
+            // Usage rows stay (spec §3.3); approvals and automation fires go with their agent.
+            for table in [
+                "messages",
+                "runs",
+                "attachments",
+                "approvals",
+                "schedule_runs",
+            ] {
                 transaction.execute(
                     &format!("DELETE FROM {table} WHERE agent_id = ?1"),
                     params![agent_id],
@@ -704,6 +785,7 @@ mod tests {
         assert_history_store_approval_conformance, assert_history_store_checkin_text_conformance,
         assert_history_store_conformance, assert_history_store_diacritics_conformance,
         assert_history_store_indexed_text_cap_conformance,
+        assert_history_store_schedule_run_conformance,
         assert_history_store_session_search_conformance, history_message,
     };
     use anima_core::MessageRole;
@@ -740,6 +822,7 @@ mod tests {
         assert_history_store_indexed_text_cap_conformance(&store).await;
         assert_history_store_diacritics_conformance(&store).await;
         assert_history_store_approval_conformance(&store).await;
+        assert_history_store_schedule_run_conformance(&store).await;
         assert_eq!(store.label(), "sqlite");
         assert!(!store.is_ephemeral());
     }
