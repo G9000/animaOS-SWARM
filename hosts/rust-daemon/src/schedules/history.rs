@@ -41,22 +41,72 @@ pub(crate) struct FireLog {
     pending: Vec<ScheduleFireRecord>,
 }
 
+/// What [`FireLog::record_undoable`] changed, so [`FireLog::undo`] puts
+/// the log back exactly: the same records in the same order.
+#[derive(Clone, Debug)]
+pub(crate) enum FireUndo {
+    /// `previous` had the fire's id and kept its place.
+    Replaced { previous: ScheduleFireRecord },
+    /// The fire was appended; `dropped` was the oldest, pushed out by the cap.
+    Added {
+        id: String,
+        dropped: Option<ScheduleFireRecord>,
+    },
+}
+
 impl FireLog {
     /// Adds `fire`, replacing one with its id (returned); past the cap the
     /// oldest leaves.
     pub(crate) fn record(&mut self, fire: ScheduleFireRecord) -> Option<ScheduleFireRecord> {
-        if let Some(existing) = self.pending.iter_mut().find(|known| known.id == fire.id) {
-            return Some(std::mem::replace(existing, fire));
+        match self.record_undoable(fire) {
+            FireUndo::Replaced { previous } => Some(previous),
+            FireUndo::Added { .. } => None,
         }
+    }
+
+    /// [`FireLog::record`], returning what [`FireLog::undo`] needs.
+    pub(crate) fn record_undoable(&mut self, fire: ScheduleFireRecord) -> FireUndo {
+        if let Some(existing) = self.pending.iter_mut().find(|known| known.id == fire.id) {
+            return FireUndo::Replaced {
+                previous: std::mem::replace(existing, fire),
+            };
+        }
+        let id = fire.id.clone();
         self.pending.push(fire);
+        let mut dropped = None;
         if self.pending.len() > MAX_UNMIRRORED_FIRES {
-            let dropped = self.pending.remove(0);
+            let oldest = self.pending.remove(0);
             warn!(
-                fire_id = %dropped.id,
+                fire_id = %oldest.id,
                 "dropped the oldest automation fire record: the history store has not taken any for a while"
             );
+            dropped = Some(oldest);
         }
-        None
+        FireUndo::Added { id, dropped }
+    }
+
+    /// Undoes a [`FireLog::record_undoable`]: a replaced record returns to
+    /// its place, an added one leaves, and one the cap pushed out returns as
+    /// the oldest.
+    pub(crate) fn undo(&mut self, undo: FireUndo) {
+        match undo {
+            FireUndo::Replaced { previous } => {
+                match self
+                    .pending
+                    .iter_mut()
+                    .find(|known| known.id == previous.id)
+                {
+                    Some(existing) => *existing = previous,
+                    None => self.pending.push(previous),
+                }
+            }
+            FireUndo::Added { id, dropped } => {
+                self.remove(&id);
+                if let Some(dropped) = dropped {
+                    self.pending.insert(0, dropped);
+                }
+            }
+        }
     }
 
     pub(crate) fn remove(&mut self, id: &str) -> Option<ScheduleFireRecord> {
@@ -206,6 +256,31 @@ mod tests {
         assert!(
             log.snapshot().iter().all(|kept| kept.id != "f0"),
             "the oldest leaves first"
+        );
+    }
+
+    #[test]
+    fn undo_puts_the_log_back_exactly() {
+        let mut log = FireLog::default();
+        for n in 0..MAX_UNMIRRORED_FIRES as u64 {
+            log.record(fire(&format!("f{n}"), "agent-1", n + 1));
+        }
+        let full = log.snapshot();
+
+        let mut changed = fire("f5", "agent-1", 6);
+        changed.outcome = ScheduleOutcomeStatus::Failed;
+        let replaced = log.record_undoable(changed);
+        assert_eq!(log.len(), MAX_UNMIRRORED_FIRES);
+        log.undo(replaced);
+        assert_eq!(log.snapshot(), full, "the replaced record keeps its place");
+
+        let added = log.record_undoable(fire("new", "agent-1", 5_000));
+        assert!(log.snapshot().iter().all(|kept| kept.id != "f0"));
+        log.undo(added);
+        assert_eq!(
+            log.snapshot(),
+            full,
+            "the record the cap pushed out returns"
         );
     }
 

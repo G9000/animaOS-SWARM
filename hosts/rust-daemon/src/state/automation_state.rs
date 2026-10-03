@@ -5,14 +5,14 @@
 
 use super::DaemonState;
 use crate::live::{LiveEvent, LiveEventBody};
+use crate::schedules::history::FireUndo;
 use crate::schedules::{ScheduleFireRecord, ScheduleSafeOutcome, ScheduledPromptRecord};
 
 /// What `record_automation_outcome` changed, so a rollback puts it back.
 #[derive(Clone, Debug)]
 pub(crate) struct OutcomeUndo {
     previous: ScheduledPromptRecord,
-    fire_id: Option<String>,
-    previous_fire: Option<ScheduleFireRecord>,
+    fire: Option<FireUndo>,
 }
 
 impl DaemonState {
@@ -78,26 +78,17 @@ impl DaemonState {
                 manual: fired.manual,
             });
         schedule.last_safe_outcome = Some(outcome);
-        let (fire_id, previous_fire) = match fire {
-            Some(fire) => (Some(fire.id.clone()), self.schedule_fires.record(fire)),
-            None => (None, None),
-        };
-        Some(OutcomeUndo {
-            previous,
-            fire_id,
-            previous_fire,
-        })
+        let fire = fire.map(|fire| self.schedule_fires.record_undoable(fire));
+        Some(OutcomeUndo { previous, fire })
     }
 
     /// Puts back what `record_automation_outcome` changed: the outcome, the
-    /// counters, and the fire log's entry. Other fields keep any change made
-    /// since (an owner's edit is not undone).
+    /// counters, and the fire log exactly as it was (controller ruling 3).
+    /// Other fields keep any change made since (an owner's edit is not
+    /// undone).
     pub(crate) fn undo_automation_outcome(&mut self, undo: OutcomeUndo) {
-        if let Some(id) = &undo.fire_id {
-            self.schedule_fires.remove(id);
-            if let Some(previous) = undo.previous_fire {
-                self.schedule_fires.record(previous);
-            }
+        if let Some(fire) = undo.fire {
+            self.schedule_fires.undo(fire);
         }
         if let Some(schedule) = self.schedules.get_mut(&undo.previous.id) {
             schedule.last_safe_outcome = undo.previous.last_safe_outcome;

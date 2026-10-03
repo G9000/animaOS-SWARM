@@ -208,6 +208,9 @@ fn schedule_error(error: ScheduleError) -> AxumResponse {
         ScheduleError::Conflict(message) => {
             error_response(StatusCode::CONFLICT, "schedule_conflict", message)
         }
+        ScheduleError::Busy(message) => {
+            error_response(StatusCode::TOO_MANY_REQUESTS, "schedule_busy", message)
+        }
         ScheduleError::TargetUnavailable => error_response(
             StatusCode::CONFLICT,
             "schedule_target_unavailable",

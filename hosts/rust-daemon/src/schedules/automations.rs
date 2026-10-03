@@ -51,6 +51,9 @@ pub(crate) const AUTOMATION_NAME_INVALID: &str = "name must be 1–80 characters
 pub(crate) const AUTOMATION_TEXT_HIDDEN: &str =
     "Automation text must not contain invisible tag or direction-override characters";
 pub(crate) const HEARTBEAT_NEEDS_TIME_ZONE: &str = "timeZone is required for the heartbeat preset";
+pub(crate) const AUTOMATION_ALREADY_RUNNING: &str = "This automation is already running";
+pub(crate) const TOO_MANY_RUNNING_AUTOMATIONS: &str =
+    "Too many automations are running; try again shortly";
 /// The existing update literal, now named.
 const NOTHING_TO_UPDATE: &str = "at least one field is required";
 

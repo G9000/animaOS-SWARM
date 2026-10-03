@@ -12,7 +12,6 @@ mod swarm_tools;
 pub(crate) use self::approval_state::{
     ApprovalAsk, ApprovalUndo, OwnerDecision, SettleRefusal, Settlement,
 };
-#[allow(unused_imports)] // M6 Task 6's scheduler names it.
 pub(crate) use self::automation_state::OutcomeUndo;
 pub(crate) use self::run_commit::RunBuild;
 pub(crate) use self::run_commit::RunContextReport;
