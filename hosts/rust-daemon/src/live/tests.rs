@@ -835,3 +835,19 @@ fn skill_updated_names_the_skill_and_the_draft() {
     assert_eq!(event["draftId"], json!(null));
     assert_eq!(event["seq"], 5);
 }
+
+#[test]
+fn automation_updated_names_the_schedule() {
+    let event = LiveEvent::new(
+        "agent-1",
+        LiveEventBody::AutomationUpdated {
+            schedule_id: "schedule-1".into(),
+            deleted: false,
+        },
+    )
+    .to_json(6);
+    assert_eq!(event["type"], "automation.updated");
+    assert_eq!(event["scheduleId"], "schedule-1");
+    assert_eq!(event["deleted"], false);
+    assert_eq!(event["seq"], 6);
+}

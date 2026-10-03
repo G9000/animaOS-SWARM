@@ -18,6 +18,14 @@ use crate::runs::{RunOutcome, RunSource, RunStatus};
 pub(crate) mod cron;
 pub(crate) mod timing;
 pub(crate) use timing::ActiveHours;
+pub(crate) mod automations;
+pub(crate) mod history;
+#[cfg(test)]
+pub(crate) use automations::test_automation;
+pub(crate) use automations::{
+    validate_stored_automation, AutomationCounters, AutomationCreator, AutomationPreset,
+};
+pub(crate) use history::{FireLog, ScheduleFireRecord};
 
 const CHECKIN_SENTINEL: &str = "CHECKIN_OK";
 const CHECKIN_SUFFIX: &str = "(This is a scheduled check-in. If you have nothing worth saying right now, reply with exactly CHECKIN_OK and nothing else.)";
@@ -45,6 +53,18 @@ pub(crate) struct ScheduledPromptRecord {
     pub(crate) last_safe_outcome: Option<ScheduleSafeOutcome>,
     pub(crate) created_at_ms: u64,
     pub(crate) updated_at_ms: u64,
+    /// Spec §9.1. Empty for records saved before M6 (`display_name` reads the
+    /// prompt's first line for those).
+    #[serde(default)]
+    pub(crate) name: String,
+    #[serde(default)]
+    pub(crate) active_hours: Option<ActiveHours>,
+    #[serde(default)]
+    pub(crate) created_by: AutomationCreator,
+    #[serde(default)]
+    pub(crate) preset: Option<AutomationPreset>,
+    #[serde(default)]
+    pub(crate) counters: AutomationCounters,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,6 +108,9 @@ pub(crate) enum ScheduleTarget {
 pub(crate) struct ScheduleLastFired {
     pub(crate) fired_at_ms: u64,
     pub(crate) run_idempotency_key: String,
+    /// Run now (spec §9.2) fired it, not the trigger.
+    #[serde(default)]
+    pub(crate) manual: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -307,6 +330,7 @@ impl SchedulerService {
                     break candidate;
                 }
             };
+            let name = automations::default_name(&prompt);
             let record = ScheduledPromptRecord {
                 id: id.clone(),
                 import_idempotency_key,
@@ -320,6 +344,11 @@ impl SchedulerService {
                 last_safe_outcome: None,
                 created_at_ms,
                 updated_at_ms: now.max(created_at_ms),
+                name,
+                active_hours: None,
+                created_by: AutomationCreator::Owner,
+                preset: None,
+                counters: AutomationCounters::default(),
             };
             let previous = state.schedules.insert(id, record.clone());
             (record, previous, state.control_plane_persist_request())
@@ -612,6 +641,7 @@ async fn claim_due(
                 claimed.last_fired = Some(ScheduleLastFired {
                     fired_at_ms: now,
                     run_idempotency_key: format!("schedule:{}:{}", claimed.id, now),
+                    manual: false,
                 });
                 claimed.last_safe_outcome = None;
                 true
