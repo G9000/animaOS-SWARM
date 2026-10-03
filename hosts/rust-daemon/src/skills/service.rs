@@ -137,6 +137,55 @@ struct ScanInput {
     registered: BTreeSet<String>,
 }
 
+/// A `SKILL.md` read before the transaction, so a change never writes over
+/// a file the owner has not reviewed (`SkillService::review_file`).
+pub(super) struct FileReview {
+    root: PathBuf,
+    slug: String,
+    /// `None` when the skill had a record (nothing was read); otherwise the
+    /// file's hash (`Ok(None)` without a file), or `Err` when it could not
+    /// be read.
+    read: Option<Result<Option<String>, ()>>,
+}
+
+impl FileReview {
+    /// The cheap check made inside the transaction, against the registry
+    /// as it is now: a skill with a record passes; otherwise the file read
+    /// must be absent or one the owner rejected at its hash. A read error, a
+    /// workspace switched since the read, or a record gone since a read that
+    /// was skipped all refuse (fail closed).
+    pub(super) fn check(
+        &self,
+        skills: &SkillRegistry,
+        root: &Path,
+        slug: &str,
+    ) -> Result<(), SkillError> {
+        let refused = || Err(SkillError::conflict(SKILL_FILE_UNREVIEWED));
+        if root != self.root || slug != self.slug {
+            return refused();
+        }
+        if skills.get(slug).is_some() {
+            return Ok(());
+        }
+        let hash = match &self.read {
+            Some(Ok(None)) => return Ok(()),
+            Some(Ok(Some(hash))) => hash,
+            Some(Err(())) | None => return refused(),
+        };
+        let rejected = skills.decided_drafts().into_iter().any(|draft| {
+            draft.source == DraftSource::File
+                && draft.status == DraftStatus::Rejected
+                && draft.slug == slug
+                && draft.file_hash.as_deref() == Some(hash.as_str())
+        });
+        if rejected {
+            Ok(())
+        } else {
+            refused()
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct SkillService {
     pub(super) state: SharedDaemonState,
@@ -246,51 +295,50 @@ impl SkillService {
             .ok_or(SkillError::NotFound)
     }
 
-    /// Reads one skill's file into the scan again (best effort).
-    pub(super) async fn refresh(&self, root: &Path, slug: &str) {
-        let (workspace, target) = (root.to_path_buf(), slug.to_string());
-        if let Ok(Ok(scanned)) = blocking(move || disk::scan_skill(&workspace, &target, None)).await
-        {
-            self.state.write().await.skills.set_scanned(slug, scanned);
-        }
+    /// Where a read made before the transaction starts: the workspace and
+    /// what the last scan holds for `slug`, read under one lock. A change
+    /// that records the read checks `SkillRegistry::scan_moved` with them.
+    pub(super) async fn read_start(
+        &self,
+        slug: &str,
+    ) -> Result<(PathBuf, Option<Option<String>>), SkillError> {
+        let guard = self.state.read().await;
+        let root = guard
+            .workspace
+            .as_ref()
+            .map(|workspace| workspace.root_path.clone())
+            .ok_or(SkillError::NoWorkspace)?;
+        Ok((root, guard.skills.scanned_hash(slug)))
     }
 
-    /// Refuses to write over a `SKILL.md` the owner has not reviewed: a
-    /// folder without a record whose file is not one the owner rejected at
-    /// its current hash. A read error refuses too (fail closed).
-    pub(super) async fn refuse_unreviewed_file(
-        &self,
-        root: &Path,
-        slug: &str,
-    ) -> Result<(), SkillError> {
-        if self.state.read().await.skills.get(slug).is_some() {
-            return Ok(());
-        }
-        let (workspace, target) = (root.to_path_buf(), slug.to_string());
-        let bytes = match blocking(move || disk::read_skill_bytes(&workspace, &target)).await? {
-            Ok(None) => return Ok(()),
-            Ok(Some(bytes)) => bytes,
-            Err(_) => return Err(SkillError::conflict(SKILL_FILE_UNREVIEWED)),
+    /// Reads what `FileReview::check` needs, before the transaction is
+    /// taken (a slow or stuck folder never holds it up): the skill's
+    /// `SKILL.md` hash, unless the skill has a record now.
+    pub(super) async fn review_file(&self, slug: &str) -> Result<FileReview, SkillError> {
+        let (root, has_record) = {
+            let guard = self.state.read().await;
+            let root = guard
+                .workspace
+                .as_ref()
+                .map(|workspace| workspace.root_path.clone())
+                .ok_or(SkillError::NoWorkspace)?;
+            (root, guard.skills.get(slug).is_some())
         };
-        let hash = skill_hash(&bytes);
-        let rejected = self
-            .state
-            .read()
-            .await
-            .skills
-            .decided_drafts()
-            .into_iter()
-            .any(|draft| {
-                draft.source == DraftSource::File
-                    && draft.status == DraftStatus::Rejected
-                    && draft.slug == slug
-                    && draft.file_hash.as_deref() == Some(hash.as_str())
-            });
-        if rejected {
-            Ok(())
+        let read = if has_record {
+            None
         } else {
-            Err(SkillError::conflict(SKILL_FILE_UNREVIEWED))
-        }
+            let (workspace, target) = (root.clone(), slug.to_string());
+            let read = blocking(move || disk::read_skill_bytes(&workspace, &target)).await?;
+            Some(
+                read.map(|bytes| bytes.map(|bytes| skill_hash(&bytes)))
+                    .map_err(|_| ()),
+            )
+        };
+        Ok(FileReview {
+            root,
+            slug: slug.to_string(),
+            read,
+        })
     }
 
     /// Rescans the skills folder (spec §8.1); `true` when a status or the
@@ -397,13 +445,14 @@ impl SkillService {
         };
         validate_body(&file.body).map_err(SkillError::invalid)?;
         let (slug, enabled) = (slug.to_string(), content.enabled);
+        let review = self.review_file(&slug).await?;
         self.locked(move |service, root| async move {
-            service.refuse_unreviewed_file(&root, &slug).await?;
             let bytes = compose_skill_file(&file.name, &file.description, &file.body).into_bytes();
             let hash = skill_hash(&bytes);
-            let target = slug.clone();
+            let (target, written_root) = (slug.clone(), root.clone());
             let created = service
                 .apply(&root, move |skills, now_ms| {
+                    review.check(skills, &written_root, &target)?;
                     let previous = skills.get(&target).cloned();
                     let mut record = SkillRecord::approved(&target, &file, hash, now_ms);
                     record.enabled = enabled
@@ -493,21 +542,37 @@ impl SkillService {
             };
             if let Err(error) = persist.save().await {
                 service.state.write().await.skills.restore(&slug, previous);
-                if let Some(name) = trashed {
-                    let (workspace, target) = (root.clone(), slug.clone());
-                    let back =
-                        blocking(move || disk::untrash_skill_folder(&workspace, &target, &name))
-                            .await
-                            .and_then(|result| result.map_err(SkillError::Unavailable));
-                    if let Err(problem) = back {
-                        warn!(
-                            skill = %slug,
-                            problem = %problem.message(),
-                            "a deleted skill's folder stays in the trash after its save failed"
-                        );
+                // Put the folder back and read it again in one bounded call.
+                let (workspace, target) = (root.clone(), slug.clone());
+                let back = blocking(move || {
+                    let untrashed = match trashed {
+                        Some(name) => disk::untrash_skill_folder(&workspace, &target, &name),
+                        None => Ok(()),
+                    };
+                    (untrashed, disk::scan_skill(&workspace, &target, None))
+                })
+                .await;
+                let untrashed = match back {
+                    Ok((untrashed, scanned)) => {
+                        if let Ok(scanned) = scanned {
+                            service
+                                .state
+                                .write()
+                                .await
+                                .skills
+                                .set_scanned(&slug, scanned);
+                        }
+                        untrashed
                     }
+                    Err(problem) => Err(problem.message()),
+                };
+                if let Err(problem) = untrashed {
+                    warn!(
+                        skill = %slug,
+                        problem = %problem,
+                        "a deleted skill's folder stays in the trash after its save failed"
+                    );
                 }
-                service.refresh(&root, &slug).await;
                 return Err(SkillError::Unavailable(error.to_string()));
             }
             service
@@ -537,7 +602,7 @@ impl SkillService {
             return Err(SkillError::invalid(SKILL_HASH_REQUIRED));
         }
         let slug = slug.to_string();
-        let read_root = self.workspace().await?;
+        let (read_root, seen) = self.read_start(&slug).await?;
         let (workspace, target) = (read_root.clone(), slug.clone());
         let bytes = blocking(move || disk::read_skill_bytes(&workspace, &target))
             .await?
@@ -559,6 +624,9 @@ impl SkillService {
                     let previous = skills.get(&target).cloned().ok_or(SkillError::NotFound)?;
                     if previous.approved_hash == current {
                         return Err(SkillError::conflict(SKILL_NOT_CHANGED));
+                    }
+                    if skills.scan_moved(&target, &seen, &scanned.hash) {
+                        return Err(SkillError::conflict(SKILL_HASH_MISMATCH));
                     }
                     let mut record = SkillRecord::approved(&target, &file, current, now_ms);
                     record.enabled = previous.enabled;
@@ -939,6 +1007,79 @@ mod tests {
             refused,
             Ok(Err(SkillError::Conflict(SKILL_HASH_MISMATCH.into())))
         );
+    }
+
+    /// Waits (bounded) until a change has finished its read and reached
+    /// `locked`, which clones the service and its transaction: the test
+    /// holds the transaction, so the change then waits there. `held` is the
+    /// count with every test-side clone already made.
+    async fn until_waiting_for_the_transaction(skills: &SkillService, held: usize) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while Arc::strong_count(&skills.transactions) <= held {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the change reached the transaction");
+    }
+
+    #[tokio::test]
+    async fn saving_reads_the_file_outside_the_transaction() {
+        let (state, root, _) = daemon("save-outside").await;
+        let skills = service(&state);
+        let path = write_skill(&root, "notes", &skill_text("Written by hand"));
+        let held = skills.transactions.clone().lock_owned().await;
+        let saver = skills.clone();
+        let held_count = Arc::strong_count(&skills.transactions);
+
+        let saving = tokio::spawn(async move { saver.save("notes", content("notes")).await });
+        until_waiting_for_the_transaction(&skills, held_count).await;
+        // The file goes while the save waits: only a read made before the
+        // transaction still saw it.
+        std::fs::remove_file(&path).unwrap();
+        drop(held);
+
+        let refused = tokio::time::timeout(Duration::from_secs(10), saving)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            refused,
+            Err(SkillError::Conflict(SKILL_FILE_UNREVIEWED.into()))
+        );
+        assert!(state.read().await.skills.get("notes").is_none());
+    }
+
+    #[tokio::test]
+    async fn an_approval_is_not_recorded_over_a_newer_scan() {
+        let (state, root, _) = daemon("approve-newer-scan").await;
+        let skills = service(&state);
+        let (first, _) = skills.save("notes", content("notes")).await.unwrap();
+        let v2 = skill_text("Notes v2");
+        write_skill(&root, "notes", &v2);
+        let held = skills.transactions.clone().lock_owned().await;
+        let (approver, hash) = (skills.clone(), skill_hash(v2.as_bytes()));
+        let held_count = Arc::strong_count(&skills.transactions);
+
+        let approving = tokio::spawn(async move { approver.approve_changed("notes", &hash).await });
+        until_waiting_for_the_transaction(&skills, held_count).await;
+        write_skill(&root, "notes", &skill_text("Notes v3"));
+        assert_eq!(skills.scan().await, Ok(true));
+        drop(held);
+
+        let refused = tokio::time::timeout(Duration::from_secs(10), approving)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            refused,
+            Err(SkillError::Conflict(SKILL_HASH_MISMATCH.into())),
+            "the read may be older than the scan, so it is not pinned"
+        );
+        let guard = state.read().await;
+        let record = guard.skills.get("notes").unwrap();
+        assert_eq!(record.approved_hash, first.approved_hash);
+        assert_eq!(record.status, SkillStatus::Changed);
     }
 
     #[tokio::test]

@@ -9,10 +9,11 @@ use anima_core::{DataValue, ToolCall};
 use tokio::sync::{RwLock, Semaphore};
 
 use super::test_support::{
-    accept, add_chat, chat_request, companion_config, ledger_run, tool_input, tool_results,
-    wait_for, ScriptedModel, Step,
+    accept, add_chat, ask_before_writes, chat_request, companion_config, decision, ledger_run,
+    patient, pending_approvals, tool_input, tool_results, wait_for, ScriptedModel, Step,
 };
 use super::AgentRunCoordinator;
+use crate::approvals::ApprovalDecisionKind;
 use crate::skills::test_support::{
     broken_store, content, skill_text, temp_workspace, with_workspace, write_skill,
 };
@@ -175,6 +176,68 @@ async fn propose_skill_creates_a_pending_draft_and_writes_nothing() {
         &proposed_reply(&draft)
     );
     assert!(!root.join("skills").exists(), "nothing was written");
+}
+
+#[tokio::test]
+async fn propose_skill_under_write_ask_waits_for_the_owner() {
+    for (kind, expected) in [
+        (ApprovalDecisionKind::AllowOnce, 1),
+        (ApprovalDecisionKind::Deny, 0),
+    ] {
+        let model = ScriptedModel::new(propose_steps());
+        let (coordinator, agent_id, root) = skilled(model, &["propose_skill"], "propose-ask").await;
+        let coordinator = coordinator.with_approval_timeouts(patient());
+        coordinator
+            .state
+            .write()
+            .await
+            .approvals
+            .set_policy(&agent_id, ask_before_writes());
+
+        let running = {
+            let (coordinator, agent_id) = (coordinator.clone(), agent_id.clone());
+            tokio::spawn(async move {
+                coordinator
+                    .run(chat_request(
+                        &agent_id,
+                        "chat:x",
+                        "remember this as a skill",
+                    ))
+                    .await
+            })
+        };
+        let pending = pending_approvals(&coordinator, 1).await.remove(0);
+        assert_eq!(pending.tool, "propose_skill");
+        assert!(
+            coordinator
+                .state
+                .read()
+                .await
+                .skills
+                .pending_drafts()
+                .is_empty(),
+            "no draft while the owner decides ({kind:?})"
+        );
+
+        coordinator
+            .decide_approval(&pending.id, decision(kind, 1))
+            .await
+            .unwrap();
+        running.await.unwrap().unwrap();
+
+        let guard = coordinator.state.read().await;
+        let drafts = guard.skills.pending_drafts();
+        assert_eq!(drafts.len(), expected, "{kind:?}");
+        if expected == 1 {
+            assert_eq!(drafts[0].slug, "weekly-review");
+            assert_eq!(drafts[0].source, DraftSource::Agent);
+        }
+        drop(guard);
+        assert!(
+            !root.join("skills").exists(),
+            "nothing was written ({kind:?})"
+        );
+    }
 }
 
 #[tokio::test]

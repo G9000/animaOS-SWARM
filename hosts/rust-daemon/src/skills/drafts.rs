@@ -19,8 +19,8 @@ use super::{
     compose_skill_file, is_valid_slug, parse_skill_file, skill_hash, slugify, validate_body,
     validate_description, validate_name, DraftSource, DraftStatus, ProposedBy, SkillDraft,
     SkillFile, SkillRecord, FILE_DRAFT_ID_PREFIX, MAX_PENDING_DRAFTS_PER_AGENT,
-    MAX_PENDING_IMPORT_DRAFTS, SKILL_DRAFT_DECIDED, SKILL_HASH_MISMATCH, SKILL_HASH_REQUIRED,
-    SKILL_SLUG_INVALID, TOO_MANY_IMPORT_DRAFTS, TOO_MANY_PENDING_DRAFTS,
+    MAX_PENDING_IMPORT_DRAFTS, SKILL_DRAFT_DECIDED, SKILL_FILE_UNREVIEWED, SKILL_HASH_MISMATCH,
+    SKILL_HASH_REQUIRED, SKILL_SLUG_INVALID, TOO_MANY_IMPORT_DRAFTS, TOO_MANY_PENDING_DRAFTS,
 };
 
 /// A companion's `propose_skill` call (spec §8.3).
@@ -229,25 +229,33 @@ impl SkillService {
             return self.approve_file_draft(slug, approval).await;
         }
         let id = id.to_string();
+        // Read before the transaction; a decided or unknown draft is
+        // answered by `apply` below.
+        let pending_slug = self
+            .state
+            .read()
+            .await
+            .skills
+            .draft(&id)
+            .filter(|draft| draft.is_pending())
+            .map(|draft| draft.slug.clone());
+        let review = match pending_slug {
+            Some(slug) => Some(self.review_file(&slug).await?),
+            None => None,
+        };
         self.locked(move |service, root| async move {
-            // A decided or unknown draft is answered by `apply` below.
-            let pending_slug = service
-                .state
-                .read()
-                .await
-                .skills
-                .draft(&id)
-                .filter(|draft| draft.is_pending())
-                .map(|draft| draft.slug.clone());
-            if let Some(slug) = pending_slug {
-                service.refuse_unreviewed_file(&root, &slug).await?;
-            }
+            let reviewed_root = root.clone();
             let (slug, draft) = service
                 .apply(&root, move |skills, now_ms| {
                     let previous_draft = skills.draft(&id).cloned().ok_or(SkillError::NotFound)?;
                     if !previous_draft.is_pending() {
                         return Err(SkillError::conflict(SKILL_DRAFT_DECIDED));
                     }
+                    // Pending now but not when read: refuse (fail closed).
+                    review
+                        .as_ref()
+                        .ok_or_else(|| SkillError::conflict(SKILL_FILE_UNREVIEWED))?
+                        .check(skills, &reviewed_root, &previous_draft.slug)?;
                     let file = SkillFile {
                         name: previous_draft.name.clone(),
                         description: previous_draft.description.clone(),
@@ -301,7 +309,7 @@ impl SkillService {
         }
         let reviewed = reviewed_hash(approval.hash.as_deref())?;
         let slug = slug.to_string();
-        let read_root = self.workspace().await?;
+        let (read_root, seen) = self.read_start(&slug).await?;
         let (workspace, target) = (read_root.clone(), slug.clone());
         let bytes = blocking(move || disk::read_skill_bytes(&workspace, &target))
             .await?
@@ -332,6 +340,11 @@ impl SkillService {
                 .apply(&root, move |skills, now_ms| {
                     if skills.get(&target).is_some() {
                         return Err(SkillError::conflict(SKILL_DRAFT_DECIDED));
+                    }
+                    if let Some(scanned) = &scanned {
+                        if skills.scan_moved(&target, &seen, &scanned.hash) {
+                            return Err(SkillError::conflict(SKILL_HASH_MISMATCH));
+                        }
                     }
                     let record =
                         SkillRecord::approved(&target, &approved_file, approved_hash, now_ms);
@@ -409,7 +422,7 @@ impl SkillService {
             return Err(SkillError::NotFound);
         }
         let slug = slug.to_string();
-        let read_root = self.workspace().await?;
+        let (read_root, seen) = self.read_start(&slug).await?;
         let (workspace, target) = (read_root.clone(), slug.clone());
         let scanned = blocking(move || disk::scan_skill(&workspace, &target, None))
             .await?
@@ -432,6 +445,9 @@ impl SkillService {
                     });
                     if already_rejected {
                         return Err(SkillError::conflict(SKILL_DRAFT_DECIDED));
+                    }
+                    if skills.scan_moved(&slug, &seen, &scanned.hash) {
+                        return Err(SkillError::conflict(SKILL_HASH_MISMATCH));
                     }
                     let file = scanned.parsed.clone().unwrap_or_else(|_| SkillFile {
                         name: slug.clone(),

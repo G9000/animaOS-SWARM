@@ -4,10 +4,15 @@
 //! last scan of the skills folder found. Records and drafts are saved; the
 //! scan is not. Nothing here touches the disk or awaits.
 //!
-//! Every record change and `set_scanned` bumps `generation`. A scan reads
-//! the generation before its file work and `apply_scan` drops it when the
-//! generation moved meanwhile, so a scan can never put back what a newer
-//! change replaced.
+//! Every record change, `set_scanned`, and every applied scan bumps
+//! `generation`. A scan reads the generation before its file work and
+//! `apply_scan` drops it when the generation moved meanwhile, so a scan can
+//! never put back what a newer change or a newer scan replaced (two scans
+//! that began together: only the first to finish applies).
+//!
+//! A change that records a file it read before the transaction checks
+//! `scan_moved` first: when a scan applied since found other content, the
+//! read may be the older one, and recording it would put back a stale state.
 
 use std::collections::{BTreeMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -262,9 +267,29 @@ impl SkillRegistry {
         &self.scanned
     }
 
+    /// The hash the last scan holds for `slug`: `None` with no entry, and
+    /// `Some(None)` for an entry that could not be read whole. Read before a
+    /// file read made outside the transaction, for `scan_moved`.
+    pub(crate) fn scanned_hash(&self, slug: &str) -> Option<Option<String>> {
+        self.scanned.get(slug).map(|file| file.hash.clone())
+    }
+
+    /// Whether a scan applied since `seen` (`scanned_hash` before a read)
+    /// found content other than `read_hash`: the read may be the older one,
+    /// so it must not be recorded over it.
+    pub(crate) fn scan_moved(
+        &self,
+        slug: &str,
+        seen: &Option<Option<String>>,
+        read_hash: &Option<String>,
+    ) -> bool {
+        let now = self.scanned_hash(slug);
+        now != *seen && now.as_ref() != Some(read_hash)
+    }
+
     /// Applies a whole scan that began at `seen_generation`. `None` when a
-    /// change came in between (the scan is dropped); otherwise whether a
-    /// status or the set of file drafts changed.
+    /// change or another scan came in between (the scan is dropped);
+    /// otherwise whether a status or the set of file drafts changed.
     pub(crate) fn apply_scan(
         &mut self,
         seen_generation: u64,
@@ -284,6 +309,8 @@ impl SkillRegistry {
         }
         self.scanned = scanned;
         self.scanned_once = true;
+        // A scan that began at the same generation is now the older one.
+        self.generation += 1;
         Some(changed || self.file_draft_keys() != drafts_before)
     }
 
@@ -615,6 +642,57 @@ mod tests {
     }
 
     #[test]
+    fn of_two_scans_that_began_together_only_the_first_applies() {
+        let mut registry = SkillRegistry::default();
+        registry.put(record("notes")).unwrap();
+        let seen = registry.generation();
+        let newer = BTreeMap::from([("notes".to_string(), scanned("edited by hand"))]);
+        let older = BTreeMap::from([("notes".to_string(), scanned("notes"))]);
+
+        assert_eq!(registry.apply_scan(seen, newer), Some(true));
+        assert_eq!(registry.get("notes").unwrap().status, SkillStatus::Changed);
+        assert_eq!(
+            registry.apply_scan(seen, older),
+            None,
+            "the second scan from the same generation is dropped"
+        );
+        assert_eq!(
+            registry.get("notes").unwrap().status,
+            SkillStatus::Changed,
+            "a `changed` skill is never flipped back to `active` by an older scan"
+        );
+    }
+
+    #[test]
+    fn a_read_is_not_recorded_over_a_scan_that_found_other_content_since() {
+        let mut registry = SkillRegistry::default();
+        registry.put(record("notes")).unwrap();
+        registry.set_scanned("notes", Some(scanned("notes")));
+        let seen = registry.scanned_hash("notes");
+        let read = Some(skill_hash(&bytes("v2")));
+
+        assert!(
+            !registry.scan_moved("notes", &seen, &read),
+            "nothing applied since"
+        );
+        registry.set_scanned("notes", Some(scanned("v2")));
+        assert!(
+            !registry.scan_moved("notes", &seen, &read),
+            "the scan agrees with the read"
+        );
+        registry.set_scanned("notes", Some(scanned("v3")));
+        assert!(
+            registry.scan_moved("notes", &seen, &read),
+            "a scan may be newer than the read"
+        );
+        registry.set_scanned("notes", None);
+        assert!(
+            registry.scan_moved("notes", &seen, &read),
+            "the file went meanwhile"
+        );
+    }
+
+    #[test]
     fn files_without_a_record_are_drafts_until_rejected_at_that_hash() {
         let mut registry = SkillRegistry::default();
         registry.put(record("notes")).unwrap();
@@ -713,6 +791,7 @@ mod tests {
         let generation = registry.generation();
         assert_eq!(registry.apply_scan(generation, scan.clone()), Some(true));
         assert_eq!(registry.get("notes").unwrap().status, SkillStatus::Changed);
+        let generation = registry.generation();
         assert_eq!(registry.apply_scan(generation, scan), Some(false));
     }
 
