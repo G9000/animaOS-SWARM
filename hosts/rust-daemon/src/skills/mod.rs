@@ -193,7 +193,7 @@ pub(crate) fn slugify(name: &str) -> Option<String> {
 /// Unicode tag characters, bidirectional embeddings, overrides, and
 /// isolates, and the supplementary variation selectors: invisible text that
 /// can smuggle instructions past the owner.
-fn is_smuggling_character(character: char) -> bool {
+pub(crate) fn is_smuggling_character(character: char) -> bool {
     matches!(
         character as u32,
         0xE0000..=0xE007F | 0x202A..=0x202E | 0x2066..=0x2069 | 0xE0100..=0xE01EF
@@ -203,7 +203,7 @@ fn is_smuggling_character(character: char) -> bool {
 /// What a one-line field refuses on top of control characters: the
 /// smuggling characters, line and paragraph separators, and every Unicode
 /// `Cf` format character (spelled out; std has no general-category API).
-fn is_hidden_in_one_line(character: char) -> bool {
+pub(crate) fn is_hidden_in_one_line(character: char) -> bool {
     is_smuggling_character(character)
         || matches!(
             character as u32,
@@ -239,7 +239,7 @@ fn is_hidden_in_one_line(character: char) -> bool {
 
 /// Two or more variation selectors in a row: one after an emoji (❤️) is
 /// fine, a run can carry hidden bytes.
-fn has_variation_selector_run(value: &str) -> bool {
+pub(crate) fn has_variation_selector_run(value: &str) -> bool {
     let selector = |character: char| matches!(character as u32, 0xFE00..=0xFE0F);
     value
         .chars()

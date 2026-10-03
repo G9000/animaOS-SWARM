@@ -2,7 +2,6 @@
 //! moved into its active hours; the next few, for previews and the agent
 //! minimum; and the validation every trigger passes, on creation and on
 //! restore, one variant at a time.
-#![allow(dead_code)] // M6 Task 5 uses every item.
 
 use chrono::{Datelike, LocalResult, NaiveDateTime, TimeDelta, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;

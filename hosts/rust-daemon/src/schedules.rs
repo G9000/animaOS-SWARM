@@ -23,7 +23,8 @@ pub(crate) mod history;
 #[cfg(test)]
 pub(crate) use automations::test_automation;
 pub(crate) use automations::{
-    validate_stored_automation, AutomationCounters, AutomationCreator, AutomationPreset,
+    validate_stored_automation, AutomationCounters, AutomationCreator, AutomationInput,
+    AutomationPatch, AutomationPreset, AutomationService,
 };
 pub(crate) use history::{FireLog, ScheduleFireRecord};
 
@@ -178,6 +179,8 @@ pub(crate) enum ScheduleError {
     Invalid(&'static str),
     /// A trigger or active hours the daemon refuses, with a built message (400).
     Rejected(String),
+    /// The change conflicts with the automation's state or a limit (409).
+    Conflict(&'static str),
     TargetUnavailable,
     Persistence,
 }
@@ -252,26 +255,19 @@ impl SchedulerService {
         }
     }
 
+    /// Owner and companion changes to automations (spec §9).
+    pub(crate) fn automations(&self) -> AutomationService {
+        AutomationService::new(
+            Arc::clone(&self.inner.state),
+            self.inner.runs.control_plane_transactions(),
+        )
+    }
+
     pub(crate) async fn list(
         &self,
         agent_id: &str,
     ) -> Result<Vec<ScheduledPromptRecord>, ScheduleError> {
-        let state = self.inner.state.read().await;
-        if state.get_agent(agent_id).is_none() {
-            return Err(ScheduleError::AgentNotFound);
-        }
-        let mut records = state
-            .schedules
-            .values()
-            .filter(|item| item.agent_id == agent_id)
-            .cloned()
-            .collect::<Vec<_>>();
-        records.sort_by(|a, b| {
-            a.created_at_ms
-                .cmp(&b.created_at_ms)
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        Ok(records)
+        self.automations().list(agent_id).await
     }
 
     pub(crate) async fn create(
@@ -285,84 +281,12 @@ impl SchedulerService {
         explicit_next_due_at_ms: Option<u64>,
         created_at_override_ms: Option<u64>,
     ) -> Result<(ScheduledPromptRecord, bool), ScheduleError> {
-        validate_prompt(&prompt)?;
-        validate_trigger(&trigger)?;
-        let trigger = timing::normalized_trigger(trigger);
-        let now = now_ms();
-        let created_at_ms = created_at_override_ms.unwrap_or(now);
-        if created_at_ms == 0 || created_at_ms > now.saturating_add(300_000) {
-            return Err(ScheduleError::Invalid("createdAtMs is invalid"));
-        }
-        let next_due_at_ms = match explicit_next_due_at_ms {
-            Some(value) if value > 0 => value,
-            Some(_) => return Err(ScheduleError::Invalid("next due time is invalid")),
-            None => next_due_at_ms(&trigger, now)?,
-        };
-        if import_idempotency_key
-            .as_ref()
-            .is_some_and(|key| key.trim().is_empty() || key.len() > 256)
-        {
-            return Err(ScheduleError::Invalid("import idempotency key is invalid"));
-        }
-        let _transaction = self.inner.runs.control_plane_transaction().await;
-        let (record, previous, persist) = {
-            let mut state = self.inner.state.write().await;
-            if state.get_agent(&agent_id).is_none() {
-                return Err(ScheduleError::AgentNotFound);
-            }
-            if let Some(key) = import_idempotency_key.as_ref() {
-                if let Some(existing) = state
-                    .schedules
-                    .values()
-                    .find(|item| {
-                        item.agent_id == agent_id
-                            && item.import_idempotency_key.as_ref() == Some(key)
-                    })
-                    .cloned()
-                {
-                    return Ok((existing, false));
-                }
-            }
-            validate_target(&state, &agent_id, &target, enabled)?;
-            let id = loop {
-                let candidate = next_schedule_id(now);
-                if !state.schedules.contains_key(&candidate) {
-                    break candidate;
-                }
-            };
-            let name = automations::default_name(&prompt);
-            let record = ScheduledPromptRecord {
-                id: id.clone(),
-                import_idempotency_key,
-                agent_id,
-                prompt,
-                trigger,
-                enabled,
-                target,
-                next_due_at_ms,
-                last_fired: None,
-                last_safe_outcome: None,
-                created_at_ms,
-                updated_at_ms: now.max(created_at_ms),
-                name,
-                active_hours: None,
-                created_by: AutomationCreator::Owner,
-                preset: None,
-                counters: AutomationCounters::default(),
-            };
-            let previous = state.schedules.insert(id, record.clone());
-            (record, previous, state.control_plane_persist_request())
-        };
-        if persist.save().await.is_err() {
-            let mut state = self.inner.state.write().await;
-            if let Some(previous) = previous {
-                state.schedules.insert(record.id.clone(), previous);
-            } else {
-                state.schedules.remove(&record.id);
-            }
-            return Err(ScheduleError::Persistence);
-        }
-        Ok((record, true))
+        let mut input = AutomationInput::owner(agent_id, prompt, trigger, target);
+        input.enabled = enabled;
+        input.import_idempotency_key = import_idempotency_key;
+        input.explicit_next_due_at_ms = explicit_next_due_at_ms;
+        input.created_at_override_ms = created_at_override_ms;
+        self.automations().create(input, now_ms()).await
     }
 
     pub(crate) async fn update(
@@ -374,61 +298,16 @@ impl SchedulerService {
         target: Option<ScheduleTarget>,
         enabled: Option<bool>,
     ) -> Result<ScheduledPromptRecord, ScheduleError> {
-        if let Some(prompt) = &prompt {
-            validate_prompt(prompt)?;
-        }
-        if let Some(trigger) = &trigger {
-            validate_trigger(trigger)?;
-        }
-        let trigger = trigger.map(timing::normalized_trigger);
-        if prompt.is_none() && trigger.is_none() && target.is_none() && enabled.is_none() {
-            return Err(ScheduleError::Invalid("at least one field is required"));
-        }
-        let now = now_ms();
-        let _transaction = self.inner.runs.control_plane_transaction().await;
-        let (updated, previous, persist) = {
-            let mut state = self.inner.state.write().await;
-            let previous = state
-                .schedules
-                .get(schedule_id)
-                .filter(|item| item.agent_id == agent_id)
-                .cloned()
-                .ok_or(ScheduleError::NotFound)?;
-            let mut updated = previous.clone();
-            if let Some(prompt) = prompt {
-                updated.prompt = prompt;
-            }
-            if let Some(target) = target {
-                updated.target = target;
-            }
-            let was_enabled = updated.enabled;
-            if let Some(enabled) = enabled {
-                updated.enabled = enabled;
-            }
-            let timing_reset = trigger.is_some() || (!was_enabled && updated.enabled);
-            if let Some(trigger) = trigger {
-                updated.trigger = trigger;
-            }
-            if timing_reset {
-                updated.next_due_at_ms = next_due_at_ms(&updated.trigger, now)?;
-            }
-            validate_target(&state, agent_id, &updated.target, updated.enabled)?;
-            updated.updated_at_ms = now.max(updated.created_at_ms);
-            state
-                .schedules
-                .insert(schedule_id.to_string(), updated.clone());
-            (updated, previous, state.control_plane_persist_request())
+        let patch = AutomationPatch {
+            prompt,
+            trigger,
+            target,
+            enabled,
+            ..AutomationPatch::default()
         };
-        if persist.save().await.is_err() {
-            self.inner
-                .state
-                .write()
-                .await
-                .schedules
-                .insert(schedule_id.to_string(), previous);
-            return Err(ScheduleError::Persistence);
-        }
-        Ok(updated)
+        self.automations()
+            .update(agent_id, schedule_id, patch, now_ms())
+            .await
     }
 
     pub(crate) async fn delete(
@@ -436,29 +315,7 @@ impl SchedulerService {
         agent_id: &str,
         schedule_id: &str,
     ) -> Result<(), ScheduleError> {
-        let _transaction = self.inner.runs.control_plane_transaction().await;
-        let (removed, persist) = {
-            let mut state = self.inner.state.write().await;
-            if !state
-                .schedules
-                .get(schedule_id)
-                .is_some_and(|item| item.agent_id == agent_id)
-            {
-                return Err(ScheduleError::NotFound);
-            }
-            let removed = state.schedules.remove(schedule_id).expect("checked");
-            (removed, state.control_plane_persist_request())
-        };
-        if persist.save().await.is_err() {
-            self.inner
-                .state
-                .write()
-                .await
-                .schedules
-                .insert(schedule_id.to_string(), removed);
-            return Err(ScheduleError::Persistence);
-        }
-        Ok(())
+        self.automations().delete(agent_id, schedule_id).await
     }
 
     #[cfg(test)]
