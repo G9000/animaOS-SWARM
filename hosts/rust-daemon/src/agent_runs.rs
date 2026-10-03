@@ -110,8 +110,9 @@ fn helper_config(parent: &AgentState, name: String) -> AgentConfig {
         // companion (spec §13.3 grants it to non-helpers only; Controller
         // ruling 1, M3 Task 14 pre-flight audit) and is withheld from
         // helpers even when the parent has it, alongside the coordination
-        // and process tools.
-        tools: Some(parent.config.tools.iter().flatten().filter(|tool| !is_coordination_tool(&tool.name) && !crate::tools::is_process_tool(&tool.name) && tool.name != "search_conversations").cloned().collect()),
+        // and process tools and `propose_skill` (spec §8.3: helpers cannot
+        // propose skills; they keep `load_skill`).
+        tools: Some(parent.config.tools.iter().flatten().filter(|tool| !is_coordination_tool(&tool.name) && !crate::tools::is_process_tool(&tool.name) && tool.name != "search_conversations" && tool.name != "propose_skill").cloned().collect()),
         settings: Some(AgentSettings {
             temperature: parent_settings.temperature,
             max_tokens: Some(parent_settings.max_tokens.unwrap_or(4096).min(4096)),
@@ -2170,6 +2171,8 @@ mod conversation_tests;
 mod live_tests;
 #[cfg(test)]
 mod queue_tests;
+#[cfg(test)]
+mod skill_tests;
 #[cfg(test)]
 mod steer_tests;
 #[cfg(test)]
