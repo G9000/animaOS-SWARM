@@ -3,6 +3,10 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Session } from '@animaOS-SWARM/sdk';
 
 import { daemon } from '../lib/daemon-api';
+import {
+  SLASH_COMMANDS,
+  SKILL_NOT_IN_TELEGRAM_CHAT,
+} from '../lib/slash-commands';
 import { runFixture } from '../test/live';
 import { sessionFixture } from '../test/sessions';
 import {
@@ -19,6 +23,15 @@ function deferred<Value>() {
 }
 
 const CHAT_KEY = 'agent-main\u0000session:room-7';
+const SKILLFUL = [
+  ...SLASH_COMMANDS,
+  {
+    name: 'notes',
+    description: 'Take notes',
+    placeholder: '<request>',
+    skill: 'notes',
+  },
+];
 const readOnly = {
   send: false,
   steer: false,
@@ -58,6 +71,7 @@ function setup(overrides: Partial<SessionCommandOptions> = {}) {
     rename: vi.fn().mockResolvedValue(true),
     archive: vi.fn().mockResolvedValue(true),
     exportSession: vi.fn().mockResolvedValue(undefined),
+    slashCommands: SKILLFUL,
     ...overrides,
   };
   const view = renderHook(
@@ -300,5 +314,71 @@ describe('useSessionCommands', () => {
       [{ kind: 'session', sessionId: 'room-9', agentId: 'helper-7' }],
       [{ kind: 'session', sessionId: 'room-7' }],
     ]);
+  });
+});
+
+describe('skill messages', () => {
+  it('sends a /skill message whole, queued, with its skill', () => {
+    const run = runFixture('run_7', { sessionId: 'room-7', status: 'running' });
+    const { result, options } = setup({
+      draft: '/notes plan the week',
+      activeRun: run,
+    });
+
+    act(() => result.current.steer());
+
+    expect(options.queueSend).toHaveBeenCalledWith(
+      options.session,
+      CHAT_KEY,
+      '/notes plan the week',
+      expect.any(String),
+      'queue',
+      'notes',
+    );
+  });
+
+  it('starts a new chat with the skill and refuses one in a Telegram session', () => {
+    const fresh = setup({
+      routeSessionId: null,
+      session: null,
+      chatKey: 'agent-main\u0000home',
+      draft: '/notes hi',
+    });
+    act(() => fresh.result.current.send());
+    expect(fresh.options.startChat).toHaveBeenCalledWith('/notes hi', 'notes');
+
+    const telegram = setup({
+      session: sessionFixture('telegram:conn-1', { kind: 'telegram' }),
+      telegramReady: true,
+      draft: '/notes hi',
+    });
+    act(() => telegram.result.current.send());
+    expect(telegram.options.queueSend).not.toHaveBeenCalled();
+    expect(telegram.options.updateChat).toHaveBeenLastCalledWith(CHAT_KEY, {
+      draft: '/notes hi',
+      error: SKILL_NOT_IN_TELEGRAM_CHAT,
+    });
+  });
+
+  it('sends a skill run again with its skill', () => {
+    const { result, options } = setup();
+    const run = runFixture('run_1', {
+      sessionId: 'room-7',
+      status: 'failed',
+      input: { text: '/notes go', attachmentIds: [], skill: 'notes' },
+    });
+
+    act(() => {
+      result.current.sendAgain(run);
+    });
+
+    expect(options.queueSend).toHaveBeenCalledWith(
+      options.session,
+      CHAT_KEY,
+      '/notes go',
+      expect.any(String),
+      'queue',
+      'notes',
+    );
   });
 });

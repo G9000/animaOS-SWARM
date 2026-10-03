@@ -55,6 +55,26 @@ describe('isRetryableSendError', () => {
 });
 
 describe('useSessionSends', () => {
+  it('sends a skill message with its skill', async () => {
+    const startRun = vi.spyOn(daemon, 'startRun').mockResolvedValue({
+      run: runFixture('run_1'),
+    });
+    const { result } = renderHook(() =>
+      useSessionSends({ onAccepted: vi.fn(), onFailed: vi.fn() }),
+    );
+
+    act(() => result.current.send({ ...message('k1'), skill: 'notes' }));
+
+    await waitFor(() =>
+      expect(startRun).toHaveBeenCalledWith(
+        'agent-main',
+        'chat:1',
+        { text: 'text k1', mode: 'queue', skill: 'notes' },
+        'k1',
+      ),
+    );
+  });
+
   it('sends one message at a time per session, in the order written', async () => {
     const first = deferred<Awaited<ReturnType<typeof daemon.startRun>>>();
     const startRun = vi

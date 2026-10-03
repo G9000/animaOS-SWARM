@@ -324,6 +324,24 @@ describe('WorkspaceShell', () => {
     expect(screen.getByText('Approvals page')).toBeVisible();
   });
 
+  it('opens Skills from the navigation and the command menu', async () => {
+    const user = userEvent.setup();
+    render(<Shell skills={<div>Skills page</div>} />);
+    const nav = screen.getByRole('navigation', {
+      name: 'Workspace navigation',
+    });
+
+    await user.click(within(nav).getByRole('button', { name: 'Skills' }));
+    expect(screen.getByText('Skills page')).toBeVisible();
+    expect(within(nav).getByRole('button', { name: 'Skills' })).toHaveAttribute(
+      'aria-current',
+      'page',
+    );
+
+    await user.keyboard('{Control>}k{/Control}');
+    expect(screen.getByRole('option', { name: /Go to Skills/ })).toBeVisible();
+  });
+
   it('shows the main agent identity in the sidebar presence block', () => {
     render(<Shell connection="offline" />);
     const sidebar = screen.getByRole('complementary');

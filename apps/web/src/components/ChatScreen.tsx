@@ -533,10 +533,12 @@ export function Composer({
     el.style.height = `${Math.min(el.scrollHeight, 192)}px`;
   }, [draft]);
 
-  /** Runs a command that needs nothing more; completes one that does. */
+  /** Runs a command that needs nothing more; completes one that does, and
+   *  a skill, which takes the request after its name (spec §15.3). */
   const pick = (command: SlashCommand, complete = false) => {
-    if (command.needs || complete) {
-      setDraft(`/${command.name}${command.needs ? ' ' : ''}`);
+    const takesText = Boolean(command.needs || command.skill);
+    if (takesText || complete) {
+      setDraft(`/${command.name}${takesText ? ' ' : ''}`);
       taRef.current?.focus();
       return;
     }

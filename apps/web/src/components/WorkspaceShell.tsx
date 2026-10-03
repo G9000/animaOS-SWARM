@@ -11,13 +11,21 @@ import { WorkspaceCapabilities } from './WorkspaceCapabilities';
 import { CommandMenu, type StudioCommand } from './CommandMenu';
 import { PROMPT_LIBRARY } from '../lib/prompt-library';
 import { sessionKey } from '../lib/session-groups';
-import { GearIcon, PulseIcon, SendIcon, ShieldIcon, SparkIcon } from './icons';
+import {
+  BoltIcon,
+  GearIcon,
+  PulseIcon,
+  SendIcon,
+  ShieldIcon,
+  SparkIcon,
+} from './icons';
 import { ghostBtnCls } from './ui-bits';
 
 /** Pages this release renders; the other hash pages open the conversation
  *  until their milestones build them. */
 export const AVAILABLE_PAGES = [
   'approvals',
+  'skills',
   'work',
   'files',
   'connectors',
@@ -36,6 +44,7 @@ interface Destination {
 
 const PRIMARY_DESTINATIONS: Destination[] = [
   { page: 'approvals', label: 'Approvals', icon: <ShieldIcon size={16} /> },
+  { page: 'skills', label: 'Skills', icon: <BoltIcon size={16} /> },
   { page: 'work', label: 'Work', icon: <SparkIcon size={16} /> },
   { page: 'files', label: 'Files', icon: <PulseIcon size={16} /> },
   { page: 'connectors', label: 'Connectors', icon: <GearIcon size={16} /> },
@@ -274,6 +283,7 @@ export function WorkspaceShell({
   sidebar = null,
   connectors = null,
   approvals = null,
+  skills = null,
   pendingApprovals = 0,
   sessions = [],
   onOpenSession,
@@ -297,6 +307,8 @@ export function WorkspaceShell({
   connectors?: ReactNode | null;
   /** The Approvals page, shown at `#/approvals`. */
   approvals?: ReactNode | null;
+  /** The Skills page, shown at `#/skills`. */
+  skills?: ReactNode | null;
   /** Approvals waiting for the owner, for the destination's badge. */
   pendingApprovals?: number;
   /** The listed sessions the command menu offers by title. */
@@ -588,6 +600,8 @@ export function WorkspaceShell({
               </div>
               {page === 'approvals' ? (
                 approvals
+              ) : page === 'skills' ? (
+                skills
               ) : page === 'connectors' ? (
                 connectors
               ) : page === 'files' ? (

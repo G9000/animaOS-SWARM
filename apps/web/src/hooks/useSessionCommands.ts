@@ -11,8 +11,10 @@ import { daemon } from '../lib/daemon-api';
 import type { Navigate } from '../lib/hash-route';
 import { sessionKey } from '../lib/session-groups';
 import {
+  SKILL_NOT_IN_TELEGRAM_CHAT,
   parseSlashCommand,
   runSlashCommand,
+  type SlashCommand,
   type SlashCommandHandlers,
 } from '../lib/slash-commands';
 import { isOwnerWritten, type HelperTarget } from '../lib/transcript';
@@ -45,15 +47,19 @@ export interface SessionCommandOptions {
   /** The open session's reply in progress. */
   activeRun: Run | null;
   updateChat: (key: string, patch: CommandChatPatch) => void;
-  /** Starts a new chat with its first message (spec §3.3). */
-  startChat: (text: string) => void;
+  /** Starts a new chat with its first message (spec §3.3), sent with
+   *  `skill` when it is a `/skill` message. */
+  startChat: (text: string, skill?: string) => void;
   queueSend: (
     target: Pick<Session, 'agentId' | 'id' | 'kind'>,
     conversation: string,
     text: string,
     idempotencyKey: string,
     mode?: RunMode,
+    skill?: string,
   ) => void;
+  /** The commands the composer offers: the built-ins and the skills. */
+  slashCommands: readonly SlashCommand[];
   /** Reads the open session's ledger again. */
   refreshRuns: () => void;
   /** Shows (or clears) the composer's error. */
@@ -171,8 +177,10 @@ export function useSessionCommands(
       if (!current.canSend()) return;
       const text = (override ?? current.draft).trim();
       if (!text) return;
-      const command = parseSlashCommand(text);
-      if (command && current.chatKey) {
+      const command = parseSlashCommand(text, current.slashCommands);
+      // A skill is a message: the whole text goes, with its skill (spec §15.3).
+      const skill = command?.command.skill;
+      if (command && !skill && current.chatKey) {
         const key = current.chatKey;
         current.updateChat(key, { draft: '', error: null });
         const problem = runSlashCommand(command, handlers());
@@ -181,12 +189,20 @@ export function useSessionCommands(
         return;
       }
       if (!current.routeSessionId) {
-        current.startChat(text);
+        if (skill) current.startChat(text, skill);
+        else current.startChat(text);
         return;
       }
       const { session, activeRun, chatKey } = current;
       // Until its record loads, the session's kind is unknown.
       if (!session || !chatKey) return;
+      if (session.kind === 'telegram' && skill) {
+        current.updateChat(chatKey, {
+          draft: text,
+          error: SKILL_NOT_IN_TELEGRAM_CHAT,
+        });
+        return;
+      }
       if (session.kind === 'telegram' && !current.telegramReady) return;
       // A restored message sent unchanged keeps its key; anything else is new.
       const idempotencyKey =
@@ -199,15 +215,21 @@ export function useSessionCommands(
         resend: null,
         delivery: null,
       });
-      current.queueSend(
-        session,
-        chatKey,
-        text,
-        idempotencyKey,
-        mode === 'steer' && activeRun && session.capabilities.steer
+      // A skill message never steers (the daemon refuses it).
+      const sendMode =
+        mode === 'steer' && !skill && activeRun && session.capabilities.steer
           ? 'steer'
-          : 'queue',
-      );
+          : 'queue';
+      if (skill)
+        current.queueSend(
+          session,
+          chatKey,
+          text,
+          idempotencyKey,
+          sendMode,
+          skill,
+        );
+      else current.queueSend(session, chatKey, text, idempotencyKey, sendMode);
     };
 
     return {
@@ -225,7 +247,17 @@ export function useSessionCommands(
           !isOwnerWritten(run)
         )
           return false;
-        queueSend(session, chatKey, run.input.text, crypto.randomUUID());
+        const key = crypto.randomUUID();
+        if (run.input.skill)
+          queueSend(
+            session,
+            chatKey,
+            run.input.text,
+            key,
+            'queue',
+            run.input.skill,
+          );
+        else queueSend(session, chatKey, run.input.text, key);
         return true;
       },
       openTarget: (target: HelperTarget) =>

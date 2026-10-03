@@ -27,8 +27,10 @@ import { useLiveSession } from './hooks/useLiveSession';
 import { useSessionCommands } from './hooks/useSessionCommands';
 import { useSessionPending } from './hooks/useSessionPending';
 import { useSessionSends } from './hooks/useSessionSends';
+import { useSkillCommands } from './hooks/useSkillCommands';
 import { useTranscriptActions } from './hooks/useTranscriptActions';
 import { ApprovalsPage } from './pages/ApprovalsPage';
+import { SkillsPage } from './pages/SkillsPage';
 import {
   SESSION_MESSAGES_LIVE_POLL_MS,
   SESSION_MESSAGES_POLL_MS,
@@ -47,7 +49,6 @@ import { pendingApprovalCount } from './lib/approvals';
 import { useHashRoute, type HashRoute } from './lib/hash-route';
 import { exportFileName, sessionKey } from './lib/session-groups';
 import { loadDraft, storeDraft } from './lib/drafts';
-import { SLASH_COMMANDS } from './lib/slash-commands';
 import { safeIntegrationError } from './lib/telegram';
 
 interface AgentOperation {
@@ -472,6 +473,11 @@ export function ViewHarness() {
     // A listed session is read again with the sidebar.
     refreshSession: () => setSessionRereads((value) => value + 1),
   });
+  const slashCommands = useSkillCommands({
+    version: live.state.skillsVersion,
+    epoch: live.state.epoch,
+    enabled: connection === 'online',
+  });
   useEffect(() => {
     setStreamOpen(live.status === 'open');
   }, [live.status]);
@@ -804,6 +810,7 @@ export function ViewHarness() {
     text: string,
     idempotencyKey: string,
     mode: RunMode = 'queue',
+    skill?: string,
   ) => {
     if (
       !availableAgentIdsRef.current.has(target.agentId) ||
@@ -817,12 +824,13 @@ export function ViewHarness() {
       conversation,
       text,
       mode,
+      ...(skill ? { skill } : {}),
       telegram: target.kind === 'telegram',
     });
   };
 
   /** A new chat becomes a session with its first message (spec §3.3). */
-  const startChat = async (targetId: string, text: string) => {
+  const startChat = async (targetId: string, text: string, skill?: string) => {
     const homeKey = chatKey(targetId, HOME_CONVERSATION);
     if (pendingSendsRef.current.has(homeKey)) return;
     pendingSendsRef.current.add(homeKey);
@@ -868,7 +876,9 @@ export function ViewHarness() {
         lastConversationRef.current = created;
       else navigate(created, { replace: true });
     }
-    queueSend(session, target, text, crypto.randomUUID());
+    if (skill)
+      queueSend(session, target, text, crypto.randomUUID(), 'queue', skill);
+    else queueSend(session, target, text, crypto.randomUUID());
   };
 
   const newChat = () => navigate({ kind: 'home' });
@@ -941,10 +951,11 @@ export function ViewHarness() {
     telegramReady: activeConnector !== null,
     activeRun,
     updateChat,
-    startChat: (text) => {
-      if (agent) void startChat(agent.id, text);
+    startChat: (text, skill) => {
+      if (agent) void startChat(agent.id, text, skill);
     },
     queueSend,
+    slashCommands,
     refreshRuns: live.refreshRuns,
     setError: setWorkspaceError,
     navigate,
@@ -1092,7 +1103,7 @@ export function ViewHarness() {
         onSend: commands.send,
         error: workspaceError,
         onDismissError: () => setWorkspaceError(null),
-        commands: SLASH_COMMANDS,
+        commands: slashCommands,
         runActive: activeRun !== null,
         onStop:
           activeRun && activeSession?.capabilities.stop
@@ -1253,6 +1264,19 @@ export function ViewHarness() {
                 commands.openTarget({
                   agentId: approval.agentId,
                   sessionId: approval.sessionId,
+                })
+              }
+            />
+          }
+          skills={
+            <SkillsPage
+              version={live.state.skillsVersion}
+              epoch={live.state.epoch}
+              online={connection === 'online'}
+              onOpenSession={(proposer) =>
+                commands.openTarget({
+                  agentId: proposer.agentId,
+                  sessionId: proposer.sessionId,
                 })
               }
             />
