@@ -132,3 +132,23 @@
   font-family: var(--font-mono);
   font-size: 11px;
 }
+
+.automation-notice {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  border: 1px solid var(--color-line);
+  border-radius: 12px;
+  padding: 8px 10px;
+}
+.automation-notice-title {
+  color: var(--color-ink);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.automation-notice-detail {
+  color: var(--color-ink-3);
+  font-size: 12px;
+}

@@ -37,6 +37,7 @@ import {
   BOOTSTRAP_POLL_MS,
   BOOTSTRAP_SUMMARY_POLL_MS,
 } from './hooks/useDaemonBootstrap';
+import { automationFixture } from './test/automations';
 import { sessionFixture } from './test/sessions';
 import { skillFixture } from './test/skills';
 import {
@@ -477,6 +478,7 @@ beforeEach(() => {
     schedules: [],
   });
   vi.spyOn(daemon, 'listSkills').mockResolvedValue([]);
+  vi.spyOn(daemon, 'listAutomations').mockResolvedValue([]);
   routes = mockSessionRoutes();
   mockRuns();
   // No stream events unless a test scripts them; the harness polls.
@@ -2156,8 +2158,8 @@ it('opens the new session on a page that still shows the conversation', async ()
     agents: [snapshot('agent-main', 'Nova', 1)],
   });
   mockProviders();
-  // Automations arrives in a later release; until then it shows the chat.
-  window.history.replaceState(null, '', '/#/automations');
+  // Memory arrives in a later release; until then it shows the chat.
+  window.history.replaceState(null, '', '/#/memory');
   render(<ViewHarness />);
 
   await user.type(await screen.findByPlaceholderText('Message Nova…'), 'Hello');
@@ -2165,6 +2167,26 @@ it('opens the new session on a page that still shows the conversation', async ()
 
   // A reload of the page must find the session, not a new chat.
   await waitFor(() => expect(window.location.hash).toBe('#/s/chat%3Anew-1'));
+});
+
+it('shows the companion’s automations at #/automations', async () => {
+  vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+  vi.spyOn(daemon, 'listAgents').mockResolvedValue({
+    agents: [snapshot('agent-main', 'Nova', 1)],
+  });
+  mockProviders();
+  vi.mocked(daemon.listAutomations).mockResolvedValue([
+    automationFixture('schedule-1', { name: 'Morning brief' }),
+  ]);
+  window.history.replaceState(null, '', '/#/automations');
+  render(<ViewHarness />);
+
+  expect(
+    await screen.findByRole('article', { name: 'Morning brief' }),
+  ).toBeVisible();
+  expect(daemon.listAutomations).toHaveBeenCalledWith('agent-main', {
+    signal: expect.any(AbortSignal),
+  });
 });
 
 it('keeps a page open when the first send creates its session, then returns to that session', async () => {

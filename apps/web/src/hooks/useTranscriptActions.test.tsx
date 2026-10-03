@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { emptyLiveRun } from '../lib/session-events';
 import type { ToolStep } from '../lib/transcript';
+import { automationFixture } from '../test/automations';
 import { approvalFixture, runFixture } from '../test/live';
 import { sessionFixture } from '../test/sessions';
 import {
@@ -75,6 +76,34 @@ describe('useTranscriptActions', () => {
     };
     return { options, ...renderHook(() => useTranscriptActions(options)) };
   }
+
+  it('finds the automation a tool call made and undoes it', async () => {
+    const made = automationFixture('schedule-1', {
+      createdBy: {
+        kind: 'agent',
+        agentId: 'agent-main',
+        sessionId: 'room-7',
+        runId: 'run_7',
+        toolCallId: 'call_a',
+      },
+    });
+    const undoAutomation = vi.fn().mockResolvedValue(true);
+    const { result } = actionsFor({ automations: [made], undoAutomation });
+    const created: ToolStep = {
+      ...helperStep(null),
+      name: 'create_automation',
+      toolCallId: 'call_a',
+      status: 'success',
+      helper: null,
+    };
+
+    expect(result.current.automationNotice?.(created)).toBe(made);
+    await act(async () => {
+      expect(await result.current.onUndoAutomation?.(made)).toBe(true);
+    });
+    expect(undoAutomation).toHaveBeenCalledWith(made);
+    expect(actionsFor({}).result.current.onUndoAutomation).toBeUndefined();
+  });
 
   it('offers what the session allows through its handlers', () => {
     const { result, options } = actionsFor({});

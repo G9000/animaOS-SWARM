@@ -1,4 +1,8 @@
-import { isTerminalRunStatus, type Run } from '@animaOS-SWARM/sdk';
+import {
+  isTerminalRunStatus,
+  type Automation,
+  type Run,
+} from '@animaOS-SWARM/sdk';
 
 import type { ApprovalDecide } from './approvals';
 import { emptyLiveRun, stepRunId, type LiveRun } from './session-events';
@@ -82,6 +86,11 @@ export interface TranscriptActions {
   /** The companion whose transcript this is: only its approvals offer
    *  "Always allow", as rules for other agents are not managed here yet. */
   companionAgentId?: string;
+  /** The automation a `create_automation` call made, for its notice card
+   *  (spec §15.2). */
+  automationNotice?: (step: ToolStep) => Automation | null;
+  /** Undo (delete) an automation the companion made; true when it went. */
+  onUndoAutomation?: (automation: Automation) => Promise<boolean>;
 }
 
 export interface TranscriptInput {

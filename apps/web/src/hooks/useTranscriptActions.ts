@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import type { Run, Session } from '@animaOS-SWARM/sdk';
+import type { Automation, Run, Session } from '@animaOS-SWARM/sdk';
 
 import {
   decideApproval as sendApprovalDecision,
   type ApprovalDecide,
 } from '../lib/approvals';
+import { automationNoticeFor } from '../lib/automations';
 import type { LiveState } from '../lib/session-events';
 import type {
   HelperTarget,
@@ -55,7 +56,13 @@ export interface TranscriptActionOptions {
   decideApproval?: ApprovalDecide;
   /** The companion shown: only its approvals can become rules. */
   companionId?: string | null;
+  /** The companion's automations, where a notice card finds its own. */
+  automations?: readonly Automation[];
+  /** Deletes an automation (the notice card's Undo). */
+  undoAutomation?: (automation: Automation) => Promise<boolean>;
 }
+
+const NO_AUTOMATIONS: readonly Automation[] = [];
 
 /**
  * What the owner can do from the open session's transcript (spec §15.2):
@@ -81,6 +88,8 @@ export function useTranscriptActions({
   openSession,
   decideApproval,
   companionId,
+  automations = NO_AUTOMATIONS,
+  undoAutomation,
 }: TranscriptActionOptions): TranscriptActions {
   const latest = {
     stopRun,
@@ -89,6 +98,7 @@ export function useTranscriptActions({
     compact,
     openSession,
     decideApproval,
+    undoAutomation,
   };
   const latestRef = useRef(latest);
   useEffect(() => {
@@ -104,6 +114,7 @@ export function useTranscriptActions({
   const cancellable = session?.capabilities.stop === true;
   const canResend = resendable && session?.capabilities.send === true;
   const compactable = session?.capabilities.compact ? session : null;
+  const canUndo = undoAutomation !== undefined;
   return useMemo<TranscriptActions>(
     () => ({
       ...(cancellable
@@ -135,6 +146,15 @@ export function useTranscriptActions({
           approval,
           input,
         ),
+      automationNotice: (step: ToolStep) =>
+        automationNoticeFor(step, automations),
+      ...(canUndo
+        ? {
+            onUndoAutomation: (automation: Automation) =>
+              latestRef.current.undoAutomation?.(automation) ??
+              Promise.resolve(false),
+          }
+        : {}),
       ...(companionId ? { companionAgentId: companionId } : {}),
     }),
     [
@@ -145,6 +165,8 @@ export function useTranscriptActions({
       resent,
       compacting,
       companionId,
+      automations,
+      canUndo,
     ],
   );
 }

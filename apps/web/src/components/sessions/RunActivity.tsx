@@ -1,5 +1,5 @@
 import { useEffect, useState, type ReactNode } from 'react';
-import { isTerminalRunStatus } from '@animaOS-SWARM/sdk';
+import { isTerminalRunStatus, type Automation } from '@animaOS-SWARM/sdk';
 
 import { isActiveRun, type LiveRun } from '../../lib/session-events';
 import {
@@ -12,6 +12,7 @@ import {
 } from '../../lib/transcript';
 import type { ChatMessage } from '../../lib/types';
 import { ApprovalCard } from './ApprovalCard';
+import { AutomationNoticeCard } from './AutomationNoticeCard';
 import { HelperCard } from './HelperCard';
 import { ToolStepCard } from './ToolStepCard';
 
@@ -73,6 +74,14 @@ export function ToolBlock({
     : `Used ${count} ${count === 1 ? 'tool' : 'tools'} · ${formatElapsed(total)}`;
   const expanded = active || open;
   const keys = stepKeys(steps);
+  // Spec §15.2: an automation the companion created stays visible with
+  // Undo, even when the block is collapsed.
+  const notices: Automation[] = [];
+  for (const candidate of steps) {
+    const automation = actions?.automationNotice?.(candidate) ?? null;
+    if (automation && !notices.some((known) => known.id === automation.id))
+      notices.push(automation);
+  }
   return (
     <div className="tool-block" data-active={active || undefined}>
       {active ? (
@@ -104,6 +113,13 @@ export function ToolBlock({
           ))}
         </ul>
       )}
+      {notices.map((automation) => (
+        <AutomationNoticeCard
+          key={automation.id}
+          automation={automation}
+          onUndo={actions?.onUndoAutomation}
+        />
+      ))}
     </div>
   );
 }

@@ -28,8 +28,10 @@ import { useSessionCommands } from './hooks/useSessionCommands';
 import { useSessionPending } from './hooks/useSessionPending';
 import { useSessionSends } from './hooks/useSessionSends';
 import { useSkillCommands } from './hooks/useSkillCommands';
+import { useAutomations } from './hooks/useAutomations';
 import { useTranscriptActions } from './hooks/useTranscriptActions';
 import { ApprovalsPage } from './pages/ApprovalsPage';
+import { AutomationsPage } from './pages/AutomationsPage';
 import { SkillsPage } from './pages/SkillsPage';
 import {
   SESSION_MESSAGES_LIVE_POLL_MS,
@@ -46,6 +48,7 @@ import {
 } from './lib/daemon-api';
 import { selectMainAgent } from './lib/agent-access';
 import { pendingApprovalCount } from './lib/approvals';
+import { checkinScheduleId } from './lib/automations';
 import { useHashRoute, type HashRoute } from './lib/hash-route';
 import { exportFileName, sessionKey } from './lib/session-groups';
 import { loadDraft, storeDraft } from './lib/drafts';
@@ -478,6 +481,14 @@ export function ViewHarness() {
     epoch: live.state.epoch,
     enabled: connection === 'online',
   });
+  const automations = useAutomations({
+    agentId,
+    version: live.state.automationsVersion,
+    epoch: live.state.epoch,
+    enabled: connection === 'online',
+  });
+  const [automationFocus, setAutomationFocus] = useState<string | null>(null);
+  const clearAutomationFocus = useCallback(() => setAutomationFocus(null), []);
   useEffect(() => {
     setStreamOpen(live.status === 'open');
   }, [live.status]);
@@ -997,6 +1008,8 @@ export function ViewHarness() {
     compacting: commands.compacting,
     openSession: commands.openTarget,
     companionId: agentId,
+    automations: automations.automations,
+    undoAutomation: automations.remove,
   });
 
   if (connection === 'unknown' || (connection === 'online' && !loaded)) {
@@ -1076,6 +1089,14 @@ export function ViewHarness() {
         agent.name)
       : null;
 
+  const checkinId =
+    viewedSession?.kind === 'checkin'
+      ? checkinScheduleId(viewedSession.id)
+      : null;
+  const checkinAutomation = checkinId
+    ? (automations.automations.find((item) => item.id === checkinId) ?? null)
+    : null;
+
   const sessionView = (
     <SessionView
       agent={sessionAgent ?? agent}
@@ -1084,6 +1105,11 @@ export function ViewHarness() {
       pending={openPending}
       runs={live.runs}
       actions={transcriptActions}
+      automation={checkinAutomation}
+      onEditAutomation={(automation) => {
+        setAutomationFocus(automation.id);
+        navigate({ kind: 'page', page: 'automations' });
+      }}
       delegatedBy={delegatedBy}
       announcement={live.announcement}
       hasOlder={history.hasOlder}
@@ -1265,6 +1291,22 @@ export function ViewHarness() {
                   agentId: approval.agentId,
                   sessionId: approval.sessionId,
                 })
+              }
+            />
+          }
+          automations={
+            <AutomationsPage
+              view={automations}
+              agentId={agent.id}
+              version={live.state.automationsVersion}
+              online={connection === 'online'}
+              telegramConnectorId={
+                telegramConnector?.approvedChat ? telegramConnector.id : null
+              }
+              focusId={automationFocus}
+              onFocusHandled={clearAutomationFocus}
+              onOpenSession={(sessionId) =>
+                commands.openTarget({ agentId: agent.id, sessionId })
               }
             />
           }
