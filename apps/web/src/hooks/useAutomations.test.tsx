@@ -111,4 +111,29 @@ describe('useAutomations', () => {
     // Each action, and the 409, read the list again.
     expect(daemon.listAutomations).toHaveBeenCalledTimes(4);
   });
+
+  it('rejects an undo the daemon refused, so the card can say why', async () => {
+    const refusal = new DaemonHttpError(409, {
+      error: 'This automation is already running',
+    });
+    vi.spyOn(daemon, 'deleteAutomation').mockRejectedValue(refusal);
+    const { result } = renderHook(() =>
+      useAutomations({
+        agentId: 'agent-main',
+        version: 0,
+        epoch: 0,
+        enabled: true,
+      }),
+    );
+    await waitFor(() => expect(result.current.loaded).toBe(true));
+
+    await act(async () => {
+      await expect(
+        result.current.undo(result.current.automations[0]),
+      ).rejects.toBe(refusal);
+    });
+    // The page-level error stays empty; the 409 read the list again.
+    expect(result.current.error).toBeNull();
+    expect(daemon.listAutomations).toHaveBeenCalledTimes(2);
+  });
 });

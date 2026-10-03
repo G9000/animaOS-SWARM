@@ -1009,7 +1009,7 @@ export function ViewHarness() {
     openSession: commands.openTarget,
     companionId: agentId,
     automations: automations.automations,
-    undoAutomation: automations.remove,
+    undoAutomation: automations.undo,
   });
 
   if (connection === 'unknown' || (connection === 'online' && !loaded)) {

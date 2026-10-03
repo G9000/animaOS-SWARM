@@ -142,8 +142,42 @@ describe('parseSchedule', () => {
       'tomorrow at 25:00',
       'every someday at 9',
       '0 9 * * *',
+      'friday at 9',
+      'on friday at 9',
+      'monday at 8:30',
+      'on monday and thursday at 7pm',
+      'fridays and tuesday at 9',
     ]) {
       expect(parseSchedule(phrase, utc), phrase).toBeNull();
+    }
+  });
+
+  it('reads a day name only after every or in the plural', () => {
+    for (const phrase of [
+      'every friday at 9',
+      'fridays at 9',
+      'on fridays at 9',
+    ]) {
+      expect(parseSchedule(phrase, utc), phrase).toEqual({
+        type: 'cron',
+        expression: '0 9 * * 5',
+        timeZone: 'UTC',
+      });
+    }
+  });
+
+  it('returns null, and does not throw, for an empty or half-typed time zone', () => {
+    for (const timeZone of ['', 'Europe/Lon', 'Not/AZone']) {
+      for (const phrase of [
+        'tomorrow at 9',
+        'every monday at 8',
+        'every hour',
+      ]) {
+        expect(
+          parseSchedule(phrase, { nowMs: NOW, timeZone }),
+          `${phrase} in "${timeZone}"`,
+        ).toBeNull();
+      }
     }
   });
 });

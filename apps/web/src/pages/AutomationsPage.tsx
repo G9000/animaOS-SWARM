@@ -69,9 +69,11 @@ export function AutomationsPage({
     let saved = false;
     if (current) {
       saved = await view.update(current, {
-        name: draft.name,
+        // The daemon refuses an empty name; the target is sent only when
+        // the owner changed it.
+        ...(draft.name ? { name: draft.name } : {}),
         prompt: draft.prompt,
-        target: draft.target,
+        ...(draft.target ? { target: draft.target } : {}),
         activeHours: draft.activeHours,
         ...(draft.trigger ? { trigger: draft.trigger } : {}),
       });
@@ -79,7 +81,7 @@ export function AutomationsPage({
       saved = await view.create({
         prompt: draft.prompt,
         trigger: draft.trigger,
-        target: draft.target,
+        target: draft.target ?? { type: 'workspace' },
         ...(draft.name ? { name: draft.name } : {}),
         ...(draft.activeHours ? { activeHours: draft.activeHours } : {}),
       });

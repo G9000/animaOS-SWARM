@@ -25,7 +25,10 @@ export interface AutomationDraft {
   /** Null while editing: the schedule stays as it is. */
   trigger: AutomationTrigger | null;
   activeHours: ActiveHours | null;
-  target: AutomationTarget;
+  /** Null when the owner did not pick one, or picked Telegram with no
+   *  connector to point at: an edit then keeps what is stored, and a new
+   *  automation runs in its own thread. */
+  target: AutomationTarget | null;
 }
 
 export interface AutomationEditorProps {
@@ -38,7 +41,10 @@ export interface AutomationEditorProps {
   onCancel: () => void;
 }
 
-type Preview = { runs: number[] } | { error: string } | null;
+type Preview =
+  | { key: string; runs: number[] }
+  | { key: string; error: string }
+  | null;
 
 const EVERY_DAY = [0, 1, 2, 3, 4, 5, 6];
 
@@ -72,9 +78,9 @@ export function AutomationEditor({
   const [days, setDays] = useState<number[]>(
     automation?.activeHours?.days ?? EVERY_DAY,
   );
-  const [target, setTarget] = useState<'workspace' | 'telegram'>(
-    automation?.target.type === 'connector' ? 'telegram' : 'workspace',
-  );
+  const initialTarget =
+    automation?.target.type === 'connector' ? 'telegram' : 'workspace';
+  const [target, setTarget] = useState<'workspace' | 'telegram'>(initialTarget);
   const [preview, setPreview] = useState<Preview>(null);
   const [saving, setSaving] = useState(false);
 
@@ -112,11 +118,12 @@ export function AutomationEditor({
         { signal: controller.signal },
       )
       .then((runs) => {
-        if (!controller.signal.aborted) setPreview({ runs });
+        if (!controller.signal.aborted) setPreview({ key: previewKey, runs });
       })
       .catch((caught: unknown) => {
         if (controller.signal.aborted) return;
         setPreview({
+          key: previewKey,
           error:
             caught instanceof DaemonHttpError
               ? caught.message
@@ -132,12 +139,23 @@ export function AutomationEditor({
     revealInvisible(name).count + revealInvisible(prompt).count,
   );
   const keepsSchedule = automation !== null && !cronMode && trigger === null;
+  // A new schedule is saved only once the daemon has shown its next runs.
+  const previewed =
+    preview !== null && preview.key === previewKey && 'runs' in preview;
   const canSave =
     prompt.trim() !== '' &&
     !phraseProblem &&
-    (trigger !== null || keepsSchedule) &&
+    (trigger !== null ? previewed : keepsSchedule) &&
     (!hoursOn || days.length > 0) &&
     !saving;
+
+  const pickedTarget = (): AutomationTarget | null => {
+    if (automation && target === initialTarget) return null;
+    if (target === 'workspace') return { type: 'workspace' };
+    return telegramConnectorId
+      ? { type: 'connector', connectorId: telegramConnectorId }
+      : null;
+  };
 
   const submit = async () => {
     if (!canSave) return;
@@ -147,10 +165,7 @@ export function AutomationEditor({
       prompt,
       trigger,
       activeHours,
-      target:
-        target === 'telegram' && telegramConnectorId
-          ? { type: 'connector', connectorId: telegramConnectorId }
-          : { type: 'workspace' },
+      target: pickedTarget(),
     });
     if (!saved) setSaving(false);
   };

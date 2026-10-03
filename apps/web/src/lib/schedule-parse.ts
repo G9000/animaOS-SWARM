@@ -156,13 +156,16 @@ function onDay(
   );
 }
 
-function weekdays(text: string): number[] | null {
-  const names = text
+/** Day names ("friday", "tue, fri"). Without `every`, each must be plural
+ *  ("fridays"), since a bare day name could mean just the next one. */
+function weekdays(text: string, pluralOnly: boolean): number[] | null {
+  const raw = text
     .split(/\s*(?:,|\band\b)\s*/)
-    .map((name) => name.trim().replace(/s$/, ''))
+    .map((name) => name.trim())
     .filter(Boolean);
-  if (names.length === 0) return null;
-  const days = names.map((name) => WEEKDAYS[name]);
+  if (raw.length === 0) return null;
+  if (pluralOnly && raw.some((name) => !name.endsWith('s'))) return null;
+  const days = raw.map((name) => WEEKDAYS[name.replace(/s$/, '')]);
   if (days.some((day) => day === undefined)) return null;
   return [...new Set(days as number[])].sort((left, right) => left - right);
 }
@@ -179,6 +182,17 @@ function cron(
   };
 }
 
+/** True when `timeZone` is a zone the runtime knows. An empty or half-typed
+ *  name ("Europe/Lon") is not, and `Intl.DateTimeFormat` throws for it. */
+function knownTimeZone(timeZone: string): boolean {
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** What a plain-language phrase means, or null (spec §15.4). */
 export function parseSchedule(
   text: string,
@@ -187,6 +201,7 @@ export function parseSchedule(
   const phrase = text.trim().toLowerCase().replace(/\s+/g, ' ');
   if (!phrase) return null;
   const { timeZone } = options;
+  if (!knownTimeZone(timeZone)) return null;
 
   let match = /^(?:every day|daily|each day) at (.+)$/.exec(phrase);
   if (match) {
@@ -236,10 +251,12 @@ export function parseSchedule(
       ? { type: 'interval', intervalMs: count * unit }
       : null;
   }
-  match = /^(?:every |on )?([a-z, ]+?) at (.+)$/.exec(phrase);
+  // `every friday at 9`, or a plural day name (`fridays at 9`). A bare
+  // `friday at 9` or `on friday at 9` could mean one day, so it is not read.
+  match = /^(?:(every )|on )?([a-z, ]+?) at (.+)$/.exec(phrase);
   if (match) {
-    const days = weekdays(match[1]);
-    const clock = parseClock(match[2]);
+    const days = weekdays(match[2], match[1] === undefined);
+    const clock = parseClock(match[3]);
     return days && clock ? cron(clock, days.join(','), timeZone) : null;
   }
   return null;

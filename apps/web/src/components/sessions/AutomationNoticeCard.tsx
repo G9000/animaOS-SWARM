@@ -1,7 +1,7 @@
 import { useState } from 'react';
-import type { Automation } from '@animaOS-SWARM/sdk';
+import { DaemonHttpError, type Automation } from '@animaOS-SWARM/sdk';
 
-import { formatWhen } from '../../lib/approvals';
+import { COMPANION_UNREACHABLE, formatWhen } from '../../lib/approvals';
 import { describeActiveHours, describeTrigger } from '../../lib/automations';
 import { revealInvisible } from '../../lib/skills';
 
@@ -16,11 +16,22 @@ export function AutomationNoticeCard({
   onUndo?: (automation: Automation) => Promise<boolean>;
 }) {
   const [undoing, setUndoing] = useState(false);
+  const [problem, setProblem] = useState<string | null>(null);
   const undo = async () => {
     if (!onUndo) return;
     setUndoing(true);
-    // On success the automation leaves the list, and this card with it.
-    if (!(await onUndo(automation))) setUndoing(false);
+    setProblem(null);
+    try {
+      // On success the automation leaves the list, and this card with it.
+      if (await onUndo(automation)) return;
+    } catch (caught) {
+      setProblem(
+        caught instanceof DaemonHttpError
+          ? caught.message
+          : COMPANION_UNREACHABLE,
+      );
+    }
+    setUndoing(false);
   };
   const name = revealInvisible(automation.name).text;
   const detail = revealInvisible(
@@ -51,6 +62,11 @@ export function AutomationNoticeCard({
         >
           {undoing ? 'Undoing…' : 'Undo'}
         </button>
+      )}
+      {problem && (
+        <p className="automation-problem" role="status">
+          {problem}
+        </p>
       )}
     </div>
   );

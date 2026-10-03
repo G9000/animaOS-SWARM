@@ -34,6 +34,9 @@ export interface AutomationsView {
   update: (automation: Automation, patch: AutomationPatch) => Promise<boolean>;
   setEnabled: (automation: Automation, enabled: boolean) => Promise<boolean>;
   remove: (automation: Automation) => Promise<boolean>;
+  /** Deletes like `remove`, but a refusal rejects with the daemon's error
+   *  instead of landing in `error`: the notice card's Undo shows it. */
+  undo: (automation: Automation) => Promise<boolean>;
   runNow: (automation: Automation) => Promise<boolean>;
 }
 
@@ -91,13 +94,21 @@ export function useAutomations({
   const refresh = useCallback(() => void load(), [load]);
 
   const act = useCallback(
-    async (work: (agentId: string) => Promise<unknown>) => {
+    async (work: (agentId: string) => Promise<unknown>, rethrow = false) => {
       if (!agentId) return false;
       setActionError(null);
       setActionStatus(null);
       try {
         await work(agentId);
       } catch (caught) {
+        if (rethrow) {
+          if (
+            caught instanceof DaemonHttpError &&
+            (caught.status === 404 || caught.status === 409)
+          )
+            await load();
+          throw caught;
+        }
         setActionError(message(caught));
         if (caught instanceof DaemonHttpError) {
           setActionStatus(caught.status);
@@ -136,6 +147,11 @@ export function useAutomations({
       act((id) => daemon.deleteAutomation(id, automation.id)),
     [act],
   );
+  const undo = useCallback(
+    (automation: Automation) =>
+      act((id) => daemon.deleteAutomation(id, automation.id), true),
+    [act],
+  );
   const runNow = useCallback(
     (automation: Automation) =>
       act((id) => daemon.runAutomationNow(id, automation.id)),
@@ -153,6 +169,7 @@ export function useAutomations({
     update,
     setEnabled,
     remove,
+    undo,
     runNow,
   };
 }

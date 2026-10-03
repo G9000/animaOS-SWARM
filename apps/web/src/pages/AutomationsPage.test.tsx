@@ -25,6 +25,7 @@ function fakeView(overrides: Partial<AutomationsView> = {}): AutomationsView {
     update: vi.fn().mockResolvedValue(true),
     setEnabled: vi.fn().mockResolvedValue(true),
     remove: vi.fn().mockResolvedValue(true),
+    undo: vi.fn().mockResolvedValue(true),
     runNow: vi.fn().mockResolvedValue(true),
     ...overrides,
   };
@@ -236,6 +237,7 @@ describe('AutomationsPage', () => {
 
   it('sends active hours with a new automation', async () => {
     const user = userEvent.setup();
+    vi.mocked(daemon.previewAutomation).mockResolvedValue([10]);
     const view = fakeView();
     renderPage(view);
     await user.click(screen.getByRole('button', { name: 'New automation' }));
@@ -245,6 +247,7 @@ describe('AutomationsPage', () => {
     await user.click(within(form).getByLabelText('Only run between'));
     await user.click(within(form).getByLabelText('Sun'));
     await user.click(within(form).getByLabelText('Sat'));
+    await within(form).findByRole('region', { name: 'Next runs' });
     await user.click(
       within(form).getByRole('button', { name: 'Create automation' }),
     );
@@ -281,12 +284,139 @@ describe('AutomationsPage', () => {
       within(form).getByRole('button', { name: 'Save changes' }),
     );
 
+    // The target and schedule were not touched, so neither is sent.
     expect(view.update).toHaveBeenCalledWith(agentMade, {
       name: '<b>Stretch</b>',
       prompt: 'Stand up',
-      target: { type: 'workspace' },
       activeHours: null,
     });
+  });
+
+  it('keeps the target of a Telegram automation when only the prompt changes', async () => {
+    const user = userEvent.setup();
+    const onTelegram = automationFixture('schedule-4', {
+      name: 'Digest',
+      target: { type: 'connector', connectorId: 'connector-old' },
+    });
+    const view = fakeView({ automations: [onTelegram] });
+    renderPage(view);
+    await user.click(
+      within(screen.getByRole('article', { name: 'Digest' })).getByRole(
+        'button',
+        { name: 'Edit' },
+      ),
+    );
+    const form = screen.getByRole('form', { name: 'Edit Digest' });
+    const prompt = within(form).getByLabelText('Prompt');
+    await user.clear(prompt);
+    await user.type(prompt, 'New text');
+    await user.click(
+      within(form).getByRole('button', { name: 'Save changes' }),
+    );
+
+    expect(view.update).toHaveBeenCalledTimes(1);
+    const patch = vi.mocked(view.update).mock.calls[0][1];
+    expect(patch).toEqual({
+      name: 'Digest',
+      prompt: 'New text',
+      activeHours: null,
+    });
+    expect('target' in patch).toBe(false);
+  });
+
+  it('sends the target once the owner picks one', async () => {
+    const user = userEvent.setup();
+    const onTelegram = automationFixture('schedule-4', {
+      name: 'Digest',
+      target: { type: 'connector', connectorId: 'connector-old' },
+    });
+    const view = fakeView({ automations: [onTelegram] });
+    renderPage(view);
+    await user.click(
+      within(screen.getByRole('article', { name: 'Digest' })).getByRole(
+        'button',
+        { name: 'Edit' },
+      ),
+    );
+    const form = screen.getByRole('form', { name: 'Edit Digest' });
+    await user.selectOptions(
+      within(form).getByLabelText('Runs in'),
+      'workspace',
+    );
+    await user.click(
+      within(form).getByRole('button', { name: 'Save changes' }),
+    );
+
+    expect(view.update).toHaveBeenCalledWith(
+      onTelegram,
+      expect.objectContaining({ target: { type: 'workspace' } }),
+    );
+  });
+
+  it('leaves an empty name out of an edit', async () => {
+    const user = userEvent.setup();
+    const view = fakeView({ automations: [agentMade] });
+    renderPage(view);
+    await user.click(
+      within(screen.getByRole('article', { name: '<b>Stretch</b>' })).getByRole(
+        'button',
+        { name: 'Edit' },
+      ),
+    );
+    const form = screen.getByRole('form', { name: 'Edit <b>Stretch</b>' });
+    await user.clear(within(form).getByLabelText('Name'));
+    await user.click(
+      within(form).getByRole('button', { name: 'Save changes' }),
+    );
+
+    const patch = vi.mocked(view.update).mock.calls[0][1];
+    expect('name' in patch).toBe(false);
+    expect(patch.prompt).toBe('**Remind** me to stretch');
+  });
+
+  it('does not crash on a half-typed time zone', async () => {
+    const user = userEvent.setup();
+    renderPage(fakeView());
+    await user.click(screen.getByRole('button', { name: 'New automation' }));
+    const form = screen.getByRole('form', { name: 'New automation' });
+    await user.type(within(form).getByLabelText('Prompt'), 'Check');
+    await user.type(within(form).getByLabelText('When'), 'tomorrow at 9am');
+    const zone = within(form).getByLabelText('Time zone');
+    await user.clear(zone);
+    expect(within(form).getByText(PHRASE_NOT_UNDERSTOOD)).toBeInTheDocument();
+    await user.type(zone, 'Europe/Lon');
+
+    expect(screen.getByRole('form', { name: 'New automation' })).toBeVisible();
+    expect(
+      within(form).getByRole('button', { name: 'Create automation' }),
+    ).toBeDisabled();
+  });
+
+  it('saves a new schedule only once the daemon has shown its runs', async () => {
+    const user = userEvent.setup();
+    const preview = vi.mocked(daemon.previewAutomation);
+    renderPage(fakeView());
+    await user.click(screen.getByRole('button', { name: 'New automation' }));
+    const form = screen.getByRole('form', { name: 'New automation' });
+    const create = () =>
+      within(form).getByRole('button', { name: 'Create automation' });
+    const when = within(form).getByLabelText('When');
+    await user.type(within(form).getByLabelText('Prompt'), 'Check');
+    await user.type(when, 'every hour');
+    // The preview is still loading.
+    expect(create()).toBeDisabled();
+
+    preview.mockRejectedValue(new DaemonHttpError(400, { error: 'Too soon' }));
+    await user.clear(when);
+    await user.type(when, 'every 5 minutes');
+    expect(await within(form).findByText('Too soon')).toBeInTheDocument();
+    expect(create()).toBeDisabled();
+
+    preview.mockResolvedValue([10]);
+    await user.clear(when);
+    await user.type(when, 'every 6 minutes');
+    await within(form).findByRole('region', { name: 'Next runs' });
+    expect(create()).toBeEnabled();
   });
 
   it('adds the heartbeat in the browser time zone', async () => {
