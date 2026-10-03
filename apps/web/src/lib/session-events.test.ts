@@ -22,6 +22,7 @@ import {
   resyncEvent,
   runEvent,
   runFixture,
+  skillEvent,
   snapshotEvent,
   snapshotRun,
   steeredEvent,
@@ -526,5 +527,19 @@ describe('approvals', () => {
     ]);
 
     expect(state.runs.run_1.approvals[0].suggestedMatcher.value).toBe('');
+  });
+});
+
+describe('skill events', () => {
+  it('count skill.updated events, ignore repeats, and survive a snapshot', () => {
+    let state = applyEvent(EMPTY_LIVE_STATE, snapshotEvent([], 1));
+    expect(state.skillsVersion).toBe(0);
+    state = applyEvent(state, skillEvent(2));
+    state = applyEvent(state, skillEvent(2));
+    state = applyEvent(state, skillEvent(3, null));
+    expect(state.skillsVersion).toBe(2);
+    const reconnected = applyEvent(state, snapshotEvent([], 1));
+    expect(reconnected.skillsVersion).toBe(2);
+    expect(reconnected.epoch).toBe(state.epoch + 1);
   });
 });

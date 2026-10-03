@@ -39,6 +39,8 @@ export interface LiveState {
   approvals: Readonly<Record<string, Approval>>;
   /** Bumped by every snapshot and resync, so views refetch what they show. */
   epoch: number;
+  /** Bumped by every `skill.updated` (spec §6), so skill views read again. */
+  skillsVersion: number;
 }
 
 export const EMPTY_LIVE_STATE: LiveState = {
@@ -46,6 +48,7 @@ export const EMPTY_LIVE_STATE: LiveState = {
   runs: {},
   approvals: {},
   epoch: 0,
+  skillsVersion: 0,
 };
 
 /** A step's streamed text kept in the page; its full text arrives with the
@@ -294,13 +297,21 @@ export function applyEvent(state: LiveState, event: AgentEvent): LiveState {
         approvals: runApprovals(approvals, item.run.id),
       };
     }
-    return { seq: event.seq, runs, approvals, epoch: state.epoch + 1 };
+    return {
+      seq: event.seq,
+      runs,
+      approvals,
+      epoch: state.epoch + 1,
+      skillsVersion: state.skillsVersion,
+    };
   }
   // A seq at or below the last one applied is a repeat from this stream.
   if (event.seq <= state.seq) return state;
   const next: LiveState = { ...state, seq: event.seq };
   if (event.type === 'stream.resync')
     return { ...next, epoch: state.epoch + 1 };
+  if (event.type === 'skill.updated')
+    return { ...next, skillsVersion: state.skillsVersion + 1 };
   if (isRunLifecycleEvent(event)) return withRun(next, event.run);
   if (event.type === 'approval.requested')
     return withApproval(next, event.approval);
