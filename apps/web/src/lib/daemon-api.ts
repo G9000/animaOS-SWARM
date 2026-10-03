@@ -7,12 +7,17 @@
 import { PROVIDER_MODELS, type AgentDetail, type ChatMessage } from './types';
 import {
   createDaemonClient,
+  type ActiveHours,
   type AgencyGenerateRequest,
   type AgencyGenerateResponse,
   type ApprovalDecisionInput,
   type ApprovalListOptions,
   type ApprovalPolicy,
   type ApprovalRuleInput,
+  type AutomationInput,
+  type AutomationPatch,
+  type AutomationTrigger,
+  type HeartbeatInput,
   type WorkspaceBootstrapRequest,
   type AgentMemory,
   type AgentTasks,
@@ -416,6 +421,28 @@ export const daemon = {
   rejectSkillDraft: (id: string) => setupClient.skills.rejectDraft(id),
   importSkill: (file: File) =>
     setupClient.skills.importFile(file, { filename: file.name }),
+  /** Automations (spec §9.2, §15.4). */
+  listAutomations: (agentId: string, options: { signal?: AbortSignal } = {}) =>
+    setupClient.automations.list(agentId, options),
+  createAutomation: (agentId: string, input: AutomationInput) =>
+    setupClient.automations.create(agentId, input),
+  createHeartbeat: (agentId: string, input: HeartbeatInput) =>
+    setupClient.automations.createHeartbeat(agentId, input),
+  updateAutomation: (agentId: string, id: string, patch: AutomationPatch) =>
+    setupClient.automations.update(agentId, id, patch),
+  deleteAutomation: (agentId: string, id: string) =>
+    setupClient.automations.remove(agentId, id),
+  runAutomationNow: (agentId: string, id: string) =>
+    setupClient.automations.runNow(agentId, id),
+  automationHistory: (
+    agentId: string,
+    id: string,
+    options: { limit?: number; signal?: AbortSignal } = {},
+  ) => setupClient.automations.history(agentId, id, options),
+  previewAutomation: (
+    input: { trigger: AutomationTrigger; activeHours?: ActiveHours },
+    options: { signal?: AbortSignal } = {},
+  ) => setupClient.automations.preview(input, options),
   listAgentSummaries: () => setupClient.agents.listSummaries(),
   cancelAgentJob: (id: string, jobId: string, input: { revision: number }) =>
     setupClient.agents.cancelJob(id, jobId, input),

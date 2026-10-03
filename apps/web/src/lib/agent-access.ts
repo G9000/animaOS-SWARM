@@ -11,6 +11,7 @@ const COMMON_TOOLS = [
   'calculate',
   'search_conversations',
   'load_skill',
+  'list_automations',
 ] as const;
 
 const OBSERVE_TOOLS = [
@@ -29,6 +30,8 @@ const COLLABORATE_TOOLS = [
   'multi_edit',
   'todo_write',
   'propose_skill',
+  'create_automation',
+  'pause_automation',
 ] as const;
 
 const OPERATE_TOOLS = [

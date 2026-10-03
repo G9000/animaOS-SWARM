@@ -315,3 +315,18 @@ export function skillEvent(
 ): AgentEvent {
   return { type: 'skill.updated', agentId, seq, at: 1, slug, draftId: null };
 }
+
+export function automationEvent(
+  seq: number,
+  scheduleId = 'schedule-1',
+  agentId = 'agent-main',
+): AgentEvent {
+  return {
+    type: 'automation.updated',
+    agentId,
+    seq,
+    at: 1,
+    scheduleId,
+    deleted: false,
+  };
+}

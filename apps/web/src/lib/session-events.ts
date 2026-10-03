@@ -41,6 +41,9 @@ export interface LiveState {
   epoch: number;
   /** Bumped by every `skill.updated` (spec §6), so skill views read again. */
   skillsVersion: number;
+  /** Bumped by every `automation.updated` (spec §6), so automation views
+   *  read again. */
+  automationsVersion: number;
 }
 
 export const EMPTY_LIVE_STATE: LiveState = {
@@ -49,6 +52,7 @@ export const EMPTY_LIVE_STATE: LiveState = {
   approvals: {},
   epoch: 0,
   skillsVersion: 0,
+  automationsVersion: 0,
 };
 
 /** A step's streamed text kept in the page; its full text arrives with the
@@ -303,6 +307,7 @@ export function applyEvent(state: LiveState, event: AgentEvent): LiveState {
       approvals,
       epoch: state.epoch + 1,
       skillsVersion: state.skillsVersion,
+      automationsVersion: state.automationsVersion,
     };
   }
   // A seq at or below the last one applied is a repeat from this stream.
@@ -312,6 +317,8 @@ export function applyEvent(state: LiveState, event: AgentEvent): LiveState {
     return { ...next, epoch: state.epoch + 1 };
   if (event.type === 'skill.updated')
     return { ...next, skillsVersion: state.skillsVersion + 1 };
+  if (event.type === 'automation.updated')
+    return { ...next, automationsVersion: state.automationsVersion + 1 };
   if (isRunLifecycleEvent(event)) return withRun(next, event.run);
   if (event.type === 'approval.requested')
     return withApproval(next, event.approval);

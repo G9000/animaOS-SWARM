@@ -17,6 +17,7 @@ import {
 import {
   approvalEvent,
   approvalFixture,
+  automationEvent,
   deltaEvent,
   progressEvent,
   resyncEvent,
@@ -541,5 +542,19 @@ describe('skill events', () => {
     const reconnected = applyEvent(state, snapshotEvent([], 1));
     expect(reconnected.skillsVersion).toBe(2);
     expect(reconnected.epoch).toBe(state.epoch + 1);
+  });
+});
+
+describe('automation events', () => {
+  it('count automation.updated events, ignore repeats, and survive a snapshot', () => {
+    let state = applyEvent(EMPTY_LIVE_STATE, snapshotEvent([], 1));
+    expect(state.automationsVersion).toBe(0);
+    state = applyEvent(state, automationEvent(2));
+    state = applyEvent(state, automationEvent(2));
+    state = applyEvent(state, automationEvent(3, 'schedule-2'));
+    expect(state.automationsVersion).toBe(2);
+    expect(state.skillsVersion).toBe(0);
+    const reconnected = applyEvent(state, snapshotEvent([], 1));
+    expect(reconnected.automationsVersion).toBe(2);
   });
 });
