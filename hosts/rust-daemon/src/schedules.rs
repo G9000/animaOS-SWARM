@@ -17,6 +17,8 @@ use crate::connectors::{OutboundDeliveryState, TelegramOutboundRecord};
 use crate::routes::ApiError;
 use crate::runs::{RunOutcome, RunSource, RunStatus};
 
+pub(crate) mod cron;
+
 const CHECKIN_SENTINEL: &str = "CHECKIN_OK";
 const CHECKIN_SUFFIX: &str = "(This is a scheduled check-in. If you have nothing worth saying right now, reply with exactly CHECKIN_OK and nothing else.)";
 const MAX_PROMPT_BYTES: usize = 32 * 1024;
