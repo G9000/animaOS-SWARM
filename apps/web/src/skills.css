@@ -1,0 +1,139 @@
+/* The Skills page (spec §15.4). Bodies are plain text in <pre>. */
+.skills-page {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  overflow-y: auto;
+  padding: 24px;
+}
+.skills-section {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.skills-section h2 {
+  color: var(--color-ink);
+  font-size: 15px;
+  font-weight: 600;
+}
+.skills-section-header,
+.skill-actions,
+.skill-draft-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.skills-list,
+.skills-decided {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.skills-row,
+.skill-draft,
+.skill-review,
+.skill-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border: 1px solid var(--color-line);
+  border-radius: 12px;
+  padding: 10px 12px;
+}
+.skill-draft {
+  border-color: var(--color-amber);
+}
+.skills-row-text {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  color: var(--color-ink);
+}
+.skills-row-text code,
+.skill-draft-header code,
+.skills-decided code {
+  color: var(--color-ink-2);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.skills-description,
+.skill-draft-description,
+.skill-draft-source,
+.skills-confirm,
+.skills-empty {
+  color: var(--color-ink-3);
+  font-size: 12px;
+}
+.skills-status-active {
+  color: var(--color-mint);
+  font-size: 12px;
+}
+.skills-status-changed,
+.skills-status-missing,
+.skills-status-invalid,
+.skill-draft-warning {
+  color: var(--color-amber);
+  font-size: 12px;
+}
+.skills-error {
+  color: var(--color-danger);
+  font-size: 13px;
+}
+.skill-body,
+.skill-diff {
+  max-height: 20rem;
+  overflow: auto;
+  border-radius: 8px;
+  padding: 8px;
+  background: var(--color-abyss);
+  color: var(--color-ink-2);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.skill-diff-added {
+  color: var(--color-mint);
+}
+.skill-diff-removed {
+  color: var(--color-danger);
+}
+.skill-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--color-ink-2);
+  font-size: 12px;
+}
+.skill-field input,
+.skill-field textarea {
+  border: 1px solid var(--color-line);
+  border-radius: 8px;
+  padding: 6px 8px;
+  background: var(--color-abyss);
+  color: var(--color-ink);
+  font-size: 13px;
+}
+.skill-field textarea {
+  font-family: var(--font-mono);
+}
+.skills-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--color-ink-2);
+  font-size: 12px;
+}
+.skills-import {
+  position: relative;
+}
+.skills-import-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
