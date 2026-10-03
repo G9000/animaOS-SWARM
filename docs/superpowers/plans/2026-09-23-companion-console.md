@@ -6,14 +6,14 @@
 
 **Architecture:** Daemon-owned contracts in `hosts/rust-daemon`, reusable engine logic in `packages/core-rust` (`anima-core`, `anima-model-adapters`, `anima-memory`), typed clients in `packages/sdk`, UI in `apps/web`. Current state lives in the control-plane snapshot with a bounded message tail; history lives in a new row-based history store fed by an outbox. One SSE stream per companion carries all live events.
 
-**Tech Stack:** Rust (tokio, axum 0.8, serde, rusqlite 0.32 bundled with FTS5, sqlx Postgres, utoipa, tracing-subscriber, cap-std, croner), TypeScript (React 19, Vite, Tailwind v4, Vitest, Testing Library, Playwright), Nx with Bun.
+**Tech Stack:** Rust (tokio, axum 0.8, serde, rusqlite 0.32 bundled with FTS5, sqlx Postgres, utoipa, tracing-subscriber, cap-std), TypeScript (React 19, Vite, Tailwind v4, Vitest, Testing Library, Playwright), Nx with Bun.
 
 **Spec:** `docs/superpowers/specs/2026-09-23-companion-console-design.md` (read it before any task; section numbers below refer to it).
 
 ## Global Constraints
 
 - Follow `AGENTS.md`: reusable engine code stays in `packages/*`; `anima-core` gains no HTTP framework, DB driver, or host runtime dependency; use `bun x nx ...` targets; do not touch `apps/server`.
-- Only new third-party dependency allowed: `croner` (cron parsing) in `hosts/rust-daemon`. Reuse existing `sha2`, `base64`, `uuid`, `chrono-tz`, `cap-std`, `rusqlite`, `sqlx`, `tracing-subscriber`. Any other new dependency requires stopping and asking.
+- No new third-party dependencies (M6 built cron in-house on `chrono`/`chrono-tz` instead of `croner`). Reuse existing `sha2`, `base64`, `uuid`, `chrono-tz`, `cap-std`, `rusqlite`, `sqlx`, `tracing-subscriber`. Any other new dependency requires stopping and asking.
 - New env vars, exact names: `ANIMAOS_RS_MAX_RUNS_PER_AGENT` (default 3), `ANIMAOS_RS_SESSION_EVENT_BUFFER` (default 1024), `ANIMAOS_RS_HISTORY_SQLITE_FILE` (default `history.sqlite` beside `ANIMAOS_RS_CONTROL_PLANE_FILE`).
 - Session ids match `^[A-Za-z0-9._:-]{1,200}$`. New chat ids are `chat:<uuid-v4>`. Run ids are `run_<uuid-v4>`.
 - Every new daemon route: reads call `state.local_owner.authorize_read(headers)` and set `Cache-Control: no-store`; mutations call `state.local_owner.authorize(headers)`; every route gets a `#[utoipa::path]` entry.
@@ -39,7 +39,7 @@
 | M3 Live runs               | `2026-09-23-companion-console-m3.md` | done (Nx rust-daemon:test 1,564 passed; sdk + web test, typecheck, build green at 6737da3) |
 | M4 Approvals               | `2026-09-23-companion-console-m4.md` | done (Nx rust-daemon:test 1654 passed; sdk + web test, typecheck, build green at 20c6221)  |
 | M5 Skills                  | `2026-09-23-companion-console-m5.md` | done (Nx rust-daemon:test 1775 passed; sdk + web test, typecheck, build green at e9d57f9)  |
-| M6 Automations             | (written before M6)                  | pending                                                                                    |
+| M6 Automations             | `2026-09-23-companion-console-m6.md` | done (Nx rust-daemon:test 1874 passed; sdk + web test, typecheck, build green at ccce91b)  |
 | M7 Memory                  | (written before M7)                  | pending                                                                                    |
 | M8 Usage, logs, health     | (written before M8)                  | pending                                                                                    |
 | M9 Attachments and voice   | (written before M9)                  | pending                                                                                    |
@@ -125,7 +125,7 @@ Carried from M3 (decided during M3's reviews):
 
 ## M6 Automations (spec §9)
 
-- **T6.1** `cron` and `once` triggers with `croner`, active hours, restore validation, preview route: `schedules.rs`, `routes/schedules.rs`, contracts.
+- **T6.1** `cron` and `once` triggers (in-house cron on `chrono-tz`), active hours, restore validation, preview route: `schedules.rs`, `routes/schedules.rs`, contracts.
 - **T6.2** Run now, history, counters, heartbeat preset.
 - **T6.3** Companion tools and limits: create `tools/automations.rs`.
 - **T6.4** SDK `automations.ts`; web `pages/AutomationsPage.tsx`, `lib/schedule-parse.ts`, notice cards.
