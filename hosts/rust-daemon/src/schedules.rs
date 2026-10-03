@@ -264,6 +264,7 @@ impl SchedulerService {
     ) -> Result<(ScheduledPromptRecord, bool), ScheduleError> {
         validate_prompt(&prompt)?;
         validate_trigger(&trigger)?;
+        let trigger = timing::normalized_trigger(trigger);
         let now = now_ms();
         let created_at_ms = created_at_override_ms.unwrap_or(now);
         if created_at_ms == 0 || created_at_ms > now.saturating_add(300_000) {
@@ -350,6 +351,7 @@ impl SchedulerService {
         if let Some(trigger) = &trigger {
             validate_trigger(trigger)?;
         }
+        let trigger = trigger.map(timing::normalized_trigger);
         if prompt.is_none() && trigger.is_none() && target.is_none() && enabled.is_none() {
             return Err(ScheduleError::Invalid("at least one field is required"));
         }
@@ -603,16 +605,33 @@ async fn claim_due(
             return Ok(None);
         };
         let mut claimed = previous.clone();
-        claimed.next_due_at_ms =
-            next_due_after_claim(&claimed.trigger, None, previous.next_due_at_ms, now)?;
-        claimed.last_fired = Some(ScheduleLastFired {
-            fired_at_ms: now,
-            run_idempotency_key: format!("schedule:{}:{}", claimed.id, now),
-        });
-        claimed.last_safe_outcome = None;
+        let claim = match next_due_after_claim(&claimed.trigger, None, previous.next_due_at_ms, now)
+        {
+            Ok(next_due_at_ms) => {
+                claimed.next_due_at_ms = next_due_at_ms;
+                claimed.last_fired = Some(ScheduleLastFired {
+                    fired_at_ms: now,
+                    run_idempotency_key: format!("schedule:{}:{}", claimed.id, now),
+                });
+                claimed.last_safe_outcome = None;
+                true
+            }
+            // A stored trigger that can never fire again (restore only checks
+            // syntax) is turned off, so it cannot end the tick and starve the
+            // other due automations.
+            Err(ScheduleError::Rejected(_)) => {
+                claimed.enabled = false;
+                false
+            }
+            Err(error) => return Err(error),
+        };
         claimed.updated_at_ms = now.max(claimed.created_at_ms);
         state.schedules.insert(id.to_string(), claimed.clone());
-        (claimed, previous, state.control_plane_persist_request())
+        (
+            claim.then_some(claimed),
+            previous,
+            state.control_plane_persist_request(),
+        )
     };
     if persist.save().await.is_err() {
         inner
@@ -623,7 +642,7 @@ async fn claim_due(
             .insert(id.to_string(), previous);
         return Err(ScheduleError::Persistence);
     }
-    Ok(Some(claimed))
+    Ok(claimed)
 }
 
 async fn execute_claimed(inner: &Arc<SchedulerInner>, record: ScheduledPromptRecord, now: u64) {
@@ -1075,6 +1094,86 @@ mod tests {
             .await
             .unwrap()
             .0
+    }
+
+    #[tokio::test]
+    async fn an_unfireable_stored_cron_is_disabled_and_does_not_starve_the_tick() {
+        let (service, state, agent_id, _) = service();
+        let now = now_ms();
+        let (bad, _) = service
+            .create(
+                agent_id.clone(),
+                "Never".into(),
+                ScheduleTrigger::Cron {
+                    expression: "0 0 31 2 *".into(),
+                    time_zone: "UTC".into(),
+                },
+                ScheduleTarget::Workspace,
+                true,
+                None,
+                Some(now - 10),
+                None,
+            )
+            .await
+            .unwrap();
+        let good = due_schedule(&service, &agent_id).await;
+        assert_eq!(service.tick_at(now_ms()).await.unwrap(), 1);
+        let guard = state.read().await;
+        assert!(!guard.schedules[&bad.id].enabled, "the bad one is off");
+        assert!(guard.schedules[&bad.id].last_fired.is_none());
+        assert!(guard.schedules[&good.id].last_fired.is_some());
+        assert!(guard.schedules[&good.id].enabled);
+    }
+
+    #[tokio::test]
+    async fn time_zones_are_stored_trimmed_on_create_and_update() {
+        let (service, _state, agent_id, _) = service();
+        let (record, _) = service
+            .create(
+                agent_id.clone(),
+                "Daily".into(),
+                ScheduleTrigger::Daily {
+                    hour: 9,
+                    minute: 0,
+                    time_zone: " America/New_York ".into(),
+                },
+                ScheduleTarget::Workspace,
+                true,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            record.trigger,
+            ScheduleTrigger::Daily {
+                hour: 9,
+                minute: 0,
+                time_zone: "America/New_York".into(),
+            }
+        );
+        let updated = service
+            .update(
+                &agent_id,
+                &record.id,
+                None,
+                Some(ScheduleTrigger::Cron {
+                    expression: "0 9 * * *".into(),
+                    time_zone: "	Europe/Paris ".into(),
+                }),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            updated.trigger,
+            ScheduleTrigger::Cron {
+                expression: "0 9 * * *".into(),
+                time_zone: "Europe/Paris".into(),
+            }
+        );
     }
 
     #[tokio::test]

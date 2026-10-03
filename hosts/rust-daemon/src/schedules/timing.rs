@@ -139,7 +139,7 @@ impl ActiveWindow {
         for _ in 0..=8 {
             if self.has_day(date.weekday().num_days_from_sunday()) {
                 let wall = date.and_hms_opt(self.start / 60, self.start % 60, 0)?;
-                if let Some(open) = self.opening(wall) {
+                if let Some(open) = self.opening(wall, at_ms) {
                     if open >= at_ms {
                         return Some(open);
                     }
@@ -150,19 +150,30 @@ impl ActiveWindow {
         None
     }
 
-    /// The instant the window opens at wall time `wall`; inside a
-    /// daylight-saving gap, the first wall minute after the gap.
-    fn opening(&self, wall: NaiveDateTime) -> Option<u64> {
+    /// The first instant at or after `at_ms` that the window opens at wall
+    /// time `wall`: a repeated (fall-back) wall time counts both of its
+    /// instants; inside a daylight-saving gap, the first wall minute after
+    /// the gap. `None` when every instant is before `at_ms`.
+    fn opening(&self, wall: NaiveDateTime, at_ms: u64) -> Option<u64> {
         (0..=DST_GAP_SEARCH_MINUTES)
             .find_map(|shift| {
                 let shifted = wall.checked_add_signed(TimeDelta::minutes(shift))?;
-                match self.time_zone.from_local_datetime(&shifted) {
-                    LocalResult::Single(at) => Some(at),
-                    LocalResult::Ambiguous(first, second) => Some(first.min(second)),
-                    LocalResult::None => None,
-                }
+                let instants = match self.time_zone.from_local_datetime(&shifted) {
+                    LocalResult::Single(at) => [Some(at), None],
+                    LocalResult::Ambiguous(first, second) => {
+                        [Some(first.min(second)), Some(first.max(second))]
+                    }
+                    LocalResult::None => return None,
+                };
+                Some(
+                    instants
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|at| u64::try_from(at.timestamp_millis()).ok())
+                        .find(|open| *open >= at_ms),
+                )
             })
-            .and_then(|at| u64::try_from(at.timestamp_millis()).ok())
+            .flatten()
     }
 }
 
@@ -214,6 +225,29 @@ pub(crate) fn validate_stored_trigger(trigger: &ScheduleTrigger) -> Result<(), S
     Ok(())
 }
 
+/// `trigger` as stored: a time zone is kept trimmed, as validation read it.
+pub(crate) fn normalized_trigger(trigger: ScheduleTrigger) -> ScheduleTrigger {
+    match trigger {
+        ScheduleTrigger::Daily {
+            hour,
+            minute,
+            time_zone,
+        } => ScheduleTrigger::Daily {
+            hour,
+            minute,
+            time_zone: time_zone.trim().to_string(),
+        },
+        ScheduleTrigger::Cron {
+            expression,
+            time_zone,
+        } => ScheduleTrigger::Cron {
+            expression,
+            time_zone: time_zone.trim().to_string(),
+        },
+        other @ (ScheduleTrigger::Interval { .. } | ScheduleTrigger::Once { .. }) => other,
+    }
+}
+
 /// The next `hour:minute` in `time_zone` strictly after `after_ms`, by the
 /// `daily` trigger's existing rule: a wall time a daylight-saving jump skips
 /// moves to the next day, and a repeated one fires at its earlier instant.
@@ -247,7 +281,9 @@ fn next_daily_after(hour: u8, minute: u8, time_zone: &str, after_ms: u64) -> Res
 }
 
 /// The trigger's own next fire strictly after `after_ms`, ignoring windows.
-fn raw_next(trigger: &ScheduleTrigger, after_ms: u64) -> Result<u64, String> {
+///
+/// `floor_ms` (at most `after_ms` in effect) is a cron's wall-clock floor.
+fn raw_next(trigger: &ScheduleTrigger, after_ms: u64, floor_ms: u64) -> Result<u64, String> {
     match trigger {
         ScheduleTrigger::Interval { interval_ms } => after_ms
             .checked_add(*interval_ms)
@@ -261,7 +297,7 @@ fn raw_next(trigger: &ScheduleTrigger, after_ms: u64) -> Result<u64, String> {
             expression,
             time_zone,
         } => parse_cron(expression)?
-            .next_after(parse_time_zone(time_zone)?, after_ms)
+            .next_after_floor(parse_time_zone(time_zone)?, after_ms, floor_ms)
             .ok_or_else(|| SCHEDULE_NEVER_RUNS.to_string()),
         ScheduleTrigger::Once { at_ms } => {
             if *at_ms > after_ms {
@@ -281,19 +317,30 @@ pub(crate) fn next_fire_after(
     window: Option<&ActiveWindow>,
     from_ms: u64,
 ) -> Result<u64, String> {
+    next_fire_after_floor(trigger, window, from_ms, from_ms)
+}
+
+/// [`next_fire_after`] with a cron wall-clock floor (see
+/// `CronSchedule::next_after_floor`); the fire is still after `from_ms`.
+fn next_fire_after_floor(
+    trigger: &ScheduleTrigger,
+    window: Option<&ActiveWindow>,
+    from_ms: u64,
+    floor_ms: u64,
+) -> Result<u64, String> {
     validate_stored_trigger(trigger)?;
     let Some(window) = window else {
-        return raw_next(trigger, from_ms);
+        return raw_next(trigger, from_ms, floor_ms);
     };
     match trigger {
         ScheduleTrigger::Once { .. } => Err(ACTIVE_HOURS_NOT_FOR_ONCE.into()),
         ScheduleTrigger::Interval { .. } => window
-            .next_open(raw_next(trigger, from_ms)?)
+            .next_open(raw_next(trigger, from_ms, floor_ms)?)
             .ok_or_else(|| SCHEDULE_NEVER_IN_ACTIVE_HOURS.to_string()),
         ScheduleTrigger::Daily { .. } | ScheduleTrigger::Cron { .. } => {
             let mut after = from_ms;
             for _ in 0..MAX_WINDOW_HOPS {
-                let candidate = raw_next(trigger, after)?;
+                let candidate = raw_next(trigger, after, floor_ms)?;
                 if window.contains(candidate) {
                     return Ok(candidate);
                 }
@@ -335,9 +382,10 @@ pub(crate) fn next_fire_after_claim(
         }
         ScheduleTrigger::Once { .. } => Ok(previous_due),
         ScheduleTrigger::Daily { .. } | ScheduleTrigger::Cron { .. } => {
-            // The wall clock only moves forward from the fire just claimed
-            // (cron's `next_after`), so a repeated hour is not fired twice.
-            next_fire_after(trigger, window, now_ms.max(previous_due))
+            // The wall clock only moves forward from the fire just claimed,
+            // even when the claim is late and the clock fell back meanwhile,
+            // so a repeated hour is not fired twice.
+            next_fire_after_floor(trigger, window, now_ms, previous_due)
         }
     }
 }
@@ -774,5 +822,60 @@ mod tests {
             next_fire_after_claim(&zone, None, fires[0], fires[0] + 200),
             Ok(fires[1])
         );
+    }
+
+    #[test]
+    fn a_late_claim_in_the_repeated_hour_does_not_fire_it_twice() {
+        let trigger = ScheduleTrigger::Cron {
+            expression: "30 1 * * *".into(),
+            time_zone: "America/New_York".into(),
+        };
+        // 01:30 EDT fired; the claim lands at 01:20 EST, after the fall-back.
+        let (due, claimed_at) = (utc(2026, 11, 1, 5, 30), utc(2026, 11, 1, 6, 20));
+        assert_eq!(
+            next_fire_after_claim(&trigger, None, due, claimed_at).unwrap(),
+            utc(2026, 11, 2, 6, 30),
+            "01:30 EST today is the same wall time as the fire just claimed"
+        );
+        assert_eq!(
+            next_fire_after(&trigger, None, claimed_at).unwrap(),
+            utc(2026, 11, 1, 6, 30),
+            "without the floor the repeated 01:30 is still ahead"
+        );
+    }
+
+    #[test]
+    fn a_window_opening_in_the_repeated_hour_is_found_at_its_second_instant() {
+        let window = window("01:30", "06:00", EVERY_DAY, "America/New_York");
+        // 01:10 EST, after the first 01:30 (EDT) has passed.
+        assert_eq!(
+            window.next_open(utc(2026, 11, 1, 6, 10)),
+            Some(utc(2026, 11, 1, 6, 30))
+        );
+        // Before the first 01:30, it opens at that first instant.
+        assert_eq!(
+            window.next_open(utc(2026, 11, 1, 5, 10)),
+            Some(utc(2026, 11, 1, 5, 30))
+        );
+    }
+
+    #[test]
+    fn trigger_time_zones_are_normalized_by_trimming() {
+        let daily = ScheduleTrigger::Daily {
+            hour: 1,
+            minute: 2,
+            time_zone: " UTC
+"
+            .into(),
+        };
+        assert_eq!(
+            normalized_trigger(daily),
+            ScheduleTrigger::Daily {
+                hour: 1,
+                minute: 2,
+                time_zone: "UTC".into()
+            }
+        );
+        assert_eq!(normalized_trigger(HALF_HOUR), HALF_HOUR);
     }
 }

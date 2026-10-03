@@ -238,10 +238,26 @@ impl CronSchedule {
     /// do not fire again. `None` when none falls within `CRON_SEARCH_DAYS`
     /// days.
     pub(crate) fn next_after(&self, time_zone: Tz, after_ms: u64) -> Option<u64> {
-        let after = Utc
-            .timestamp_millis_opt(i64::try_from(after_ms).ok()?)
-            .single()?;
-        let local = after.with_timezone(&time_zone).naive_local();
+        self.next_after_floor(time_zone, after_ms, after_ms)
+    }
+
+    /// Like [`Self::next_after`], but the wall clock never starts before
+    /// `floor_ms`'s: a fire claimed late (inside a repeated hour, after the
+    /// clock fell back past the fire's own wall time) does not fire again.
+    /// The instant must still come after `after_ms`.
+    pub(crate) fn next_after_floor(
+        &self,
+        time_zone: Tz,
+        after_ms: u64,
+        floor_ms: u64,
+    ) -> Option<u64> {
+        let wall_of = |at_ms: u64| {
+            let at = Utc
+                .timestamp_millis_opt(i64::try_from(at_ms).ok()?)
+                .single()?;
+            Some(at.with_timezone(&time_zone).naive_local())
+        };
+        let local = wall_of(after_ms)?.max(wall_of(floor_ms)?);
         let first = local
             .date()
             .and_hms_opt(local.hour(), local.minute(), 0)?
