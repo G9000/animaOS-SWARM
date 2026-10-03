@@ -4,8 +4,6 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anima_core::{Content, DataValue, TaskStatus};
-use chrono::{LocalResult, Offset, TimeZone, Utc};
-use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{watch, Mutex};
 use tokio::task::JoinHandle;
@@ -18,6 +16,8 @@ use crate::routes::ApiError;
 use crate::runs::{RunOutcome, RunSource, RunStatus};
 
 pub(crate) mod cron;
+pub(crate) mod timing;
+pub(crate) use timing::ActiveHours;
 
 const CHECKIN_SENTINEL: &str = "CHECKIN_OK";
 const CHECKIN_SUFFIX: &str = "(This is a scheduled check-in. If you have nothing worth saying right now, reply with exactly CHECKIN_OK and nothing else.)";
@@ -59,6 +59,17 @@ pub(crate) enum ScheduleTrigger {
         minute: u8,
         #[serde(rename = "timeZone")]
         time_zone: String,
+    },
+    /// Five-field cron on `time_zone`'s wall clock (spec §9.1).
+    Cron {
+        expression: String,
+        #[serde(rename = "timeZone")]
+        time_zone: String,
+    },
+    /// Fires once; the claim turns the automation off (spec §9.1).
+    Once {
+        #[serde(rename = "atMs")]
+        at_ms: u64,
     },
 }
 
@@ -142,6 +153,8 @@ pub(crate) enum ScheduleError {
     AgentNotFound,
     NotFound,
     Invalid(&'static str),
+    /// A trigger or active hours the daemon refuses, with a built message (400).
+    Rejected(String),
     TargetUnavailable,
     Persistence,
 }
@@ -591,7 +604,7 @@ async fn claim_due(
         };
         let mut claimed = previous.clone();
         claimed.next_due_at_ms =
-            next_due_after_claim(&claimed.trigger, previous.next_due_at_ms, now)?;
+            next_due_after_claim(&claimed.trigger, None, previous.next_due_at_ms, now)?;
         claimed.last_fired = Some(ScheduleLastFired {
             fired_at_ms: now,
             run_idempotency_key: format!("schedule:{}:{}", claimed.id, now),
@@ -796,79 +809,38 @@ pub(crate) fn next_due_at_ms(
     trigger: &ScheduleTrigger,
     from_ms: u64,
 ) -> Result<u64, ScheduleError> {
-    validate_trigger(trigger)?;
-    match trigger {
-        ScheduleTrigger::Interval { interval_ms } => from_ms
-            .checked_add(*interval_ms)
-            .ok_or(ScheduleError::Invalid("schedule timing overflow")),
-        ScheduleTrigger::Daily {
-            hour,
-            minute,
-            time_zone,
-        } => next_daily_at_ms(*hour, *minute, time_zone, from_ms),
-    }
+    next_due(trigger, None, from_ms)
 }
 
-fn next_due_after_claim(
+/// The first fire of `trigger` after `from_ms` inside `active_hours`.
+pub(crate) fn next_due(
     trigger: &ScheduleTrigger,
+    active_hours: Option<&ActiveHours>,
+    from_ms: u64,
+) -> Result<u64, ScheduleError> {
+    let window = active_window(active_hours)?;
+    timing::next_fire_after(trigger, window.as_ref(), from_ms).map_err(ScheduleError::Rejected)
+}
+
+/// The due time after the occurrence due at `previous_due` was claimed.
+pub(crate) fn next_due_after_claim(
+    trigger: &ScheduleTrigger,
+    active_hours: Option<&ActiveHours>,
     previous_due: u64,
     now: u64,
 ) -> Result<u64, ScheduleError> {
-    match trigger {
-        ScheduleTrigger::Interval { interval_ms } => {
-            let elapsed = now.saturating_sub(previous_due);
-            let steps = elapsed / *interval_ms + 1;
-            previous_due
-                .checked_add(
-                    interval_ms
-                        .checked_mul(steps)
-                        .ok_or(ScheduleError::Invalid("schedule timing overflow"))?,
-                )
-                .ok_or(ScheduleError::Invalid("schedule timing overflow"))
-        }
-        ScheduleTrigger::Daily { .. } => next_due_at_ms(trigger, now),
-    }
+    let window = active_window(active_hours)?;
+    timing::next_fire_after_claim(trigger, window.as_ref(), previous_due, now)
+        .map_err(ScheduleError::Rejected)
 }
 
-fn next_daily_at_ms(
-    hour: u8,
-    minute: u8,
-    time_zone: &str,
-    from_ms: u64,
-) -> Result<u64, ScheduleError> {
-    let tz: Tz = time_zone
-        .parse()
-        .map_err(|_| ScheduleError::Invalid("timeZone is invalid"))?;
-    let from = Utc
-        .timestamp_millis_opt(
-            i64::try_from(from_ms)
-                .map_err(|_| ScheduleError::Invalid("schedule timing overflow"))?,
-        )
-        .single()
-        .ok_or(ScheduleError::Invalid("schedule timing is invalid"))?;
-    let local = from.with_timezone(&tz);
-    for day_offset in 0..=2 {
-        let date = local
-            .date_naive()
-            .checked_add_days(chrono::Days::new(day_offset))
-            .ok_or(ScheduleError::Invalid("schedule timing overflow"))?;
-        let naive = date
-            .and_hms_opt(u32::from(hour), u32::from(minute), 0)
-            .ok_or(ScheduleError::Invalid("daily trigger is invalid"))?;
-        let candidate = match tz.from_local_datetime(&naive) {
-            LocalResult::Single(value) => value,
-            LocalResult::Ambiguous(first, second) => first.min(second),
-            LocalResult::None => continue,
-        };
-        let millis = u64::try_from(candidate.timestamp_millis())
-            .map_err(|_| ScheduleError::Invalid("schedule timing is invalid"))?;
-        if millis > from_ms {
-            return Ok(millis);
-        }
-    }
-    Err(ScheduleError::Invalid(
-        "daily trigger has no next occurrence",
-    ))
+fn active_window(
+    active_hours: Option<&ActiveHours>,
+) -> Result<Option<timing::ActiveWindow>, ScheduleError> {
+    active_hours
+        .map(timing::ActiveWindow::parse)
+        .transpose()
+        .map_err(ScheduleError::Rejected)
 }
 
 pub(crate) fn legacy_next_due_at_ms(
@@ -917,43 +889,7 @@ fn validate_prompt(prompt: &str) -> Result<(), ScheduleError> {
 }
 
 fn validate_trigger(trigger: &ScheduleTrigger) -> Result<(), ScheduleError> {
-    let core_trigger = match trigger {
-        ScheduleTrigger::Interval { interval_ms } => {
-            if *interval_ms == 0 || interval_ms % 1_000 != 0 {
-                return Err(ScheduleError::Invalid(
-                    "intervalMs must be a positive whole number of seconds",
-                ));
-            }
-            anima_schedule::ScheduleTrigger::Every {
-                interval_secs: interval_ms / 1_000,
-            }
-        }
-        ScheduleTrigger::Daily {
-            hour,
-            minute,
-            time_zone,
-        } => {
-            let tz: Tz = time_zone
-                .parse()
-                .map_err(|_| ScheduleError::Invalid("timeZone is invalid"))?;
-            let now = Utc::now();
-            let offset_minutes = now.with_timezone(&tz).offset().fix().local_minus_utc() / 60;
-            anima_schedule::ScheduleTrigger::DailyAt {
-                hour: *hour,
-                minute: *minute,
-                tz_offset_minutes: offset_minutes,
-            }
-        }
-    };
-    anima_schedule::Scheduler::new(vec![anima_schedule::ScheduledJob {
-        name: "validation".into(),
-        agent_name: "agent".into(),
-        prompt: "prompt".into(),
-        trigger: core_trigger,
-        enabled: true,
-    }])
-    .map_err(|_| ScheduleError::Invalid("trigger is invalid"))?;
-    Ok(())
+    timing::validate_stored_trigger(trigger).map_err(ScheduleError::Rejected)
 }
 
 fn validate_target(

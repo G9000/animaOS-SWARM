@@ -202,6 +202,9 @@ fn schedule_error(error: ScheduleError) -> AxumResponse {
         ScheduleError::Invalid(message) => {
             error_response(StatusCode::BAD_REQUEST, "schedule_invalid", message)
         }
+        ScheduleError::Rejected(message) => {
+            error_response(StatusCode::BAD_REQUEST, "schedule_invalid", &message)
+        }
         ScheduleError::TargetUnavailable => error_response(
             StatusCode::CONFLICT,
             "schedule_target_unavailable",

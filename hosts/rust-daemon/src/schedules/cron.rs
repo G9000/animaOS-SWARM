@@ -2,7 +2,6 @@
 //! zone's wall clock. In-house, because the daemon takes no cron crate (M6
 //! Global Constraints). Day of month and day of week combine the Vixie way:
 //! when both are restricted, either may match.
-#![allow(dead_code)] // M6 Task 2 uses every item.
 
 use chrono::{Datelike, LocalResult, NaiveDate, NaiveDateTime, TimeDelta, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;

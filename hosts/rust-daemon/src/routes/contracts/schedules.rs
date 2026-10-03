@@ -103,6 +103,15 @@ pub(crate) enum ScheduleTriggerResponse {
         #[serde(rename = "timeZone")]
         time_zone: String,
     },
+    Cron {
+        expression: String,
+        #[serde(rename = "timeZone")]
+        time_zone: String,
+    },
+    Once {
+        #[serde(rename = "atMs")]
+        at_ms: u64,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
@@ -155,6 +164,14 @@ impl From<ScheduledPromptRecord> for ScheduleResponse {
                 minute,
                 time_zone,
             },
+            ScheduleTrigger::Cron {
+                expression,
+                time_zone,
+            } => ScheduleTriggerResponse::Cron {
+                expression,
+                time_zone,
+            },
+            ScheduleTrigger::Once { at_ms } => ScheduleTriggerResponse::Once { at_ms },
         };
         let target = match value.target {
             ScheduleTarget::Workspace => ScheduleTargetResponse::Workspace,

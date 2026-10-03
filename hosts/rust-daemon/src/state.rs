@@ -828,6 +828,45 @@ mod tests {
     }
 
     #[test]
+    fn restore_validates_every_trigger_variant() {
+        // `ScheduleTrigger` is already imported by this test module.
+        for (trigger, valid) in [
+            (
+                ScheduleTrigger::Cron {
+                    expression: "0 9 * * 1-5".into(),
+                    time_zone: "Europe/London".into(),
+                },
+                true,
+            ),
+            (ScheduleTrigger::Once { at_ms: 5 }, true),
+            (
+                ScheduleTrigger::Cron {
+                    expression: "0 9 * *".into(),
+                    time_zone: "Europe/London".into(),
+                },
+                false,
+            ),
+            (
+                ScheduleTrigger::Cron {
+                    expression: "0 9 * * *".into(),
+                    time_zone: "".into(),
+                },
+                false,
+            ),
+            (ScheduleTrigger::Once { at_ms: 0 }, false),
+        ] {
+            let (mut snapshot, _) = valid_connector_snapshot();
+            snapshot.schedules[0].trigger = trigger.clone();
+            let mut state = DaemonState::new();
+            assert_eq!(
+                state.restore_control_plane_snapshot(snapshot).is_ok(),
+                valid,
+                "{trigger:?}"
+            );
+        }
+    }
+
+    #[test]
     fn restore_does_not_validate_inbound_against_a_connector_absent_from_snapshot() {
         let mut state = DaemonState::new();
         let agent_id = state
@@ -2340,28 +2379,15 @@ impl DaemonState {
                     ));
                 }
             }
-            match &schedule.trigger {
-                crate::schedules::ScheduleTrigger::Interval { interval_ms }
-                    if *interval_ms == 0 || *interval_ms % 1_000 != 0 =>
-                {
-                    return Err(format!("schedule '{}' has a zero interval", schedule.id));
-                }
-                crate::schedules::ScheduleTrigger::Daily {
-                    hour,
-                    minute,
-                    time_zone,
-                } if *hour > 23
-                    || *minute > 59
-                    || time_zone.trim().is_empty()
-                    || time_zone.parse::<chrono_tz::Tz>().is_err() =>
-                {
-                    return Err(format!(
-                        "schedule '{}' has an invalid daily trigger",
+            // Spec §9.1: every variant by name, no catch-all arm.
+            crate::schedules::timing::validate_stored_trigger(&schedule.trigger).map_err(
+                |problem| {
+                    format!(
+                        "schedule '{}' has an invalid trigger: {problem}",
                         schedule.id
-                    ));
-                }
-                _ => {}
-            }
+                    )
+                },
+            )?;
             if let Some(last_fired) = &schedule.last_fired {
                 if last_fired.fired_at_ms == 0
                     || last_fired.fired_at_ms > schedule.updated_at_ms
