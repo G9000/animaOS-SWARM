@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import type {
   SkillDraft,
   SkillDraftApproval,
@@ -71,7 +71,10 @@ export function SkillDraftCard({
     await onReject(draft);
     setBusy(false);
   };
-  const diff = current === null ? null : lineDiff(current, draft.body);
+  const diff = useMemo(
+    () => (current === null ? null : lineDiff(current, draft.body)),
+    [current, draft.body],
+  );
   const blocked = busy || draft.problem !== null;
   // What the owner reads is shown with the invisible characters as markers;
   // the diff is computed on the raw text and each line is revealed.

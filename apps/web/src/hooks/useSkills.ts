@@ -27,6 +27,8 @@ export interface SkillsView {
   decided: SkillDraft[];
   loaded: boolean;
   error: string | null;
+  /** The HTTP status of the failed action, when the daemon refused it. */
+  errorStatus: number | null;
   /** Why skills cannot be used at all (no workspace), from the daemon. */
   unavailable: string | null;
   /** Reads the lists again. */
@@ -65,6 +67,7 @@ export function useSkills({
   // successful reload does not hide a refused action, nor the reverse.
   const [readError, setReadError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [actionStatus, setActionStatus] = useState<number | null>(null);
   const [unavailable, setUnavailable] = useState<string | null>(null);
   const reading = useRef<AbortController | null>(null);
 
@@ -112,13 +115,21 @@ export function useSkills({
   // not depend on the stream, so an action reads before it answers.
   const act = useCallback(
     async (work: () => Promise<unknown>) => {
+      // A new action does not keep showing the last one's refusal.
+      setActionError(null);
+      setActionStatus(null);
       try {
         await work();
       } catch (caught) {
         setActionError(message(caught));
+        if (caught instanceof DaemonHttpError) {
+          setActionStatus(caught.status);
+          // The thing acted on changed or went away since the lists were
+          // read: read them again so the page shows what is there now.
+          if (caught.status === 404 || caught.status === 409) await load();
+        }
         return false;
       }
-      setActionError(null);
       await load();
       return true;
     },
@@ -131,6 +142,7 @@ export function useSkills({
     decided,
     loaded,
     error: actionError ?? readError,
+    errorStatus: actionError ? actionStatus : null,
     unavailable,
     refresh,
     save: (slug, input) => act(() => daemon.saveSkill(slug, input)),

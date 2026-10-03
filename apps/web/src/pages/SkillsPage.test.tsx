@@ -1,4 +1,10 @@
-import { render, screen, waitFor, within } from '@testing-library/react';
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DaemonHttpError } from '@animaOS-SWARM/sdk';
@@ -6,9 +12,11 @@ import { DaemonHttpError } from '@animaOS-SWARM/sdk';
 import { daemon } from '../lib/daemon-api';
 import {
   EDIT_NEEDS_REVIEW,
+  FILE_PROBLEM_FIX,
   REVIEW_WARNING,
   SOURCE_LABELS,
   invisibleNote,
+  skillExistsProblem,
 } from '../lib/skills';
 import { skillDraftFixture, skillFixture } from '../test/skills';
 import { SkillsPage } from './SkillsPage';
@@ -327,14 +335,28 @@ describe('SkillsPage', () => {
     );
   });
 
-  it('points to the draft found in the folder when a save is refused for it', async () => {
+  it('points to the draft found in the folder when a save is refused while it waits', async () => {
     const user = userEvent.setup();
-    const save = vi.spyOn(daemon, 'saveSkill').mockRejectedValue(
-      new DaemonHttpError(409, {
-        error:
-          "A SKILL.md the owner hasn't reviewed is in this folder; review it first",
-      }),
+    vi.mocked(daemon.listSkillDrafts).mockImplementation(async ({ status }) =>
+      status === 'pending'
+        ? [
+            skillDraftFixture('file:hi', {
+              slug: 'hi',
+              name: 'Hi',
+              source: 'file',
+              proposedBy: null,
+              fileHash: 'f'.repeat(64),
+            }),
+          ]
+        : [],
     );
+    const save = vi
+      .spyOn(daemon, 'saveSkill')
+      .mockRejectedValue(
+        new DaemonHttpError(409, {
+          error: 'The daemon words this its own way',
+        }),
+      );
     renderPage();
     await screen.findByRole('region', { name: 'Skills' });
 
@@ -352,7 +374,7 @@ describe('SkillsPage', () => {
     await user.click(within(form).getByRole('button', { name: 'Save skill' }));
 
     expect(save).toHaveBeenCalled();
-    expect(await screen.findByText(/review it first/)).toBeVisible();
+    expect(await screen.findByText(/its own way/)).toBeVisible();
     expect(
       screen.getByText(/Waiting for review.*found in the skills folder/),
     ).toBeVisible();
@@ -434,6 +456,244 @@ describe('SkillsPage', () => {
     expect(
       screen.queryByRole('region', { name: /^Review changes/ }),
     ).not.toBeInTheDocument();
+  });
+
+  it('does not point to a draft when no file draft waits for that folder', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(daemon, 'saveSkill').mockRejectedValue(
+      new DaemonHttpError(409, {
+        error:
+          "A SKILL.md the owner hasn't reviewed is in this folder; review it first",
+      }),
+    );
+    renderPage();
+    await screen.findByRole('region', { name: 'Skills' });
+
+    await user.click(screen.getByRole('button', { name: 'New skill' }));
+    const form = screen.getByRole('form', { name: 'Skill editor' });
+    await user.type(within(form).getByRole('textbox', { name: 'Name' }), 'Hi');
+    await user.type(
+      within(form).getByRole('textbox', { name: 'When to use it' }),
+      'Greeting',
+    );
+    await user.type(
+      within(form).getByRole('textbox', { name: 'Instructions' }),
+      'Say hi.',
+    );
+    await user.click(within(form).getByRole('button', { name: 'Save skill' }));
+
+    expect(await screen.findByText(/review it first/)).toBeVisible();
+    expect(screen.queryByText(/found in the skills folder/)).toBeNull();
+  });
+
+  it('refuses a new skill whose folder already holds a skill', async () => {
+    const user = userEvent.setup();
+    const save = vi.spyOn(daemon, 'saveSkill');
+    renderPage();
+    await screen.findByRole('region', { name: 'Skills' });
+
+    await user.click(screen.getByRole('button', { name: 'New skill' }));
+    const form = screen.getByRole('form', { name: 'Skill editor' });
+    await user.type(
+      within(form).getByRole('textbox', { name: 'Name' }),
+      'Notes',
+    );
+    await user.type(
+      within(form).getByRole('textbox', { name: 'When to use it' }),
+      'Again',
+    );
+    await user.type(
+      within(form).getByRole('textbox', { name: 'Instructions' }),
+      'Overwrite.',
+    );
+    await user.click(within(form).getByRole('button', { name: 'Save skill' }));
+
+    expect(within(form).getByRole('alert')).toHaveTextContent(
+      'A skill in /notes already exists; edit it instead.',
+    );
+    expect(skillExistsProblem('notes')).toBe(
+      'A skill in /notes already exists; edit it instead.',
+    );
+    expect(save).not.toHaveBeenCalled();
+  });
+
+  it('reveals invisible characters in the editor preview', async () => {
+    const user = userEvent.setup();
+    renderPage();
+    await screen.findByRole('region', { name: 'Skills' });
+
+    await user.click(screen.getByRole('button', { name: 'New skill' }));
+    const form = screen.getByRole('form', { name: 'Skill editor' });
+    fireEvent.change(
+      within(form).getByRole('textbox', { name: 'Instructions' }),
+      { target: { value: `safe${String.fromCharCode(0x200b)}hidden` } },
+    );
+    await user.click(within(form).getByRole('button', { name: 'Preview' }));
+
+    expect(within(form).getByLabelText('Preview')).toHaveTextContent(
+      'safe⟨U+200B⟩hidden',
+    );
+    expect(within(form).getByText(invisibleNote(1) ?? '')).toBeVisible();
+  });
+
+  it('reads again and shows the new body when approving a file draft is refused', async () => {
+    const user = userEvent.setup();
+    let body = 'Old body';
+    vi.mocked(daemon.listSkillDrafts).mockImplementation(async ({ status }) =>
+      status === 'pending'
+        ? [
+            skillDraftFixture('file:found', {
+              slug: 'found',
+              name: 'Found',
+              source: 'file',
+              proposedBy: null,
+              fileHash: 'f'.repeat(64),
+              body,
+            }),
+          ]
+        : [],
+    );
+    vi.spyOn(daemon, 'approveSkillDraft').mockImplementation(async () => {
+      body = 'New body';
+      throw new DaemonHttpError(409, { error: 'The file changed on disk' });
+    });
+    renderPage();
+    const card = await screen.findByRole('region', {
+      name: 'Skill draft: Found',
+    });
+    expect(within(card).getByText('Old body')).toBeVisible();
+
+    await user.click(within(card).getByRole('button', { name: 'Approve' }));
+
+    expect(await screen.findByText('The file changed on disk')).toBeVisible();
+    await waitFor(() => expect(daemon.listSkills).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText('New body')).toBeVisible();
+  });
+
+  it('shows the new file when approving a changed skill is refused', async () => {
+    const user = userEvent.setup();
+    const detail = vi.mocked(daemon.skill);
+    detail.mockResolvedValue({
+      skill: skillFixture('plan', { status: 'changed' }),
+      file: {
+        hash: 'b'.repeat(64),
+        name: 'Plan',
+        description: 'd',
+        body: 'First version',
+        problem: null,
+      },
+    });
+    const approve = vi
+      .spyOn(daemon, 'approveSkill')
+      .mockImplementation(async () => {
+        detail.mockResolvedValue({
+          skill: skillFixture('plan', { status: 'changed' }),
+          file: {
+            hash: 'c'.repeat(64),
+            name: 'Plan',
+            description: 'd',
+            body: 'Second version',
+            problem: null,
+          },
+        });
+        throw new DaemonHttpError(409, { error: 'The file changed' });
+      });
+    renderPage();
+    const plan = within(
+      await screen.findByRole('region', { name: 'Skills' }),
+    ).getByRole('listitem', { name: 'Plan' });
+    await user.click(
+      within(plan).getByRole('button', { name: 'Review changes' }),
+    );
+    const review = await screen.findByRole('region', {
+      name: 'Review changes to Plan',
+    });
+    expect(within(review).getByText('First version')).toBeVisible();
+
+    await user.click(
+      within(review).getByRole('button', { name: 'Approve this version' }),
+    );
+
+    expect(await within(review).findByText('Second version')).toBeVisible();
+    expect(approve).toHaveBeenCalledWith('plan', 'b'.repeat(64));
+    expect(screen.getByText('The file changed')).toBeVisible();
+    await user.click(
+      within(review).getByRole('button', { name: 'Approve this version' }),
+    );
+    expect(approve).toHaveBeenLastCalledWith('plan', 'c'.repeat(64));
+  });
+
+  it('opens the editor when the detail shows the file at the approved hash', async () => {
+    const user = userEvent.setup();
+    // The list is stale: the detail's own skill record has the new hash.
+    vi.mocked(daemon.skill).mockResolvedValue({
+      skill: skillFixture('notes', { approvedHash: 'b'.repeat(64) }),
+      file: {
+        hash: 'b'.repeat(64),
+        name: 'Notes',
+        description: 'Take notes',
+        body: 'Fresh body',
+        problem: null,
+      },
+    });
+    renderPage();
+    const notes = within(
+      await screen.findByRole('region', { name: 'Skills' }),
+    ).getByRole('listitem', { name: 'Notes' });
+
+    await user.click(within(notes).getByRole('button', { name: 'Edit' }));
+
+    expect(
+      await screen.findByRole('form', { name: 'Skill editor' }),
+    ).toBeVisible();
+  });
+
+  it("shows the daemon's reason when a skill cannot be read, then clears it", async () => {
+    const user = userEvent.setup();
+    vi.mocked(daemon.skill).mockRejectedValue(
+      new DaemonHttpError(404, { error: 'No skill in /notes' }),
+    );
+    renderPage();
+    const notes = within(
+      await screen.findByRole('region', { name: 'Skills' }),
+    ).getByRole('listitem', { name: 'Notes' });
+
+    await user.click(within(notes).getByRole('button', { name: 'Edit' }));
+    expect(await screen.findByText('No skill in /notes')).toBeVisible();
+
+    vi.mocked(daemon.skill).mockResolvedValue({
+      skill: skillFixture('notes'),
+      file: null,
+    });
+    await user.click(within(notes).getByRole('button', { name: 'Edit' }));
+    await waitFor(() =>
+      expect(screen.queryByText('No skill in /notes')).toBeNull(),
+    );
+  });
+
+  it('tells the owner how to fix a file with a problem', async () => {
+    const user = userEvent.setup();
+    vi.mocked(daemon.skill).mockResolvedValue({
+      skill: skillFixture('plan', { status: 'invalid' }),
+      file: {
+        hash: null,
+        name: null,
+        description: null,
+        body: null,
+        problem: 'SKILL.md must start with front matter between --- lines',
+      },
+    });
+    renderPage();
+    const plan = within(
+      await screen.findByRole('region', { name: 'Skills' }),
+    ).getByRole('listitem', { name: 'Plan' });
+
+    await user.click(within(plan).getByRole('button', { name: 'Edit' }));
+
+    const review = await screen.findByRole('region', {
+      name: 'Review changes to Plan',
+    });
+    expect(within(review).getByText(FILE_PROBLEM_FIX)).toBeVisible();
   });
 
   it('deletes a skill only after confirming', async () => {

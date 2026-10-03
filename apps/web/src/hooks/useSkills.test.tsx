@@ -125,4 +125,63 @@ describe('useSkills', () => {
     expect(kept).toBe(true);
     expect(result.current.error).not.toBeNull();
   });
+
+  it('reads the lists again when an action finds its target changed or gone', async () => {
+    vi.spyOn(daemon, 'approveSkillDraft').mockRejectedValue(
+      new DaemonHttpError(409, { error: 'The file changed' }),
+    );
+    vi.spyOn(daemon, 'deleteSkill').mockRejectedValue(
+      new DaemonHttpError(404, { error: 'No such skill' }),
+    );
+    vi.spyOn(daemon, 'rejectSkillDraft').mockRejectedValue(
+      new DaemonHttpError(500, { error: 'Broke' }),
+    );
+    const { result } = renderHook(() =>
+      useSkills({ version: 0, epoch: 0, enabled: true }),
+    );
+    await waitFor(() => expect(result.current.loaded).toBe(true));
+
+    await act(async () => {
+      await result.current.approveDraft(result.current.pending[0]);
+    });
+    expect(result.current.error).toBe('The file changed');
+    expect(result.current.errorStatus).toBe(409);
+    expect(daemon.listSkills).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      await result.current.remove(result.current.skills[0]);
+    });
+    expect(result.current.error).toBe('No such skill');
+    expect(daemon.listSkills).toHaveBeenCalledTimes(3);
+
+    await act(async () => {
+      await result.current.rejectDraft(result.current.pending[0]);
+    });
+    expect(result.current.error).toBe('Broke');
+    expect(daemon.listSkills).toHaveBeenCalledTimes(3);
+  });
+
+  it('a new action clears the last refusal', async () => {
+    vi.spyOn(daemon, 'rejectSkillDraft').mockRejectedValue(
+      new DaemonHttpError(500, { error: 'Broke' }),
+    );
+    vi.spyOn(daemon, 'setSkillEnabled').mockResolvedValue(
+      skillFixture('notes', { enabled: false }),
+    );
+    const { result } = renderHook(() =>
+      useSkills({ version: 0, epoch: 0, enabled: true }),
+    );
+    await waitFor(() => expect(result.current.loaded).toBe(true));
+    await act(async () => {
+      await result.current.rejectDraft(result.current.pending[0]);
+    });
+    expect(result.current.error).toBe('Broke');
+
+    await act(async () => {
+      await result.current.setEnabled(result.current.skills[0], false);
+    });
+
+    expect(result.current.error).toBeNull();
+    expect(result.current.errorStatus).toBeNull();
+  });
 });

@@ -27,12 +27,18 @@ export const SKILL_NAME_PROBLEM =
   'Give the skill a one-line name of at most 64 characters.';
 export const SKILL_DESCRIPTION_PROBLEM =
   'Say when to use it in one line of at most 300 characters.';
+/** A new skill must not overwrite one that exists. */
+export function skillExistsProblem(slug: string): string {
+  return `A skill in /${slug} already exists; edit it instead.`;
+}
 export const SKILL_BODY_MISSING = 'Write the instructions.';
 export const SKILL_BODY_TOO_LARGE = 'The instructions must be at most 32 KiB.';
 
 /** Copy for the Skills page (Task 12). */
 export const EDIT_NEEDS_REVIEW =
   'This skill’s file changed since you approved it. Review it first, then edit.';
+export const FILE_PROBLEM_FIX =
+  'Fix SKILL.md on disk, or delete the skill; it cannot be approved as it is.';
 export const REVIEW_WARNING =
   'Anything with write access to the workspace, including your companion, can change this file. Read it in full before approving.';
 

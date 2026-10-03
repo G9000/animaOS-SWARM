@@ -1,6 +1,11 @@
 import { useState, type FormEvent } from 'react';
 
-import { skillInputProblem, slugFromName } from '../../lib/skills';
+import {
+  invisibleNote,
+  revealInvisible,
+  skillInputProblem,
+  slugFromName,
+} from '../../lib/skills';
 
 export interface SkillEditorValue {
   slug: string;
@@ -17,6 +22,7 @@ export function SkillEditor({
   slugLocked = false,
   bodyOnly = false,
   saveLabel,
+  checkProblem,
   onSave,
   onCancel,
 }: {
@@ -28,6 +34,8 @@ export function SkillEditor({
    *  check before saving reads. */
   bodyOnly?: boolean;
   saveLabel: string;
+  /** Anything else the caller would refuse in this content, or null. */
+  checkProblem?: (value: SkillEditorValue) => string | null;
   /** True when the daemon took it; the editor then stays for the caller
    *  to close. */
   onSave: (value: SkillEditorValue) => Promise<boolean>;
@@ -42,11 +50,13 @@ export function SkillEditor({
   const [problem, setProblem] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const folder = slugEdited ? slug : slugFromName(name);
+  const shownBody = revealInvisible(body);
+  const bodyNote = invisibleNote(shownBody.count);
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     const value = { slug: folder, name, description, body };
-    const found = skillInputProblem(value);
+    const found = skillInputProblem(value) ?? checkProblem?.(value) ?? null;
     setProblem(found);
     if (found) return;
     setSaving(true);
@@ -91,7 +101,7 @@ export function SkillEditor({
       )}
       {preview ? (
         <pre className="skill-body" aria-label="Preview">
-          {body}
+          {shownBody.text}
         </pre>
       ) : (
         <label className="skill-field">
@@ -102,6 +112,11 @@ export function SkillEditor({
             onChange={(event) => setBody(event.target.value)}
           />
         </label>
+      )}
+      {bodyNote && (
+        <p className="skill-draft-warning" role="note">
+          {bodyNote}
+        </p>
       )}
       {problem && (
         <p className="skills-error" role="alert">

@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { DaemonHttpError } from '@animaOS-SWARM/sdk';
 import type { Skill, SkillDraftProposer, SkillFile } from '@animaOS-SWARM/sdk';
 
 import { SkillDraftCard } from '../components/skills/SkillDraftCard';
@@ -10,11 +11,13 @@ import { COMPANION_UNREACHABLE, formatWhen } from '../lib/approvals';
 import { daemon } from '../lib/daemon-api';
 import {
   EDIT_NEEDS_REVIEW,
+  FILE_PROBLEM_FIX,
   REVIEW_WARNING,
   STATUS_LABELS,
   invisibleNote,
   moreFileDraftsNote,
   revealInvisible,
+  skillExistsProblem,
   splitFileDrafts,
 } from '../lib/skills';
 import { useSkills } from '../hooks/useSkills';
@@ -31,10 +34,8 @@ export interface SkillsPageProps {
 type Editing = { skill: Skill | null; initial?: SkillEditorValue };
 type Review = { skill: Skill; file: SkillFile; note: string | null };
 
-/** The daemon's 409 when a SKILL.md the owner has not reviewed sits in the
- *  folder a save or an approval would write to. */
-const FILE_UNREVIEWED =
-  "A SKILL.md the owner hasn't reviewed is in this folder; review it first";
+/** Shown when a save is refused (409) while a file draft waits in the folder
+ *  it would write to. */
 const FILE_UNREVIEWED_HINT =
   'It is listed under Waiting for review as a draft found in the skills folder.';
 
@@ -52,13 +53,24 @@ export function SkillsPage({
   const [review, setReview] = useState<Review | null>(null);
   const [confirming, setConfirming] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  // The folder of the last save, for the hint when it was refused.
+  const [savedSlug, setSavedSlug] = useState<string | null>(null);
 
+  // A new action does not keep showing the last one's notice.
+  const begin = () => {
+    setNotice(null);
+    setSavedSlug(null);
+  };
   const detailOf = async (skill: Skill) => {
+    begin();
     try {
-      setNotice(null);
       return await daemon.skill(skill.slug);
-    } catch {
-      setNotice(COMPANION_UNREACHABLE);
+    } catch (caught) {
+      setNotice(
+        caught instanceof DaemonHttpError
+          ? caught.message
+          : COMPANION_UNREACHABLE,
+      );
       return null;
     }
   };
@@ -69,7 +81,8 @@ export function SkillsPage({
     // since the owner approved it, or that has a problem, is reviewed first.
     if (
       detail.file &&
-      (detail.file.problem !== null || detail.file.hash !== skill.approvedHash)
+      (detail.file.problem !== null ||
+        detail.file.hash !== (detail.skill?.approvedHash ?? skill.approvedHash))
     ) {
       setEditing(null);
       setReview({ skill, file: detail.file, note: EDIT_NEEDS_REVIEW });
@@ -103,6 +116,11 @@ export function SkillsPage({
   const shown = splitFileDrafts(view.pending);
   const moreFiles = moreFileDraftsNote(shown.hidden);
   const error = view.error ?? notice;
+  // A save refused while a file draft waits in its folder: say where it is.
+  const unreviewedFile =
+    view.errorStatus === 409 &&
+    savedSlug !== null &&
+    view.pending.some((draft) => draft.id === `file:${savedSlug}`);
 
   if (view.unavailable) {
     return (
@@ -119,7 +137,7 @@ export function SkillsPage({
       {error && (
         <p className="skills-error" role="alert">
           {error}
-          {error === FILE_UNREVIEWED && ` ${FILE_UNREVIEWED_HINT}`}
+          {unreviewedFile && ` ${FILE_UNREVIEWED_HINT}`}
         </p>
       )}
       <section className="skills-section" aria-labelledby="skills-waiting">
@@ -131,8 +149,14 @@ export function SkillsPage({
             <SkillDraftCard
               key={draft.id}
               draft={draft}
-              onApprove={view.approveDraft}
-              onReject={view.rejectDraft}
+              onApprove={(target, approval) => {
+                begin();
+                return view.approveDraft(target, approval);
+              }}
+              onReject={(target) => {
+                begin();
+                return view.rejectDraft(target);
+              }}
               onOpenSession={onOpenSession}
             />
           ))
@@ -145,7 +169,10 @@ export function SkillsPage({
           <button
             type="button"
             className="studio-tool-button"
-            onClick={() => setEditing({ skill: null })}
+            onClick={() => {
+              begin();
+              setEditing({ skill: null });
+            }}
           >
             New skill
           </button>
@@ -158,7 +185,10 @@ export function SkillsPage({
               onChange={(event) => {
                 const file = event.target.files?.[0];
                 event.target.value = '';
-                if (file) void view.importFile(file);
+                if (file) {
+                  begin();
+                  void view.importFile(file);
+                }
               }}
             />
           </label>
@@ -168,7 +198,17 @@ export function SkillsPage({
             initial={editing.initial}
             slugLocked={editing.skill !== null}
             saveLabel="Save skill"
+            checkProblem={
+              editing.skill === null
+                ? (value) =>
+                    view.skills.some((skill) => skill.slug === value.slug)
+                      ? skillExistsProblem(value.slug)
+                      : null
+                : undefined
+            }
             onSave={async (value) => {
+              begin();
+              setSavedSlug(value.slug);
               const kept = await view.save(value.slug, {
                 name: value.name,
                 description: value.description,
@@ -199,9 +239,14 @@ export function SkillsPage({
               </p>
             )}
             {review.file.problem ? (
-              <p className="skill-draft-warning" role="note">
-                {review.file.problem}
-              </p>
+              <>
+                <p className="skill-draft-warning" role="note">
+                  {review.file.problem}
+                </p>
+                <p className="skill-draft-warning" role="note">
+                  {FILE_PROBLEM_FIX}
+                </p>
+              </>
             ) : (
               <>
                 {reviewed.name.text && <strong>{reviewed.name.text}</strong>}
@@ -220,8 +265,12 @@ export function SkillsPage({
                 disabled={!review.file.hash || review.file.problem !== null}
                 onClick={async () => {
                   if (!review.file.hash) return;
+                  begin();
+                  // Refused (the file changed again, or is gone): read it
+                  // again so the review shows what is there now.
                   if (await view.approveChanged(review.skill, review.file.hash))
                     setReview(null);
+                  else await openReview(review.skill);
                 }}
               >
                 Approve this version
@@ -266,9 +315,10 @@ export function SkillsPage({
                       type="checkbox"
                       checked={skill.enabled}
                       aria-label={`${revealInvisible(skill.name).text} is ${skill.enabled ? 'on' : 'off'}`}
-                      onChange={(event) =>
-                        void view.setEnabled(skill, event.target.checked)
-                      }
+                      onChange={(event) => {
+                        begin();
+                        void view.setEnabled(skill, event.target.checked);
+                      }}
                     />
                     {skill.enabled ? 'On' : 'Off'}
                   </label>
@@ -297,6 +347,7 @@ export function SkillsPage({
                         type="button"
                         className="studio-tool-button"
                         onClick={async () => {
+                          begin();
                           if (await view.remove(skill)) setConfirming(null);
                         }}
                       >

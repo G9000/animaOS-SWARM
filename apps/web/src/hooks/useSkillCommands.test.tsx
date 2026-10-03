@@ -56,4 +56,30 @@ describe('useSkillCommands', () => {
 
     expect(renders).toBe(1);
   });
+
+  it('falls back to the built-ins when a read fails or the daemon goes offline', async () => {
+    const list = vi
+      .spyOn(daemon, 'listSkills')
+      .mockResolvedValue([skillFixture('notes')]);
+    const { result, rerender } = renderHook(
+      (props: { version: number; enabled: boolean }) =>
+        useSkillCommands({ epoch: 0, ...props }),
+      { initialProps: { version: 0, enabled: true } },
+    );
+    await waitFor(() =>
+      expect(result.current.map((command) => command.name)).toContain('notes'),
+    );
+
+    list.mockRejectedValue(new Error('offline'));
+    rerender({ version: 1, enabled: true });
+    await waitFor(() => expect(result.current).toEqual(SLASH_COMMANDS));
+
+    list.mockResolvedValue([skillFixture('notes')]);
+    rerender({ version: 2, enabled: true });
+    await waitFor(() =>
+      expect(result.current.map((command) => command.name)).toContain('notes'),
+    );
+    rerender({ version: 2, enabled: false });
+    await waitFor(() => expect(result.current).toEqual(SLASH_COMMANDS));
+  });
 });
