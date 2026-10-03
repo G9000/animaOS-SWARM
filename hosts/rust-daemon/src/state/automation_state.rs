@@ -1,7 +1,6 @@
 //! Automations in the daemon state (spec §9): announcing changes, recording
 //! an occurrence's outcome with its counters and fire record (and undoing
 //! that when the commit's save fails), and handing fires to the outbox.
-#![allow(dead_code)] // M6 Task 7 uses every item.
 
 use super::DaemonState;
 use crate::live::{LiveEvent, LiveEventBody};

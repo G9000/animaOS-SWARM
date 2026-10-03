@@ -24,9 +24,14 @@ pub(crate) mod history;
 #[cfg(test)]
 pub(crate) use automations::test_automation;
 pub(crate) use automations::{
-    validate_stored_automation, AutomationCounters, AutomationCreator, AutomationInput,
-    AutomationPatch, AutomationPreset, AutomationService, AUTOMATION_ALREADY_RUNNING,
-    TOO_MANY_RUNNING_AUTOMATIONS,
+    display_name, heartbeat_input, preview, validate_stored_automation, AutomationCounters,
+    AutomationCreator, AutomationInput, AutomationPatch, AutomationPreset, AutomationService,
+    AUTOMATION_ALREADY_RUNNING, AUTOMATION_HISTORY_UNAVAILABLE, MAX_AUTOMATION_HISTORY_SHOWN,
+    PROMPT_AND_TRIGGER_REQUIRED, TOO_MANY_RUNNING_AUTOMATIONS,
+};
+#[cfg(test)]
+pub(crate) use automations::{
+    HEARTBEAT_NEEDS_TIME_ZONE, MAX_AUTOMATIONS_PER_AGENT, TOO_MANY_AUTOMATIONS,
 };
 pub(crate) use history::{FireLog, ScheduleFireRecord};
 
@@ -185,6 +190,8 @@ pub(crate) enum ScheduleError {
     Conflict(&'static str),
     /// The scheduler is at its admission cap (429).
     Busy(&'static str),
+    /// The history store could not be read (503).
+    HistoryUnavailable,
     TargetUnavailable,
     Persistence,
 }
@@ -298,6 +305,7 @@ impl SchedulerService {
         self.automations().create(input, now_ms()).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn update(
         &self,
         agent_id: &str,
@@ -344,7 +352,6 @@ impl SchedulerService {
     /// one run per automation and the scheduler's admission cap still hold,
     /// and the fire is recorded as manual. The claim and the job's start run
     /// in their own task, so a dropped request still finishes them.
-    #[allow(dead_code)] // M6 Task 7's route calls it.
     pub(crate) async fn run_now(
         &self,
         agent_id: &str,
@@ -523,6 +530,12 @@ fn unresolved_occurrence(record: &ScheduledPromptRecord) -> bool {
             .as_ref()
             .is_none_or(|outcome| outcome.occurred_at_ms < fired.fired_at_ms)
     })
+}
+
+/// Its latest occurrence has no outcome yet: it is running, or a restart
+/// interrupted it and the next tick will record that.
+pub(crate) fn is_running(record: &ScheduledPromptRecord) -> bool {
+    unresolved_occurrence(record)
 }
 
 async fn reconcile_interrupted(

@@ -2,7 +2,6 @@
 //! active hours, who made it, a preset, and counters). This module also holds
 //! their limits and strings, the heartbeat preset, and `AutomationService`,
 //! through which the owner's routes and the companion's tools change them.
-#![allow(dead_code)] // M6 Task 8 uses every item.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -16,7 +15,8 @@ use super::timing::{
 };
 use super::{
     next_due, next_schedule_id, validate_prompt, validate_target, validate_trigger, ScheduleError,
-    ScheduleOutcomeStatus, ScheduleTarget, ScheduleTrigger, ScheduledPromptRecord,
+    ScheduleFireRecord, ScheduleOutcomeStatus, ScheduleTarget, ScheduleTrigger,
+    ScheduledPromptRecord,
 };
 use crate::app::SharedDaemonState;
 use crate::skills::{has_variation_selector_run, is_hidden_in_one_line, is_smuggling_character};
@@ -51,6 +51,9 @@ pub(crate) const AUTOMATION_NAME_INVALID: &str = "name must be 1–80 characters
 pub(crate) const AUTOMATION_TEXT_HIDDEN: &str =
     "Automation text must not contain invisible tag or direction-override characters";
 pub(crate) const HEARTBEAT_NEEDS_TIME_ZONE: &str = "timeZone is required for the heartbeat preset";
+pub(crate) const PROMPT_AND_TRIGGER_REQUIRED: &str =
+    "prompt and trigger are required unless preset is heartbeat";
+pub(crate) const AUTOMATION_HISTORY_UNAVAILABLE: &str = "automation history is unavailable";
 pub(crate) const AUTOMATION_ALREADY_RUNNING: &str = "This automation is already running";
 pub(crate) const TOO_MANY_RUNNING_AUTOMATIONS: &str =
     "Too many automations are running; try again shortly";
@@ -436,6 +439,7 @@ impl AutomationService {
         Ok(records)
     }
 
+    #[allow(dead_code)] // M6 Task 8's tools call it.
     pub(crate) async fn get(
         &self,
         agent_id: &str,
@@ -451,6 +455,53 @@ impl AutomationService {
             .filter(|item| item.agent_id == agent_id)
             .cloned()
             .ok_or(ScheduleError::NotFound)
+    }
+
+    /// The automation's latest fires, newest first: the control plane's
+    /// unmirrored ones merged with the history store's (spec §9.1).
+    pub(crate) async fn history(
+        &self,
+        agent_id: &str,
+        schedule_id: &str,
+        limit: usize,
+    ) -> Result<Vec<ScheduleFireRecord>, ScheduleError> {
+        let (pending, store) = {
+            let state = self.state.read().await;
+            let owned = state.get_agent(agent_id).is_some()
+                && state
+                    .schedules
+                    .get(schedule_id)
+                    .is_some_and(|record| record.agent_id == agent_id);
+            if !owned {
+                return Err(ScheduleError::NotFound);
+            }
+            (
+                state.schedule_fires.for_schedule(schedule_id),
+                state.history.store(),
+            )
+        };
+        let stored = store
+            .page_schedule_runs(agent_id, schedule_id, limit)
+            .await
+            .map_err(|error| {
+                tracing::warn!(error = %error, schedule_id, "could not read an automation's history");
+                ScheduleError::HistoryUnavailable
+            })?;
+        let mut merged = pending;
+        for fire in stored {
+            if !merged.iter().any(|known| known.id == fire.id) {
+                merged.push(fire);
+            }
+        }
+        merged.retain(|fire| fire.agent_id == agent_id);
+        merged.sort_by(|left, right| {
+            right
+                .fired_at_ms
+                .cmp(&left.fired_at_ms)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        merged.truncate(limit);
+        Ok(merged)
     }
 
     /// Creates an automation; `(record, false)` when a legacy import's key
@@ -646,6 +697,7 @@ impl AutomationService {
     }
 
     /// Turns an automation off; `(record, false)` when it already was.
+    #[allow(dead_code)] // M6 Task 8's tools call it.
     pub(crate) async fn pause(
         &self,
         agent_id: &str,

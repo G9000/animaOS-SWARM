@@ -1,7 +1,6 @@
 //! Automation fire history (spec §9.1): one record per occurrence, saved
 //! with its outcome and kept in the control plane until the history store
 //! holds it (spec §13.1).
-#![allow(dead_code)] // M6 Task 7 uses every item.
 
 use std::collections::HashSet;
 
@@ -57,6 +56,7 @@ pub(crate) enum FireUndo {
 impl FireLog {
     /// Adds `fire`, replacing one with its id (returned); past the cap the
     /// oldest leaves.
+    #[cfg(test)]
     pub(crate) fn record(&mut self, fire: ScheduleFireRecord) -> Option<ScheduleFireRecord> {
         match self.record_undoable(fire) {
             FireUndo::Replaced { previous } => Some(previous),

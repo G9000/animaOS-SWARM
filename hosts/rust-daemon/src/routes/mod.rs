@@ -170,6 +170,9 @@ use crate::runtime_model::provider_summaries;
         schedules::update_schedule,
         schedules::delete_schedule,
         schedules::import_legacy_schedules,
+        schedules::run_schedule,
+        schedules::schedule_history,
+        schedules::preview_schedule,
         sessions::list_sessions, sessions::get_session, sessions::list_session_messages,
         sessions::create_session, sessions::update_session, sessions::delete_session, sessions::export_session,
         sessions::compact_session,
@@ -193,7 +196,7 @@ use crate::runtime_model::provider_summaries;
         (name = "providers", description = "Model provider catalog"),
         (name = "connectors", description = "Agent-scoped connector administration"),
         (name = "connector-thread", description = "Dedicated connector-room messages"),
-        (name = "schedules", description = "Daemon-backed scheduled prompts"),
+        (name = "schedules", description = "Automations: daemon-backed scheduled prompts, their history, Run now, and previews"),
         (name = "sessions", description = "Agent sessions and their transcripts"),
         (name = "runs", description = "Live runs: the agent event stream, session runs, and stop"),
         (name = "approvals", description = "Tool approvals: pending requests, decisions, policies, and rules"),
@@ -673,6 +676,18 @@ fn router_with_services_with_policies(
         .route(
             "/api/agents/{agent_id}/schedules/{schedule_id}",
             axum::routing::patch(schedules::update_schedule).delete(schedules::delete_schedule),
+        )
+        .route(
+            "/api/agents/{agent_id}/schedules/{schedule_id}/run",
+            axum::routing::post(schedules::run_schedule),
+        )
+        .route(
+            "/api/agents/{agent_id}/schedules/{schedule_id}/history",
+            get(schedules::schedule_history),
+        )
+        .route(
+            "/api/schedules/preview",
+            axum::routing::post(schedules::preview_schedule),
         )
         .route(
             "/api/agents/{agent_id}/connectors",
@@ -1965,6 +1980,7 @@ async fn handle_memory_search(uri: Uri, state: &SharedDaemonState) -> AxumRespon
 #[cfg(test)]
 mod tests {
     mod approvals;
+    mod automations;
     mod capabilities;
     mod events;
     mod goals;
