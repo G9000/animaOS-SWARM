@@ -163,6 +163,73 @@ export interface MemoryReadiness {
   evaluation: MemoryEvalReport;
 }
 
+export const MAX_MEMORY_EDIT_CHARS = 8_000;
+export const MAX_MEMORY_TAGS = 20;
+export const MAX_MEMORY_TAG_CHARS = 40;
+export const MAX_FACT_VALUE_CHARS = 500;
+export const MAX_FACTS_SHOWN = 500;
+
+export interface MemoryPatch {
+  content?: string;
+  importance?: number;
+  /** `null` clears the tags; absent keeps them. */
+  tags?: string[] | null;
+}
+
+export interface MemoryDeleteResult {
+  id: string;
+  removedRelationships: number;
+  updatedRelationships: number;
+  updatedFacts: number;
+}
+
+export type MemoryFactStatus = 'active' | 'superseded' | 'retracted';
+
+/** A temporal fact. Untrusted text: the companion wrote it, so show it as text. */
+export interface MemoryFact {
+  id: string;
+  subjectKind: RelationshipEndpointKind;
+  subjectId: string;
+  subjectName: string;
+  predicate: string;
+  objectKind: RelationshipEndpointKind | null;
+  objectId: string | null;
+  objectName: string | null;
+  value: string | null;
+  validFrom: number | null;
+  validTo: number | null;
+  observedAt: number;
+  confidence: number;
+  evidenceMemoryIds: string[];
+  supersedesFactIds: string[];
+  status: MemoryFactStatus;
+  tags: string[] | null;
+  roomId: string | null;
+  worldId: string | null;
+  sessionId: string | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface MemoryFactOptions {
+  agentId?: string;
+  subject?: string;
+  includeInactive?: boolean;
+  limit?: number;
+}
+
+export interface MemoryFactReplaced {
+  fact: MemoryFact;
+  superseded: MemoryFact;
+}
+
+export interface MemoryEntityDeleteResult {
+  kind: RelationshipEndpointKind;
+  id: string;
+  removedRelationships: number;
+  removedFacts: number;
+}
+
 export class MemoriesClient {
   constructor(private readonly client: DaemonClient) {}
 
@@ -175,7 +242,7 @@ export class MemoriesClient {
 
   async search(
     query: string,
-    options: MemorySearchOptions = {}
+    options: MemorySearchOptions = {},
   ): Promise<MemorySearchResult[]> {
     const search = new URLSearchParams();
     search.set('q', query);
@@ -244,7 +311,7 @@ export class MemoriesClient {
       ? `/api/memories/recent?${search.toString()}`
       : '/api/memories/recent';
     const response = await this.client.requestJson<{ memories: Memory[] }>(
-      path
+      path,
     );
 
     return response.memories;
@@ -279,11 +346,81 @@ export class MemoriesClient {
     const path = search.size
       ? `/api/memories/entities?${search.toString()}`
       : '/api/memories/entities';
-    const response = await this.client.requestJson<{ entities: MemoryEntity[] }>(
-      path
-    );
+    const response = await this.client.requestJson<{
+      entities: MemoryEntity[];
+    }>(path);
 
     return response.entities;
+  }
+
+  async update(memoryId: string, patch: MemoryPatch): Promise<Memory> {
+    return this.client.requestJson<Memory>(
+      `/api/memories/${encodeURIComponent(memoryId)}`,
+      { method: 'PATCH', body: patch },
+    );
+  }
+
+  async delete(memoryId: string): Promise<MemoryDeleteResult> {
+    return this.client.requestJson<MemoryDeleteResult>(
+      `/api/memories/${encodeURIComponent(memoryId)}`,
+      { method: 'DELETE' },
+    );
+  }
+
+  async facts(options: MemoryFactOptions = {}): Promise<MemoryFact[]> {
+    const search = new URLSearchParams();
+
+    if (options.agentId !== undefined) {
+      search.set('agentId', options.agentId);
+    }
+    if (options.subject !== undefined) {
+      search.set('subject', options.subject);
+    }
+    if (options.includeInactive === true) {
+      search.set('includeInactive', 'true');
+    }
+    if (options.limit !== undefined) {
+      search.set('limit', String(options.limit));
+    }
+
+    const path = search.size
+      ? `/api/memories/facts?${search.toString()}`
+      : '/api/memories/facts';
+    const response = await this.client.requestJson<{ facts: MemoryFact[] }>(
+      path,
+    );
+
+    return response.facts;
+  }
+
+  async replaceFact(
+    factId: string,
+    value: string,
+  ): Promise<MemoryFactReplaced> {
+    return this.client.requestJson<MemoryFactReplaced>(
+      `/api/memories/facts/${encodeURIComponent(factId)}`,
+      { method: 'PATCH', body: { value } },
+    );
+  }
+
+  async deleteFact(factId: string): Promise<{ id: string }> {
+    return this.client.requestJson<{ id: string }>(
+      `/api/memories/facts/${encodeURIComponent(factId)}`,
+      { method: 'DELETE' },
+    );
+  }
+
+  async deleteEntity(
+    kind: RelationshipEndpointKind,
+    entityId: string,
+  ): Promise<MemoryEntityDeleteResult> {
+    const search = new URLSearchParams({ kind });
+    return this.client.requestJson<MemoryEntityDeleteResult>(
+      `/api/memories/entities/${encodeURIComponent(
+        entityId,
+      )}?${search.toString()}`,
+      { method: 'DELETE' },
+    );
   }
 
   async evaluate(input: EvaluatedMemoryInput): Promise<MemoryEvaluation> {
@@ -292,25 +429,25 @@ export class MemoriesClient {
       {
         method: 'POST',
         body: input,
-      }
+      },
     );
   }
 
   async addEvaluated(
-    input: EvaluatedMemoryInput
+    input: EvaluatedMemoryInput,
   ): Promise<MemoryEvaluationOutcome> {
     return this.client.requestJson<MemoryEvaluationOutcome>(
       '/api/memories/evaluated',
       {
         method: 'POST',
         body: input,
-      }
+      },
     );
   }
 
   async recall(
     query: string,
-    options: MemoryRecallOptions = {}
+    options: MemoryRecallOptions = {},
   ): Promise<MemoryRecallResult[]> {
     const search = new URLSearchParams();
     search.set('q', query);
@@ -370,19 +507,19 @@ export class MemoriesClient {
 
   async trace(memoryId: string): Promise<MemoryEvidenceTrace> {
     return this.client.requestJson<MemoryEvidenceTrace>(
-      `/api/memories/${encodeURIComponent(memoryId)}/trace`
+      `/api/memories/${encodeURIComponent(memoryId)}/trace`,
     );
   }
 
   async applyRetention(
-    input: MemoryRetentionInput
+    input: MemoryRetentionInput,
   ): Promise<MemoryRetentionReport> {
     return this.client.requestJson<MemoryRetentionReport>(
       '/api/memories/retention',
       {
         method: 'POST',
         body: input,
-      }
+      },
     );
   }
 
@@ -391,19 +528,19 @@ export class MemoriesClient {
   }
 
   async createRelationship(
-    input: CreateAgentRelationshipInput
+    input: CreateAgentRelationshipInput,
   ): Promise<AgentRelationship> {
     return this.client.requestJson<AgentRelationship>(
       '/api/memories/relationships',
       {
         method: 'POST',
         body: input,
-      }
+      },
     );
   }
 
   async relationships(
-    options: AgentRelationshipOptions = {}
+    options: AgentRelationshipOptions = {},
   ): Promise<AgentRelationship[]> {
     const search = new URLSearchParams();
 
