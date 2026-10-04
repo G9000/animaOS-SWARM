@@ -2,6 +2,21 @@
 
 This document is for the next agent picking up the companion console upgrade. Read it first; it tells you where everything is and what to do next.
 
+## Update 2026-10-04 (later): M7 done, PR open (stacked on M6)
+
+- **M7 (Memory) is complete** on `feat/companion-console-m7`. The branch is based on the M6 branch, so its PR targets `feat/companion-console-m6`; merge M6 (#12) first.
+- **Gates at `e33f919`, all green:**
+  - `rust-daemon:test`: 1,925 passed, 7 ignored.
+  - SDK and web test, typecheck and build (web 932 tests).
+  - Formatting.
+- **Lean plan, about 900 lines,** with a cheap process: Sonnet implementers (Opus for Task 2), one daemon batch review, one web final review, one fix wave.
+- **Formatting gotcha:** with `autocrlf`, git can check files out with CRLF line endings, which `nx format:check` flags. `nx format:write` on those files fixes it, and if only line endings differ, nothing gets committed.
+- **Post-M7 follow-ups:**
+  - Owner auth for the older memory routes.
+  - Hidden-text refusal for evaluator extractions.
+  - A `memory.updated` stream event.
+- **Next:** M8 (usage, logs, health), with a lean Sonnet plan.
+
 ## Update 2026-10-04: M6 done, PR open
 
 - M5 is merged (PR #11).
