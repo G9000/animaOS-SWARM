@@ -18,6 +18,7 @@ use super::ApiError;
 use crate::app::SharedDaemonState;
 use crate::memory_embeddings::SharedMemoryEmbeddings;
 use crate::memory_store::{MemoryMutation, MemoryStoreConfig};
+use crate::memory_text::{has_hidden_text, MEMORY_TEXT_HIDDEN};
 
 pub(crate) async fn handle_create_memory(
     body: Vec<u8>,
@@ -27,6 +28,15 @@ pub(crate) async fn handle_create_memory(
     let new_memory = request
         .into_domain()
         .map_err(ApiError::bad_request_static)?;
+    if has_hidden_text(&new_memory.content)
+        || new_memory
+            .tags
+            .iter()
+            .flatten()
+            .any(|tag| has_hidden_text(tag))
+    {
+        return Err(ApiError::bad_request_static(MEMORY_TEXT_HIDDEN));
+    }
 
     let (memory_handle, embeddings_handle, memory_store) = {
         let guard = state.read().await;
