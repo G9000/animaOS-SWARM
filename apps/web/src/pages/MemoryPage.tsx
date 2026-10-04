@@ -85,13 +85,17 @@ export function MemoryPage({ agentId, online, epoch }: MemoryPageProps) {
     view.search(searchText.trim());
   };
 
+  // A refused removal belongs to its entity: it shows beside it on the People
+  // tab and nowhere else, so it does not follow the owner to the other tabs.
+  const entityRefused =
+    removingEntity !== null &&
+    view.error !== null &&
+    view.entities.some((entity) => entityKey(entity) === removingEntity);
   const entityError =
-    tab === 'people' &&
-    view.error &&
-    removingEntity &&
-    view.entities.some((entity) => entityKey(entity) === removingEntity)
+    tab === 'people' && entityRefused && removingEntity && view.error
       ? { key: removingEntity, message: view.error }
       : null;
+  const headerError = entityRefused ? null : view.error;
 
   if (!online) {
     return (
@@ -110,7 +114,7 @@ export function MemoryPage({ agentId, online, epoch }: MemoryPageProps) {
     <div className="memory-page">
       <div className="memory-header">
         <h2>What your companion remembers</h2>
-        {!view.error && (
+        {!headerError && (
           <button
             type="button"
             className="studio-tool-button"
@@ -120,10 +124,10 @@ export function MemoryPage({ agentId, online, epoch }: MemoryPageProps) {
           </button>
         )}
       </div>
-      {view.error && !entityError && (
+      {headerError && (
         <div className="memory-header">
           <p className="memory-error" role="alert">
-            {view.error}
+            {headerError}
           </p>
           <button
             type="button"
@@ -165,7 +169,11 @@ export function MemoryPage({ agentId, online, epoch }: MemoryPageProps) {
             <h3 ref={headingRef} tabIndex={-1}>
               Memories
             </h3>
-            <form className="memory-search" role="search" onSubmit={submitSearch}>
+            <form
+              className="memory-search"
+              role="search"
+              onSubmit={submitSearch}
+            >
               <input
                 type="search"
                 aria-label="Search memories"

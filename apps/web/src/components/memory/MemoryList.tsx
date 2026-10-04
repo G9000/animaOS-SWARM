@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import type {
   Memory,
   MemoryEvidenceTrace,
@@ -15,11 +15,14 @@ import {
   formatTags,
   importanceLabel,
   parseTagInput,
-  stripInvisible,
   type MemoryEntry,
 } from '../../lib/memory';
-import { invisibleNote, revealInvisible } from '../../lib/skills';
-import { ConfirmRow, charCount, formatCount } from './memory-ui';
+import {
+  ConfirmRow,
+  InvisibleCharacters,
+  charCount,
+  formatCount,
+} from './memory-ui';
 import { RevealedText } from './RevealedText';
 
 const TRAIL_FAILED = 'Couldn’t load the trail.';
@@ -78,14 +81,19 @@ function MemoryRow({
   const [mode, setMode] = useState<Mode>('view');
   const [trail, setTrail] = useState<Trail | null>(null);
   const [busy, setBusy] = useState(false);
+  // Closing the trail while it loads must not let the late answer reopen it.
+  const trailRequest = useRef(0);
 
   const toggleTrail = async () => {
     if (trail) {
+      trailRequest.current += 1;
       setTrail(null);
       return;
     }
+    const request = ++trailRequest.current;
     setTrail({ state: 'loading' });
     const trace = await onTrace(memory);
+    if (request !== trailRequest.current) return;
     setTrail(trace ? { state: 'ready', trace } : { state: 'failed' });
   };
 
@@ -263,18 +271,20 @@ function MemoryEditor({
 
   const trimmed = content.trim();
   const length = charCount(trimmed);
-  const tooLong = length > MAX_MEMORY_EDIT_CHARS;
+  // The limit applies to text being changed: a memory already over it can
+  // still have its importance or tags edited.
+  const contentChanged = trimmed !== memory.content;
+  const tooLong = contentChanged && length > MAX_MEMORY_EDIT_CHARS;
   const tags = parseTagInput(tagText);
 
   const patch: MemoryPatch = {};
-  if (trimmed !== memory.content) patch.content = trimmed;
+  if (contentChanged) patch.content = trimmed;
   if (Math.abs(importance - memory.importance) > 1e-9)
     patch.importance = importance;
   if (!sameTags(tags, memory.tags ?? []))
     patch.tags = tags.length === 0 ? null : tags;
   const canSave =
     Object.keys(patch).length > 0 && !tooLong && trimmed !== '' && !saving;
-  const hidden = revealInvisible(content).count;
 
   return (
     <form
@@ -301,18 +311,7 @@ function MemoryEditor({
           {formatCount(length, MAX_MEMORY_EDIT_CHARS)}
         </p>
       )}
-      {hidden > 0 && (
-        <div className="memory-edit-row">
-          <small className="memory-hidden-note">{invisibleNote(hidden)}</small>
-          <button
-            type="button"
-            className="studio-tool-button"
-            onClick={() => setContent(stripInvisible(content))}
-          >
-            Remove invisible characters
-          </button>
-        </div>
-      )}
+      <InvisibleCharacters text={content} onStrip={setContent} />
       <div className="memory-field">
         <span>Importance</span>
         <span className="memory-edit-row">
@@ -337,7 +336,11 @@ function MemoryEditor({
         />
       </label>
       <div className="memory-actions">
-        <button type="submit" className="studio-tool-button" disabled={!canSave}>
+        <button
+          type="submit"
+          className="studio-tool-button"
+          disabled={!canSave}
+        >
           Save
         </button>
         <button type="button" className="studio-tool-button" onClick={onCancel}>

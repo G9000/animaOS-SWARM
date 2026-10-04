@@ -75,8 +75,8 @@ describe('useMemory', () => {
     expect(result.current.relationships.map((r) => r.id)).toEqual(['r1']);
     expect(result.current.error).toBeNull();
     expect(daemon.recentMemories).toHaveBeenCalledWith('agent-main', 200);
+    // Facts belong to the owner: they are not read for one agent.
     expect(daemon.listFacts).toHaveBeenCalledWith({
-      agentId: 'agent-main',
       includeInactive: false,
       limit: 500,
     });
@@ -114,7 +114,6 @@ describe('useMemory', () => {
 
     await waitFor(() =>
       expect(daemon.listFacts).toHaveBeenLastCalledWith({
-        agentId: 'agent-main',
         includeInactive: true,
         limit: 500,
       }),
@@ -315,7 +314,30 @@ describe('useMemory', () => {
     });
     expect(trace).toBeNull();
     expect(result.current.error).toBe(MEMORY_GONE);
-    expect(daemon.recentMemories).toHaveBeenCalledTimes(1);
+    // A memory that is gone is dropped from the lists.
+    expect(daemon.recentMemories).toHaveBeenCalledTimes(2);
+  });
+
+  it('a refused action’s message goes when the owner reads again', async () => {
+    const refusal = new DaemonHttpError(409, { error: 'Still has memories' });
+    const { result } = await loaded();
+
+    for (const read of [
+      () => result.current.refresh(),
+      () => result.current.search('tea'),
+      () => result.current.setIncludeReplaced(true),
+    ]) {
+      vi.mocked(daemon.deleteMemoryEntity).mockRejectedValue(refusal);
+      await act(async () => {
+        await result.current.removeEntity(entityFixture('e1'));
+      });
+      expect(result.current.error).toBe('Still has memories');
+      expect(result.current.errorStatus).toBe(409);
+
+      act(read);
+      await waitFor(() => expect(result.current.error).toBeNull());
+      expect(result.current.errorStatus).toBeNull();
+    }
   });
 
   it('nothing is read while offline or without an agent', async () => {

@@ -224,6 +224,9 @@ const EMPTY_RUNS: readonly LiveRun[] = [];
 // One element, so a render of the view keeps the message list's props.
 const NO_MESSAGES = <p className="session-footer-note">No messages yet.</p>;
 
+/** The name saved with a memory when the agent's own name is not at hand. */
+const GENERIC_SAVE_AGENT_NAME = 'Helper agent';
+
 /** One session (or a new chat): its transcript and composer (spec §15.2). */
 export function SessionView({
   agent,
@@ -251,13 +254,19 @@ export function SessionView({
   onEditAutomation,
   notice = null,
 }: SessionViewProps) {
-  // The viewed session's agent, so a helper's session saves to that helper.
+  // The session record names its agent, so a helper's session saves to that
+  // helper even when the agents list does not hold it (then `agent` is the
+  // companion); the name is the agent's only when the ids match.
+  const saveAgentId = session?.agentId ?? null;
+  const saveAgentName =
+    saveAgentId === agent.id ? agent.name : GENERIC_SAVE_AGENT_NAME;
+  const sessionId = session?.id ?? null;
   const saveTarget = useMemo(
     () =>
-      session
-        ? { agentId: agent.id, agentName: agent.name, sessionId: session.id }
+      saveAgentId && sessionId
+        ? { agentId: saveAgentId, agentName: saveAgentName, sessionId }
         : null,
-    [agent.id, agent.name, session],
+    [saveAgentId, saveAgentName, sessionId],
   );
   const { save, savedState } = useSaveToMemory(saveTarget);
   const transcriptActions = useMemo<TranscriptActions>(

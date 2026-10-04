@@ -1,5 +1,8 @@
 import { useEffect, useRef } from 'react';
 
+import { stripInvisible } from '../../lib/memory';
+import { invisibleNote, revealInvisible } from '../../lib/skills';
+
 /** Characters as the daemon counts them (code points, not UTF-16 units). */
 export function charCount(text: string): number {
   let count = 0;
@@ -49,6 +52,35 @@ export function ConfirmRow({
       >
         Keep
       </button>
+    </div>
+  );
+}
+
+/** Under an editor: how many invisible characters the text holds and, when
+ *  some are ones the daemon refuses, a button that removes them. */
+export function InvisibleCharacters({
+  text,
+  onStrip,
+}: {
+  text: string;
+  onStrip: (stripped: string) => void;
+}) {
+  const stripped = stripInvisible(text);
+  const refused = charCount(text) - charCount(stripped);
+  const note = invisibleNote(Math.max(revealInvisible(text).count, refused));
+  if (!note) return null;
+  return (
+    <div className="memory-edit-row">
+      <small className="memory-hidden-note">{note}</small>
+      {refused > 0 && (
+        <button
+          type="button"
+          className="studio-tool-button"
+          onClick={() => onStrip(stripped)}
+        >
+          Remove invisible characters
+        </button>
+      )}
     </div>
   );
 }

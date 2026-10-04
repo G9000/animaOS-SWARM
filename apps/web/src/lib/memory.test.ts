@@ -110,12 +110,29 @@ describe('memory helpers', () => {
     expect(grouped.about.map((f) => f.id)).toEqual(['b']);
   });
 
-  it('strips the characters that are revealed', () => {
+  it('strips only the characters the daemon refuses', () => {
+    const refused = [
+      0xe0041, // tag
+      0xe0000,
+      0xe007f,
+      0x202a, // bidi embeddings and overrides
+      0x202e,
+      0x2066, // isolates
+      0x2069,
+      0xe0100, // supplementary variation selectors
+      0xe01ef,
+    ].map((code) => String.fromCodePoint(code));
+    expect(stripInvisible(`a${refused.join('b')}c`)).toBe('abbbbbbbbc');
+    expect(stripInvisible('plain')).toBe('plain');
+  });
+
+  it('keeps zero-width joiners, spaces, and separators so emoji sequences survive', () => {
+    const zwj = String.fromCodePoint(0x200d);
     const zwsp = String.fromCodePoint(0x200b);
     const separator = String.fromCodePoint(0x2028);
-    const paragraph = String.fromCodePoint(0x2029);
-    expect(stripInvisible(`a${zwsp}b${separator}c${paragraph}d`)).toBe('abcd');
-    expect(stripInvisible('plain')).toBe('plain');
+    const family = `${String.fromCodePoint(0x1f469)}${zwj}${String.fromCodePoint(0x1f467)}`;
+    const text = `a${zwsp}${family}${separator}b`;
+    expect(stripInvisible(text)).toBe(text);
   });
 
   it('maps a daemon refusal to its message and a network failure to the unreachable text', () => {

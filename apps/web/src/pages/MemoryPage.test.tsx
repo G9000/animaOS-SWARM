@@ -1,4 +1,5 @@
 import {
+  act,
   fireEvent,
   render,
   screen,
@@ -33,6 +34,9 @@ import { MemoryPage } from './MemoryPage';
 
 const ZWSP = String.fromCodePoint(0x200b);
 const HIDDEN_MARKER = '⟨U+200B⟩';
+// A tag character is one the daemon refuses; a zero-width space is not.
+const TAG_A = String.fromCodePoint(0xe0041);
+const TAG_MARKER = '⟨U+E0041⟩';
 const HIDDEN_REFUSAL =
   'Memory text must not contain invisible tag or direction-override characters';
 
@@ -173,12 +177,17 @@ describe('MemoryPage: memories', () => {
     const box = screen.getByRole('searchbox', { name: 'Search memories' });
     await user.type(box, ' tea {Enter}');
     expect(await screen.findByText('Likes tea')).toBeVisible();
-    expect(daemon.searchMemories).toHaveBeenCalledWith('tea', 'agent-main', 200);
+    expect(daemon.searchMemories).toHaveBeenCalledWith(
+      'tea',
+      'agent-main',
+      200,
+    );
     // Most relevant is offered while a search is active.
     expect(
-      within(
-        screen.getByRole('combobox', { name: 'Sort memories' }),
-      ).getByRole('option', { name: 'Most relevant' }),
+      within(screen.getByRole('combobox', { name: 'Sort memories' })).getByRole(
+        'option',
+        { name: 'Most relevant' },
+      ),
     ).toBeInTheDocument();
 
     await user.clear(box);
@@ -256,9 +265,12 @@ describe('MemoryPage: memories', () => {
 
       await user.click(screen.getByRole('button', { name: 'Edit' }));
       const third = screen.getByRole('form', { name: 'Edit memory' });
-      fireEvent.change(within(third).getByRole('slider', { name: 'Importance' }), {
-        target: { value: '0.8' },
-      });
+      fireEvent.change(
+        within(third).getByRole('slider', { name: 'Importance' }),
+        {
+          target: { value: '0.8' },
+        },
+      );
       expect(within(third).getByText('0.80')).toBeVisible();
       await user.click(within(third).getByRole('button', { name: 'Save' }));
       await waitFor(() =>
@@ -312,9 +324,7 @@ describe('MemoryPage: memories', () => {
         HIDDEN_REFUSAL,
       );
       expect(screen.getByRole('form', { name: 'Edit memory' })).toBeVisible();
-      expect(
-        within(form).getByRole('button', { name: 'Save' }),
-      ).toBeEnabled();
+      expect(within(form).getByRole('button', { name: 'Save' })).toBeEnabled();
     });
 
     it('deleting asks first, Keep cancels, and confirming deletes', async () => {
@@ -340,9 +350,7 @@ describe('MemoryPage: memories', () => {
       );
       expect(await screen.findByText(MEMORY_EMPTY)).toBeVisible();
       await waitFor(() =>
-        expect(
-          screen.getByRole('heading', { name: 'Memories' }),
-        ).toHaveFocus(),
+        expect(screen.getByRole('heading', { name: 'Memories' })).toHaveFocus(),
       );
     });
 
@@ -406,10 +414,10 @@ describe('MemoryPage: memories', () => {
   it('the editor can remove invisible characters', async () => {
     const user = userEvent.setup();
     vi.mocked(daemon.recentMemories).mockResolvedValue([
-      memoryFixture('m1', { content: `Likes${ZWSP}tea` }),
+      memoryFixture('m1', { content: `Likes${TAG_A}tea` }),
     ]);
     renderPage();
-    await screen.findByText(`Likes${HIDDEN_MARKER}tea`);
+    await screen.findByText(`Likes${TAG_MARKER}tea`);
     await user.click(screen.getByRole('button', { name: 'Edit' }));
     const form = screen.getByRole('form', { name: 'Edit memory' });
     expect(
@@ -428,6 +436,66 @@ describe('MemoryPage: memories', () => {
         content: 'Likestea',
       }),
     );
+  });
+
+  it('the editor keeps zero-width spaces, which the daemon accepts', async () => {
+    const user = userEvent.setup();
+    vi.mocked(daemon.recentMemories).mockResolvedValue([
+      memoryFixture('m1', { content: `Likes${ZWSP}tea` }),
+    ]);
+    renderPage();
+    await screen.findByText(`Likes${HIDDEN_MARKER}tea`);
+    await user.click(screen.getByRole('button', { name: 'Edit' }));
+    const form = screen.getByRole('form', { name: 'Edit memory' });
+    expect(
+      within(form).getByText('This text contains 1 invisible character'),
+    ).toBeVisible();
+    expect(
+      within(form).queryByRole('button', {
+        name: 'Remove invisible characters',
+      }),
+    ).not.toBeInTheDocument();
+  });
+
+  it('a memory already over 8,000 characters can still have its tags edited', async () => {
+    const user = userEvent.setup();
+    vi.mocked(daemon.recentMemories).mockResolvedValue([
+      memoryFixture('m1', { content: 'a'.repeat(8_001), tags: ['old'] }),
+    ]);
+    renderPage();
+    await screen.findByText('a'.repeat(8_001));
+    await user.click(screen.getByRole('button', { name: 'Edit' }));
+    const form = screen.getByRole('form', { name: 'Edit memory' });
+    expect(within(form).queryByRole('alert')).not.toBeInTheDocument();
+
+    const tags = within(form).getByRole('textbox', { name: 'Tags' });
+    await user.clear(tags);
+    await user.type(tags, 'new');
+    await user.click(within(form).getByRole('button', { name: 'Save' }));
+    await waitFor(() =>
+      expect(daemon.updateMemory).toHaveBeenCalledWith('m1', {
+        tags: ['new'],
+      }),
+    );
+  });
+
+  it('a changed memory over 8,000 characters is still refused', async () => {
+    const user = userEvent.setup();
+    vi.mocked(daemon.recentMemories).mockResolvedValue([
+      memoryFixture('m1', { content: 'a'.repeat(8_001) }),
+    ]);
+    renderPage();
+    await screen.findByText('a'.repeat(8_001));
+    await user.click(screen.getByRole('button', { name: 'Edit' }));
+    const form = screen.getByRole('form', { name: 'Edit memory' });
+    fireEvent.change(
+      within(form).getByRole('textbox', { name: 'Memory text' }),
+      {
+        target: { value: 'b'.repeat(8_001) },
+      },
+    );
+    expect(within(form).getByRole('alert')).toHaveTextContent('8,001 / 8,000');
+    expect(within(form).getByRole('button', { name: 'Save' })).toBeDisabled();
   });
 
   it('renders model text as text, never markup', async () => {
@@ -497,6 +565,35 @@ describe('MemoryPage: memories', () => {
       ).not.toBeInTheDocument();
     });
 
+    it('closing the trail while it loads keeps it closed', async () => {
+      const user = userEvent.setup();
+      let release: (
+        value: Awaited<ReturnType<typeof daemon.traceMemory>>,
+      ) => void = () => undefined;
+      vi.mocked(daemon.traceMemory).mockImplementation(
+        () => new Promise((resolve) => (release = resolve)),
+      );
+      renderPage();
+      await screen.findByText('Likes tea');
+      const toggle = screen.getByRole('button', { name: 'Where it was used' });
+      await user.click(toggle);
+      expect(await screen.findByText('Loading…')).toBeVisible();
+
+      await user.click(toggle);
+      expect(toggle).toHaveAttribute('aria-expanded', 'false');
+      await act(async () => {
+        release({
+          memory: memoryFixture('m1'),
+          relationships: [],
+          entities: [],
+        });
+      });
+      expect(toggle).toHaveAttribute('aria-expanded', 'false');
+      expect(
+        screen.queryByText('Nothing else cites this memory.'),
+      ).not.toBeInTheDocument();
+    });
+
     it('an uncited memory says so', async () => {
       const user = userEvent.setup();
       renderPage();
@@ -551,8 +648,12 @@ describe('MemoryPage: About you', () => {
     const preferences = await screen.findByRole('region', {
       name: 'Preferences',
     });
-    expect(within(preferences).getByText('Prefers short answers')).toBeVisible();
-    expect(within(preferences).getByText('communication preference')).toBeVisible();
+    expect(
+      within(preferences).getByText('Prefers short answers'),
+    ).toBeVisible();
+    expect(
+      within(preferences).getByText('communication preference'),
+    ).toBeVisible();
     const told = screen.getByRole('region', { name: 'Things you’ve told me' });
     expect(within(told).getByText('Lisbon')).toBeVisible();
 
@@ -586,6 +687,29 @@ describe('MemoryPage: About you', () => {
     });
     expect(within(form).getByRole('button', { name: 'Save' })).toBeDisabled();
     expect(screen.getByRole('alert')).toHaveTextContent('501 / 500');
+  });
+
+  it('the fact editor can remove invisible characters', async () => {
+    vi.mocked(daemon.listFacts).mockResolvedValue([
+      factFixture('f1', { value: `Short${TAG_A}answers` }),
+    ]);
+    const user = await openAbout();
+    await user.click(await screen.findByRole('button', { name: 'Edit' }));
+    const form = screen.getByRole('form', { name: 'Edit fact' });
+    expect(
+      within(form).getByText('This text contains 1 invisible character'),
+    ).toBeVisible();
+
+    await user.click(
+      within(form).getByRole('button', { name: 'Remove invisible characters' }),
+    );
+    expect(
+      within(form).queryByText('This text contains 1 invisible character'),
+    ).not.toBeInTheDocument();
+    await user.click(within(form).getByRole('button', { name: 'Save' }));
+    await waitFor(() =>
+      expect(daemon.replaceFact).toHaveBeenCalledWith('f1', 'Shortanswers'),
+    );
   });
 
   it('forgetting a fact asks first', async () => {
@@ -693,7 +817,9 @@ describe('MemoryPage: People & things', () => {
     expect(within(connections).getByText('Met in 2020')).toBeVisible();
     // Deleting the user entity is soft, and the page says so.
     expect(
-      screen.getByText('Your companion adds this again when it learns about you.'),
+      screen.getByText(
+        'Your companion adds this again when it learns about you.',
+      ),
     ).toBeVisible();
 
     await user.click(within(ada).getByRole('button', { name: 'Remove' }));
@@ -752,10 +878,63 @@ describe('MemoryPage: page', () => {
       new DaemonHttpError(503, { error: 'Memory is busy' }),
     );
     renderPage();
-    expect(await screen.findByRole('alert')).toHaveTextContent('Memory is busy');
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Memory is busy',
+    );
     await user.click(screen.getByRole('button', { name: 'Refresh' }));
     await waitFor(() => expect(screen.queryByRole('alert')).toBeNull());
     expect(daemon.recentMemories).toHaveBeenCalledTimes(2);
+  });
+
+  it('a failed delete shows an alert that Refresh clears', async () => {
+    const user = userEvent.setup();
+    vi.mocked(daemon.recentMemories).mockResolvedValue([
+      memoryFixture('m1', { content: 'Likes tea' }),
+    ]);
+    vi.mocked(daemon.deleteMemory).mockRejectedValue(
+      new DaemonHttpError(503, { error: 'Memory is busy' }),
+    );
+    renderPage();
+    await screen.findByText('Likes tea');
+    await user.click(screen.getByRole('button', { name: 'Delete' }));
+    await user.click(
+      within(screen.getByRole('group', { name: 'Confirm' })).getByRole(
+        'button',
+        { name: 'Delete memory' },
+      ),
+    );
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Memory is busy',
+    );
+
+    await user.click(screen.getByRole('button', { name: 'Refresh' }));
+    await waitFor(() => expect(screen.queryByRole('alert')).toBeNull());
+  });
+
+  it('a refused entity removal does not follow the owner to another tab', async () => {
+    const user = userEvent.setup();
+    vi.mocked(daemon.listMemoryEntities).mockResolvedValue([
+      entityFixture('e1', { kind: 'agent', name: 'Helper' }),
+    ]);
+    vi.mocked(daemon.deleteMemoryEntity).mockRejectedValue(
+      new DaemonHttpError(409, { error: 'Still has memories' }),
+    );
+    renderPage();
+    await screen.findByText(MEMORY_EMPTY);
+    await user.click(screen.getByRole('tab', { name: 'People & things' }));
+    await user.click(await screen.findByRole('button', { name: 'Remove' }));
+    await user.click(
+      within(screen.getByRole('group', { name: 'Confirm' })).getByRole(
+        'button',
+        { name: 'Remove' },
+      ),
+    );
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Still has memories',
+    );
+
+    await user.click(screen.getByRole('tab', { name: 'Memories' }));
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
   it('the selected tab survives a remount through session storage', async () => {

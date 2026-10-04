@@ -98,8 +98,10 @@ export function useMemory({
       text
         ? daemon.searchMemories(text, id, MEMORY_PAGE_LIMIT)
         : daemon.recentMemories(id, MEMORY_PAGE_LIMIT),
+      // Facts belong to the owner, not to one agent: a fact whose evidence
+      // memories were deleted, or that only a helper's memories evidence,
+      // is still in use.
       daemon.listFacts({
-        agentId: id,
         includeInactive: includeReplacedRef.current,
         limit: MAX_FACTS_SHOWN,
       }),
@@ -147,17 +149,35 @@ export function useMemory({
     };
   }, []);
 
-  const search = useCallback((next: string) => {
-    queryRef.current = next;
-    setQueryState(next);
+  // A new read starts with a clean header: a refused action's message goes
+  // when the owner reads again, on any tab.
+  const clearActionError = useCallback(() => {
+    setActionError(null);
+    setActionStatus(null);
   }, []);
 
-  const setIncludeReplaced = useCallback((value: boolean) => {
-    includeReplacedRef.current = value;
-    setIncludeReplacedState(value);
-  }, []);
+  const search = useCallback(
+    (next: string) => {
+      clearActionError();
+      queryRef.current = next;
+      setQueryState(next);
+    },
+    [clearActionError],
+  );
 
-  const refresh = useCallback(() => void load(), [load]);
+  const setIncludeReplaced = useCallback(
+    (value: boolean) => {
+      clearActionError();
+      includeReplacedRef.current = value;
+      setIncludeReplacedState(value);
+    },
+    [clearActionError],
+  );
+
+  const refresh = useCallback(() => {
+    clearActionError();
+    void load();
+  }, [clearActionError, load]);
 
   // The page does not depend on any stream event, so an action reads again
   // before it answers.
@@ -221,10 +241,12 @@ export function useMemory({
           setActionError(status === 404 ? MEMORY_GONE : message);
           setActionStatus(status);
         }
+        // The memory is gone: read the lists again so the page drops it.
+        if (status === 404) await load();
         return null;
       }
     },
-    [],
+    [load],
   );
 
   return {

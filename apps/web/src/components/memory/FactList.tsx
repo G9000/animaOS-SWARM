@@ -9,7 +9,12 @@ import {
   REPLACED_LABEL,
   describeFact,
 } from '../../lib/memory';
-import { ConfirmRow, charCount, formatCount } from './memory-ui';
+import {
+  ConfirmRow,
+  InvisibleCharacters,
+  charCount,
+  formatCount,
+} from './memory-ui';
 import { RevealedText } from './RevealedText';
 
 export interface FactListProps {
@@ -20,7 +25,12 @@ export interface FactListProps {
   onDone: () => void;
 }
 
-export function FactList({ facts, onReplace, onForget, onDone }: FactListProps) {
+export function FactList({
+  facts,
+  onReplace,
+  onForget,
+  onDone,
+}: FactListProps) {
   return (
     <ul className="memory-list">
       {facts.map((fact) => (
@@ -50,8 +60,7 @@ function FactRow({
   const trimmed = value.trim();
   const length = charCount(trimmed);
   const tooLong = length > MAX_FACT_VALUE_CHARS;
-  const canSave =
-    trimmed !== '' && trimmed !== fact.value && !tooLong && !busy;
+  const canSave = trimmed !== '' && trimmed !== fact.value && !tooLong && !busy;
 
   return (
     <li className="memory-item">
@@ -60,9 +69,7 @@ function FactRow({
           <span className="memory-label">
             <RevealedText text={described.label} />
           </span>
-          {!active && (
-            <span className="memory-replaced">{REPLACED_LABEL}</span>
-          )}
+          {!active && <span className="memory-replaced">{REPLACED_LABEL}</span>}
           <time dateTime={new Date(fact.observedAt).toISOString()}>
             {formatWhen(fact.observedAt)}
           </time>
@@ -95,6 +102,7 @@ function FactRow({
                 {formatCount(length, MAX_FACT_VALUE_CHARS)}
               </p>
             )}
+            <InvisibleCharacters text={value} onStrip={setValue} />
             <div className="memory-actions">
               <button
                 type="submit"

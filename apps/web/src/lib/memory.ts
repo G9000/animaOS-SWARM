@@ -120,10 +120,16 @@ export function groupFacts(facts: readonly MemoryFact[]): {
   return { preferences, about };
 }
 
-/** Removes what `revealInvisible` marks (format characters and the line and
- *  paragraph separators), so the owner can send text without them. */
+/** Removes what the daemon refuses in memory text (it mirrors the daemon's
+ *  `is_smuggling_character`): Unicode tag characters, bidirectional
+ *  embeddings, overrides and isolates, and supplementary variation
+ *  selectors. Zero-width joiners and spaces stay, so emoji sequences and
+ *  joined scripts survive. */
 export function stripInvisible(text: string): string {
-  return text.replace(/[\p{Cf}\u2028\u2029]/gu, '');
+  return text.replace(
+    /[\u{E0000}-\u{E007F}\u{202A}-\u{202E}\u{2066}-\u{2069}\u{E0100}-\u{E01EF}]/gu,
+    '',
+  );
 }
 
 /** The daemon's own refusals are owner-readable; anything else is a network

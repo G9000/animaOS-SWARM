@@ -108,6 +108,37 @@ describe('SessionView', () => {
     );
   });
 
+  it('saves a helper’s message with the session’s own agent when the agent shown is the companion', async () => {
+    const user = userEvent.setup();
+    const saveMemory = vi
+      .spyOn(daemon, 'saveMemory')
+      .mockResolvedValue(memoryFixture('mem-2'));
+    // The helper is not in the agents list, so the page passes the companion.
+    renderView({
+      session: sessionFixture('room-10', {
+        agentId: 'helper-9',
+        kind: 'helper',
+      }),
+      messages: [
+        {
+          id: 'm1',
+          role: 'Assistant',
+          content: { text: 'Found it' },
+          created_at_ms: 1,
+        },
+      ],
+    });
+
+    await user.click(screen.getByRole('button', { name: 'Save to memory' }));
+    expect(
+      await screen.findByRole('button', { name: '✓ Saved to memory' }),
+    ).toBeDisabled();
+    const saved = saveMemory.mock.calls[0][0];
+    expect(saved.agentId).toBe('helper-9');
+    expect(saved.agentName).not.toBe('Nova');
+    expect(saved.agentName).toBeTruthy();
+  });
+
   it('opens a new chat on the welcome screen with the companion composer', () => {
     renderView();
     expect(
