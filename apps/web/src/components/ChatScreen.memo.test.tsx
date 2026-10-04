@@ -120,7 +120,9 @@ describe('MessageList memoization', () => {
     );
     expect(markdownRenderProbe).toHaveBeenCalledTimes(2);
 
-    await user.click(screen.getAllByRole('button', { name: 'Save to memory' })[0]);
+    await user.click(
+      screen.getAllByRole('button', { name: 'Save to memory' })[0],
+    );
     expect(
       await screen.findByRole('button', { name: '✓ Saved to memory' }),
     ).toBeDisabled();
