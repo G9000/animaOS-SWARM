@@ -4,6 +4,7 @@ mod approvals;
 mod connectors;
 mod gcalendar;
 mod memories;
+mod memory_edits;
 mod providers;
 mod runs;
 mod schedules;
@@ -36,6 +37,7 @@ pub(crate) use memories::{
     MemoryRetentionRequest, MemorySearchEnvelope, MemorySearchQuery, MemorySearchResultResponse,
     RecentMemoriesQuery,
 };
+pub(crate) use memory_edits::{MemoryDeleteResponse, MemoryPatchRequest};
 pub(crate) use providers::{ProviderResponse, ProvidersEnvelope};
 pub(crate) use runs::*;
 pub(crate) use schedules::*;

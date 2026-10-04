@@ -349,7 +349,10 @@ async fn index_memory_embedding(embeddings: &SharedMemoryEmbeddings, memory: &Me
     }
 }
 
-async fn remove_memory_embeddings(embeddings: &SharedMemoryEmbeddings, memory_ids: &[String]) {
+pub(super) async fn remove_memory_embeddings(
+    embeddings: &SharedMemoryEmbeddings,
+    memory_ids: &[String],
+) {
     if memory_ids.is_empty() {
         return;
     }
@@ -362,7 +365,7 @@ async fn remove_memory_embeddings(embeddings: &SharedMemoryEmbeddings, memory_id
     }
 }
 
-async fn persist_memory_store(
+pub(super) async fn persist_memory_store(
     memory_store: Option<&MemoryStoreConfig>,
     manager: &mut MemoryMutation<'_>,
     message: &'static str,

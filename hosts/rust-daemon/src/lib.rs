@@ -10,6 +10,7 @@ mod jobs;
 mod live;
 mod memory_embeddings;
 mod memory_store;
+mod memory_text;
 mod model;
 mod routes;
 mod runs;

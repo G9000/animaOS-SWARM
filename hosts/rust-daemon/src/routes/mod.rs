@@ -15,6 +15,7 @@ mod http;
 mod jobs;
 mod mail;
 mod memories;
+mod memory_edits;
 mod multipart;
 mod oauth_apps;
 mod profile;
@@ -185,6 +186,7 @@ use crate::runtime_model::provider_summaries;
         skills::delete_skill, skills::approve_skill,
         skills::list_skill_drafts, skills::approve_skill_draft, skills::reject_skill_draft,
         skills::import_skill,
+        memory_edits::patch_memory, memory_edits::delete_memory,
     ),
     components(schemas(self::contracts::AgentSummariesEnvelope)),
     tags(
@@ -618,6 +620,10 @@ fn router_with_services_with_policies(
             axum::routing::post(apply_memory_retention_entry),
         )
         .route("/api/memories/{memory_id}/trace", get(memory_trace_entry))
+        .route(
+            "/api/memories/{memory_id}",
+            axum::routing::patch(memory_edits::patch_memory).delete(memory_edits::delete_memory),
+        )
         .route(
             "/api/memories/relationships",
             get(list_agent_relationships_entry).post(create_agent_relationship_entry),
@@ -1985,6 +1991,7 @@ mod tests {
     mod events;
     mod goals;
     mod jobs;
+    mod memory_edits;
     mod runs;
     mod sessions;
     mod skills;
