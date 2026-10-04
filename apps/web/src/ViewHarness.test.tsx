@@ -38,6 +38,7 @@ import {
   BOOTSTRAP_SUMMARY_POLL_MS,
 } from './hooks/useDaemonBootstrap';
 import { automationFixture } from './test/automations';
+import { memoryFixture } from './test/memory';
 import { sessionFixture } from './test/sessions';
 import { skillFixture } from './test/skills';
 import {
@@ -479,6 +480,11 @@ beforeEach(() => {
   });
   vi.spyOn(daemon, 'listSkills').mockResolvedValue([]);
   vi.spyOn(daemon, 'listAutomations').mockResolvedValue([]);
+  vi.spyOn(daemon, 'recentMemories').mockResolvedValue([]);
+  vi.spyOn(daemon, 'searchMemories').mockResolvedValue([]);
+  vi.spyOn(daemon, 'listFacts').mockResolvedValue([]);
+  vi.spyOn(daemon, 'listMemoryEntities').mockResolvedValue([]);
+  vi.spyOn(daemon, 'listMemoryRelationships').mockResolvedValue([]);
   routes = mockSessionRoutes();
   mockRuns();
   // No stream events unless a test scripts them; the harness polls.
@@ -2158,8 +2164,8 @@ it('opens the new session on a page that still shows the conversation', async ()
     agents: [snapshot('agent-main', 'Nova', 1)],
   });
   mockProviders();
-  // Memory arrives in a later release; until then it shows the chat.
-  window.history.replaceState(null, '', '/#/memory');
+  // Usage arrives in a later release; until then it shows the chat.
+  window.history.replaceState(null, '', '/#/usage');
   render(<ViewHarness />);
 
   await user.type(await screen.findByPlaceholderText('Message Nova…'), 'Hello');
@@ -2187,6 +2193,22 @@ it('shows the companion’s automations at #/automations', async () => {
   expect(daemon.listAutomations).toHaveBeenCalledWith('agent-main', {
     signal: expect.any(AbortSignal),
   });
+});
+
+it('shows the companion’s memory at #/memory', async () => {
+  vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+  vi.spyOn(daemon, 'listAgents').mockResolvedValue({
+    agents: [snapshot('agent-main', 'Nova', 1)],
+  });
+  mockProviders();
+  vi.mocked(daemon.recentMemories).mockResolvedValue([
+    memoryFixture('mem-1', { content: 'Likes green tea' }),
+  ]);
+  window.history.replaceState(null, '', '/#/memory');
+  render(<ViewHarness />);
+
+  expect(await screen.findByText('Likes green tea')).toBeVisible();
+  expect(daemon.recentMemories).toHaveBeenCalledWith('agent-main', 200);
 });
 
 it('keeps a page open when the first send creates its session, then returns to that session', async () => {

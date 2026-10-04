@@ -8,6 +8,7 @@
 @import './approvals.css';
 @import './skills.css';
 @import './automations.css';
+@import './memory.css';
 
 @source '../../packages/ui/src/**/*.{ts,tsx}';
 

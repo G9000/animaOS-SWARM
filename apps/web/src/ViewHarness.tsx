@@ -32,6 +32,7 @@ import { useAutomations } from './hooks/useAutomations';
 import { useTranscriptActions } from './hooks/useTranscriptActions';
 import { ApprovalsPage } from './pages/ApprovalsPage';
 import { AutomationsPage } from './pages/AutomationsPage';
+import { MemoryPage } from './pages/MemoryPage';
 import { SkillsPage } from './pages/SkillsPage';
 import {
   SESSION_MESSAGES_LIVE_POLL_MS,
@@ -1308,6 +1309,13 @@ export function ViewHarness() {
               onOpenSession={(sessionId) =>
                 commands.openTarget({ agentId: agent.id, sessionId })
               }
+            />
+          }
+          memory={
+            <MemoryPage
+              agentId={agent.id}
+              online={connection === 'online'}
+              epoch={live.state.epoch}
             />
           }
           skills={

@@ -13,6 +13,7 @@ import { PROMPT_LIBRARY } from '../lib/prompt-library';
 import { sessionKey } from '../lib/session-groups';
 import {
   BoltIcon,
+  ChipIcon,
   ClockIcon,
   GearIcon,
   PulseIcon,
@@ -27,6 +28,7 @@ import { ghostBtnCls } from './ui-bits';
 export const AVAILABLE_PAGES = [
   'approvals',
   'automations',
+  'memory',
   'skills',
   'work',
   'files',
@@ -51,6 +53,7 @@ const PRIMARY_DESTINATIONS: Destination[] = [
     label: 'Automations',
     icon: <ClockIcon size={16} />,
   },
+  { page: 'memory', label: 'Memory', icon: <ChipIcon size={16} /> },
   { page: 'skills', label: 'Skills', icon: <BoltIcon size={16} /> },
   { page: 'work', label: 'Work', icon: <SparkIcon size={16} /> },
   { page: 'files', label: 'Files', icon: <PulseIcon size={16} /> },
@@ -292,6 +295,7 @@ export function WorkspaceShell({
   approvals = null,
   automations = null,
   skills = null,
+  memory = null,
   pendingApprovals = 0,
   sessions = [],
   onOpenSession,
@@ -319,6 +323,8 @@ export function WorkspaceShell({
   automations?: ReactNode | null;
   /** The Skills page, shown at `#/skills`. */
   skills?: ReactNode | null;
+  /** The Memory page, shown at `#/memory`. */
+  memory?: ReactNode | null;
   /** Approvals waiting for the owner, for the destination's badge. */
   pendingApprovals?: number;
   /** The listed sessions the command menu offers by title. */
@@ -612,6 +618,8 @@ export function WorkspaceShell({
                 approvals
               ) : page === 'automations' ? (
                 automations
+              ) : page === 'memory' ? (
+                memory
               ) : page === 'skills' ? (
                 skills
               ) : page === 'connectors' ? (
