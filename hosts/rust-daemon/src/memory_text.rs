@@ -8,7 +8,6 @@ pub(crate) const MAX_MEMORY_TAGS: usize = 20;
 /// The most characters one tag may have.
 pub(crate) const MAX_MEMORY_TAG_CHARS: usize = 40;
 /// The most characters a fact's value may have.
-#[allow(dead_code)] // Used by the facts routes (M7 Task 3).
 pub(crate) const MAX_FACT_VALUE_CHARS: usize = 500;
 
 pub(crate) const MEMORY_TEXT_HIDDEN: &str =
@@ -16,7 +15,6 @@ pub(crate) const MEMORY_TEXT_HIDDEN: &str =
 pub(crate) const MEMORY_CONTENT_INVALID: &str = "content must be 1 to 8000 characters";
 pub(crate) const MEMORY_TAGS_INVALID: &str =
     "tags must be at most 20 non-empty tags of at most 40 characters";
-#[allow(dead_code)] // Used by the facts routes (M7 Task 3).
 pub(crate) const FACT_VALUE_INVALID: &str = "value must be 1 to 500 characters";
 
 /// True when the text smuggles Unicode tag characters, bidirectional

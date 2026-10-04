@@ -187,6 +187,8 @@ use crate::runtime_model::provider_summaries;
         skills::list_skill_drafts, skills::approve_skill_draft, skills::reject_skill_draft,
         skills::import_skill,
         memory_edits::patch_memory, memory_edits::delete_memory,
+        memory_edits::list_facts, memory_edits::patch_fact, memory_edits::delete_fact,
+        memory_edits::delete_entity,
     ),
     components(schemas(self::contracts::AgentSummariesEnvelope)),
     tags(
@@ -614,6 +616,15 @@ fn router_with_services_with_policies(
             axum::routing::post(add_evaluated_memory_entry),
         )
         .route("/api/memories/recall", get(recall_memories_entry))
+        .route("/api/memories/facts", get(memory_edits::list_facts))
+        .route(
+            "/api/memories/facts/{fact_id}",
+            axum::routing::patch(memory_edits::patch_fact).delete(memory_edits::delete_fact),
+        )
+        .route(
+            "/api/memories/entities/{entity_id}",
+            axum::routing::delete(memory_edits::delete_entity),
+        )
         .route("/api/memories/readiness", get(memory_readiness_entry))
         .route(
             "/api/memories/retention",

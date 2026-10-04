@@ -277,6 +277,27 @@ Every automation route requires local-owner authorization (the list too, since M
 
 Set `ANIMAOS_RS_MEMORY_SQLITE_FILE=/path/to/memories.sqlite` to load the daemon-owned memory snapshot on startup and autosave runtime memory writes from HTTP routes, tools, runtime evaluators, and retention policy runs. For lightweight JSON memory persistence, set `ANIMAOS_RS_MEMORY_FILE=/path/to/memories.json` instead; embeddings remain in process unless `ANIMAOS_RS_MEMORY_EMBEDDINGS_SQLITE_FILE` is also set. Set only one memory store variable. BM25 memory search uses the multilingual analyzer and does not remove stop words or stem terms by language. Runtime evaluation uses evaluated writes for reflection evidence, extracts explicit user-stated preference/remember facts, indexes stored memories for semantic recall, and links the responding agent to the user entity when request metadata includes `userId`/`userName`.
 
+### Memory editing (owner)
+
+These routes let the owner fix what the companion remembers. Each requires local-owner authorization (`403` `local owner authorization required` otherwise; `GET /api/memories/facts` needs owner read authorization) and answers `Cache-Control: no-store`, errors included. The older memory routes above keep their shapes and authorization: a non-owner can still reach them, and only the routes below are owner-only. Every mutation runs to completion even when the client disconnects, saves the memory store, and on a failed save restores the previous state and answers `503`.
+
+| Method   | Path                                 | Request                                      | Answers                                                                                                                                                                                                                  |
+| -------- | ------------------------------------ | -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `PATCH`  | `/api/memories/{memory_id}`          | `{ content?, importance?, tags? }`           | `200` the memory. `tags: null` clears the tags, an array replaces them, absent keeps them. Content is re-indexed and re-embedded. `400`, `403`, `404`, `503`.                                                            |
+| `DELETE` | `/api/memories/{memory_id}`          | none                                         | `200` `{ id, removedRelationships, updatedRelationships, updatedFacts }`. The memory, its embedding, and its citations are removed. `403`, `404`, `503`.                                                                 |
+| `GET`    | `/api/memories/facts`                | `?agentId=&subject=&includeInactive=&limit=` | `200` `{ facts }`, newest first. `limit` is 1 to 500 (default 100); `includeInactive` is `true` or `false`. `400` (`limit must be from 1 to 500`, `includeInactive must be true or false`), `403`.                       |
+| `PATCH`  | `/api/memories/facts/{fact_id}`      | `{ value }` (1 to 500 characters)            | `200` `{ fact, superseded }`: the fact is replaced by a new active one that supersedes it. `400`, `403`, `404`, `409` (`Only an active fact with a value can be edited`), `503`.                                         |
+| `DELETE` | `/api/memories/facts/{fact_id}`      | none                                         | `200` `{ id }`. `403`, `404`, `503`.                                                                                                                                                                                     |
+| `DELETE` | `/api/memories/entities/{entity_id}` | `?kind=agent\|user\|system\|external`        | `200` `{ kind, id, removedRelationships, removedFacts }`. `400` (`kind query parameter must be one of agent, user, system, external`), `403`, `404`, `409` (`This entity still has memories; delete them first`), `503`. |
+
+Notes:
+
+- An entity's key is its kind plus its id, so `entities/{id}` takes a required `kind` query parameter (the one addition to the path). Deleting an entity also removes the relationships and the facts that name it, because the store would otherwise recreate the entity on load. An `agent` entity that still owns memories, including the companion itself, answers `409`. Deleting the `user` entity is soft in practice: the evaluator recreates it on the next message that names the user.
+- Facts carry no agent of their own, so `?agentId=` keeps a fact when at least one memory in its evidence belongs to that agent; a fact with no evidence is listed only without `agentId`. `?subject=` matches the subject id, or the subject name ignoring ASCII case.
+- Deleting a memory removes it from the citations of facts and relationships. A fact or relationship left with no evidence is kept (only agent relationships left empty are removed), so the owner can forget it directly.
+- Edited memory content, tags, and replacement fact values must not contain invisible tag or direction-override characters (`400`).
+- Rolling back: M7 changes no control-plane snapshot and no memory store format, so an earlier daemon reads the same data.
+
 ### Swarms
 
 | Method | Path                            | Description                                                                                                                                                 |
