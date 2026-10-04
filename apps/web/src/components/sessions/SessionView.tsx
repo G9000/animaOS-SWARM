@@ -11,6 +11,7 @@ import {
   type Session,
 } from '@animaOS-SWARM/sdk';
 
+import { useSaveToMemory } from '../../hooks/useSaveToMemory';
 import { describeTrigger } from '../../lib/automations';
 import type { LiveRun } from '../../lib/session-events';
 import { SESSION_KIND_LABELS } from '../../lib/session-groups';
@@ -250,6 +251,19 @@ export function SessionView({
   onEditAutomation,
   notice = null,
 }: SessionViewProps) {
+  // The viewed session's agent, so a helper's session saves to that helper.
+  const saveTarget = useMemo(
+    () =>
+      session
+        ? { agentId: agent.id, agentName: agent.name, sessionId: session.id }
+        : null,
+    [agent.id, agent.name, session],
+  );
+  const { save, savedState } = useSaveToMemory(saveTarget);
+  const transcriptActions = useMemo<TranscriptActions>(
+    () => ({ ...actions, onSaveToMemory: save, savedToMemory: savedState }),
+    [actions, save, savedState],
+  );
   const conversation = useMemo(
     () => ({ ...agent, messages }),
     [agent, messages],
@@ -315,7 +329,7 @@ export function SessionView({
       <MessageList
         agent={conversation}
         items={items}
-        actions={actions}
+        actions={transcriptActions}
         sending={thinking}
         scrollerRef={scrollerRef}
         onSuggestion={onSuggestion}

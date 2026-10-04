@@ -1,7 +1,10 @@
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { createRef } from 'react';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+import { daemon } from '../../lib/daemon-api';
+import { memoryFixture } from '../../test/memory';
 
 import { emptyLiveRun } from '../../lib/session-events';
 import type { AgentDetail } from '../../lib/types';
@@ -65,7 +68,46 @@ function renderView(overrides: Partial<SessionViewProps> = {}) {
   return props;
 }
 
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
 describe('SessionView', () => {
+  it('saves a message to the viewed session’s agent as a memory', async () => {
+    const user = userEvent.setup();
+    const saveMemory = vi
+      .spyOn(daemon, 'saveMemory')
+      .mockResolvedValue(memoryFixture('mem-1'));
+    renderView({
+      agent: { ...agent, id: 'helper-7', name: 'Researcher' },
+      session: sessionFixture('room-9', {
+        agentId: 'helper-7',
+        kind: 'helper',
+      }),
+      messages: [
+        {
+          id: 'm1',
+          role: 'Assistant',
+          content: { text: 'Found the answer' },
+          created_at_ms: 1,
+        },
+      ],
+    });
+
+    await user.click(screen.getByRole('button', { name: 'Save to memory' }));
+    expect(
+      await screen.findByRole('button', { name: '✓ Saved to memory' }),
+    ).toBeDisabled();
+    expect(saveMemory).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agentId: 'helper-7',
+        agentName: 'Researcher',
+        sessionId: 'room-9',
+        content: 'Found the answer',
+      }),
+    );
+  });
+
   it('opens a new chat on the welcome screen with the companion composer', () => {
     renderView();
     expect(

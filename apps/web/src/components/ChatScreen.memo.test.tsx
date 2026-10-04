@@ -1,4 +1,5 @@
 import { fireEvent, render, screen } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { useRef, useState } from 'react';
 import { describe, expect, it, vi } from 'vitest';
 import type { AgentDetail } from '../lib/types';
@@ -99,5 +100,32 @@ describe('MessageList memoization', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Update messages' }));
     expect(markdownRenderProbe).toHaveBeenCalledTimes(2);
     expect(screen.getByText('Updated response')).toBeVisible();
+  });
+
+  it('saving one message does not render the other bubbles again', async () => {
+    markdownRenderProbe.mockClear();
+    const user = userEvent.setup();
+    const onSaveToMemory = vi
+      .fn()
+      .mockResolvedValue({ kind: 'saved', shortened: false });
+    const actions = { onSaveToMemory };
+    render(
+      <MessageList
+        agent={updatedAgent}
+        actions={actions}
+        onSuggestion={onSuggestion}
+        scrollerRef={{ current: null }}
+        sending={false}
+      />,
+    );
+    expect(markdownRenderProbe).toHaveBeenCalledTimes(2);
+
+    await user.click(screen.getAllByRole('button', { name: 'Save to memory' })[0]);
+    expect(
+      await screen.findByRole('button', { name: '✓ Saved to memory' }),
+    ).toBeDisabled();
+
+    expect(onSaveToMemory).toHaveBeenCalledTimes(1);
+    expect(markdownRenderProbe).toHaveBeenCalledTimes(2);
   });
 });
