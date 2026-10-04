@@ -18,12 +18,16 @@ import {
   type AutomationPatch,
   type AutomationTrigger,
   type HeartbeatInput,
+  type MemoryFactOptions,
+  type MemoryPatch,
+  type RelationshipEndpointKind,
   type WorkspaceBootstrapRequest,
   type AgentMemory,
   type AgentTasks,
   type AgentJobInput,
   type AgentJobRetryInput,
   type AgentJobReviewInput,
+  type CreateMemoryInput,
   type GoalInput,
   type GoalStatus,
   type Session,
@@ -400,6 +404,29 @@ export const daemon = {
     setupClient.approvals.addRule(agentId, input),
   removeApprovalRule: (agentId: string, ruleId: string) =>
     setupClient.approvals.removeRule(agentId, ruleId),
+  /** Memory (spec §10). Reads take no signal: the SDK memory calls do not;
+   *  the hook ignores stale answers by sequence number. */
+  recentMemories: (agentId: string, limit: number) =>
+    setupClient.memories.recent({ agentId, limit }),
+  searchMemories: (query: string, agentId: string, limit: number) =>
+    setupClient.memories.search(query, { agentId, limit }),
+  traceMemory: (id: string) => setupClient.memories.trace(id),
+  updateMemory: (id: string, patch: MemoryPatch) =>
+    setupClient.memories.update(id, patch),
+  deleteMemory: (id: string) => setupClient.memories.delete(id),
+  saveMemory: (input: CreateMemoryInput) => setupClient.memories.create(input),
+  listFacts: (options: MemoryFactOptions) =>
+    setupClient.memories.facts(options),
+  replaceFact: (id: string, value: string) =>
+    setupClient.memories.replaceFact(id, value),
+  deleteFact: (id: string) => setupClient.memories.deleteFact(id),
+  listMemoryEntities: (limit: number) =>
+    setupClient.memories.entities({ limit }),
+  listMemoryRelationships: (agentId: string, limit: number) =>
+    setupClient.memories.relationships({ agentId, limit }),
+  deleteMemoryEntity: (kind: RelationshipEndpointKind, id: string) =>
+    setupClient.memories.deleteEntity(kind, id),
+
   /** Skills (spec §8.4); the daemon rescans the folder on these reads. */
   listSkills: (options: { signal?: AbortSignal } = {}) =>
     setupClient.skills.list(options),

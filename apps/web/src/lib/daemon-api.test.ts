@@ -702,3 +702,73 @@ describe('daemon session requests', () => {
     ).toBe('Tool');
   });
 });
+
+describe('daemon memory requests', () => {
+  it('reads and changes memories, facts, and entities through the SDK routes', async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async (input) => {
+        const url = String(input);
+        const body = url.includes('/search')
+          ? { results: [] }
+          : url.includes('/facts') && !url.includes('/facts/')
+            ? { facts: [] }
+            : url.includes('/entities?kind')
+              ? { kind: 'user', id: 'e 1' }
+              : url.includes('/entities')
+                ? { entities: [] }
+                : url.includes('/relationships')
+                  ? { relationships: [] }
+                  : url.includes('/recent')
+                    ? { memories: [] }
+                    : {};
+        return new Response(JSON.stringify(body), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await daemon.recentMemories('agent 1', 200);
+    await daemon.searchMemories('tea', 'agent 1', 200);
+    await daemon.traceMemory('m 1');
+    await daemon.updateMemory('m 1', { content: 'New' });
+    await daemon.deleteMemory('m 1');
+    await daemon.saveMemory({
+      agentId: 'agent 1',
+      agentName: 'Anima',
+      type: 'fact',
+      content: 'Saved',
+      importance: 0.5,
+    });
+    await daemon.listFacts({
+      agentId: 'agent 1',
+      includeInactive: true,
+      limit: 500,
+    });
+    await daemon.replaceFact('f 1', 'Value');
+    await daemon.deleteFact('f 1');
+    await daemon.listMemoryEntities(200);
+    await daemon.listMemoryRelationships('agent 1', 200);
+    await daemon.deleteMemoryEntity('user', 'e 1');
+
+    expect(
+      fetchMock.mock.calls.map(
+        ([url, init]) => `${init?.method ?? 'GET'} ${String(url)}`,
+      ),
+    ).toEqual([
+      'GET /api/memories/recent?agentId=agent+1&limit=200',
+      'GET /api/memories/search?q=tea&agentId=agent+1&limit=200',
+      'GET /api/memories/m%201/trace',
+      'PATCH /api/memories/m%201',
+      'DELETE /api/memories/m%201',
+      'POST /api/memories',
+      'GET /api/memories/facts?agentId=agent+1&includeInactive=true&limit=500',
+      'PATCH /api/memories/facts/f%201',
+      'DELETE /api/memories/facts/f%201',
+      'GET /api/memories/entities?limit=200',
+      'GET /api/memories/relationships?agentId=agent+1&limit=200',
+      'DELETE /api/memories/entities/e%201?kind=user',
+    ]);
+  });
+});
