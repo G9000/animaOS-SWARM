@@ -1,3 +1,6 @@
+mod edit;
+#[cfg(test)]
+mod edit_tests;
 #[cfg(test)]
 mod tests;
 mod types;
@@ -7,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anima_core::primitives::now_millis;
 
+pub use self::edit::{EntityDeletion, MemoryDeletion, MemoryPatch};
 pub use self::types::{
     AgentRelationship, AgentRelationshipOptions, Memory, MemoryEntity, MemoryEntityOptions,
     MemoryError, MemoryEvaluation, MemoryEvaluationDecision, MemoryEvaluationOptions,
