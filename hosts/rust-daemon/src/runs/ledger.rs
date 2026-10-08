@@ -164,6 +164,12 @@ pub(crate) struct RunStepUsage {
     pub(crate) step_id: String,
     #[serde(default)]
     pub(crate) usage: TokenUsage,
+    /// When the step's usage was reported; 0 for a step saved before timing.
+    #[serde(default)]
+    pub(crate) at_ms: u64,
+    /// How long the step took; 0 when unknown.
+    #[serde(default)]
+    pub(crate) duration_ms: u64,
 }
 
 /// A steer saved with the run it joined (spec §4.7; controller ruling, M3
@@ -980,6 +986,21 @@ mod tests {
         assert_eq!(minimal.reply_message_id, None);
         assert!(minimal.pending_steers.is_empty());
         assert!(minimal.steered_keys.is_empty());
+    }
+
+    #[test]
+    fn an_old_step_without_timing_loads_with_zeros() {
+        let step: RunStepUsage = serde_json::from_value(json!({
+            "stepId": "run_1:1",
+            "usage": { "prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5 }
+        }))
+        .unwrap();
+        assert_eq!(step.at_ms, 0);
+        assert_eq!(step.duration_ms, 0);
+        assert_eq!(step.usage.total_tokens, 5);
+        let written = serde_json::to_value(&step).unwrap();
+        assert_eq!(written["atMs"], 0);
+        assert_eq!(written["durationMs"], 0);
     }
 
     #[test]

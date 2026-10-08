@@ -1161,6 +1161,12 @@ pub fn price_usage(pricing: &ModelPricing, usage: &TokenUsage) -> u64 {
     u64::try_from((total + 500_000) / 1_000_000).unwrap_or(u64::MAX)
 }
 
+/// The canonical id of a provider name or alias (case-insensitive), or `None`
+/// for a provider the catalog does not know.
+pub fn canonical_provider_id(provider: &str) -> Option<&'static str> {
+    canonical_provider(provider)
+}
+
 fn canonical_provider(provider: &str) -> Option<&'static str> {
     let requested = provider.trim().to_ascii_lowercase();
     if requested == "chatgpt" {

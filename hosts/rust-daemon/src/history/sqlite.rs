@@ -11,11 +11,12 @@ use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 
 use super::{
     message_ordinal, role_name, search_tokens, searchable_text, to_i64, ApprovalPageQuery,
-    HistoryError, HistoryMessage, HistoryStore, MessagePageQuery,
+    HistoryError, HistoryMessage, HistoryStore, MessagePageQuery, UsagePageQuery,
 };
 use crate::approvals::ApprovalRequest;
 use crate::runs::RunRecord;
 use crate::schedules::ScheduleFireRecord;
+use crate::usage::UsageRecord;
 
 /// `PRAGMA user_version` of the schema this daemon writes.
 pub(crate) const SQLITE_HISTORY_SCHEMA_VERSION: i64 = 1;
@@ -147,6 +148,33 @@ SELECT record FROM schedule_runs
 WHERE agent_id = ?1 AND schedule_id = ?2
 ORDER BY fired_at_ms DESC, id DESC
 LIMIT ?3";
+
+/// A stored row keeps its price fields when the same id is written again
+/// (spec §11.1: priced when first mirrored); a legacy row without them takes
+/// the new ones.
+const UPSERT_USAGE: &str = "
+INSERT INTO usage (id, agent_id, session_id, run_id, created_at_ms, record)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+ON CONFLICT (id) DO UPDATE SET
+    agent_id = excluded.agent_id,
+    session_id = excluded.session_id,
+    run_id = excluded.run_id,
+    created_at_ms = excluded.created_at_ms,
+    record = CASE
+        WHEN json_extract(usage.record, '$.pricingSource') IS NOT NULL
+        THEN json_set(excluded.record,
+                      '$.costMicros', json_extract(usage.record, '$.costMicros'),
+                      '$.pricingSource', json_extract(usage.record, '$.pricingSource'))
+        ELSE excluded.record
+    END";
+
+const PAGE_USAGE: &str = "
+SELECT record FROM usage
+WHERE created_at_ms >= ?1 AND created_at_ms < ?2
+  AND (?3 IS NULL OR agent_id = ?3) AND (?4 IS NULL OR session_id = ?4)
+  AND (?5 IS NULL OR created_at_ms < ?5 OR (created_at_ms = ?5 AND id < ?6))
+ORDER BY created_at_ms DESC, id DESC
+LIMIT ?7";
 
 const PAGE_MESSAGES: &str = "
 SELECT agent_id, session_id, hidden, record FROM messages
@@ -449,6 +477,75 @@ impl HistoryStore for SqliteHistoryStore {
                     params![
                         query.agent_id,
                         to_i64(query.since_ms)?,
+                        before_at,
+                        before_id,
+                        i64::try_from(query.limit).unwrap_or(i64::MAX)
+                    ],
+                    |row| row.get::<_, String>(0),
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            records
+                .iter()
+                .map(|record| serde_json::from_str(record).map_err(HistoryError::from))
+                .collect()
+        })
+        .await
+    }
+
+    async fn upsert_usage(&self, records: &[UsageRecord]) -> Result<(), HistoryError> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        type Row = (String, String, Option<String>, Option<String>, i64, String);
+        let rows = records
+            .iter()
+            .map(|record| -> Result<Row, HistoryError> {
+                Ok((
+                    record.id.clone(),
+                    record.agent_id.clone(),
+                    record.session_id.clone(),
+                    record.run_id.clone(),
+                    to_i64(record.created_at_ms)?,
+                    serde_json::to_string(record)?,
+                ))
+            })
+            .collect::<Result<Vec<_>, HistoryError>>()?;
+        self.run(move |connection| {
+            let transaction = connection.transaction()?;
+            {
+                let mut statement = transaction.prepare_cached(UPSERT_USAGE)?;
+                for (id, agent_id, session_id, run_id, created_at_ms, record) in &rows {
+                    statement.execute(params![
+                        id,
+                        agent_id,
+                        session_id,
+                        run_id,
+                        created_at_ms,
+                        record
+                    ])?;
+                }
+            }
+            transaction.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn page_usage(&self, query: &UsagePageQuery) -> Result<Vec<UsageRecord>, HistoryError> {
+        let query = query.clone();
+        self.run(move |connection| {
+            let (before_at, before_id) = match &query.before {
+                Some((at_ms, id)) => (Some(to_i64(*at_ms)?), id.clone()),
+                None => (None, String::new()),
+            };
+            let mut statement = connection.prepare_cached(PAGE_USAGE)?;
+            let records = statement
+                .query_map(
+                    params![
+                        to_i64(query.from_ms)?,
+                        to_i64(query.to_ms)?,
+                        query.agent_id,
+                        query.session_id,
                         before_at,
                         before_id,
                         i64::try_from(query.limit).unwrap_or(i64::MAX)
@@ -786,7 +883,8 @@ mod tests {
         assert_history_store_conformance, assert_history_store_diacritics_conformance,
         assert_history_store_indexed_text_cap_conformance,
         assert_history_store_schedule_run_conformance,
-        assert_history_store_session_search_conformance, history_message,
+        assert_history_store_session_search_conformance, assert_history_store_usage_conformance,
+        history_message,
     };
     use anima_core::MessageRole;
 
@@ -823,6 +921,7 @@ mod tests {
         assert_history_store_diacritics_conformance(&store).await;
         assert_history_store_approval_conformance(&store).await;
         assert_history_store_schedule_run_conformance(&store).await;
+        assert_history_store_usage_conformance(&store).await;
         assert_eq!(store.label(), "sqlite");
         assert!(!store.is_ephemeral());
     }

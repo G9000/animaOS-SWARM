@@ -8,11 +8,12 @@ use async_trait::async_trait;
 
 use super::{
     search_tokens, searchable_text, text_matches, ApprovalPageQuery, HistoryError, HistoryMessage,
-    HistoryStore, MessagePageQuery, EPHEMERAL_HISTORY_MAX_ROWS,
+    HistoryStore, MessagePageQuery, UsagePageQuery, EPHEMERAL_HISTORY_MAX_ROWS,
 };
 use crate::approvals::ApprovalRequest;
 use crate::runs::RunRecord;
 use crate::schedules::ScheduleFireRecord;
+use crate::usage::UsageRecord;
 
 pub(crate) struct MemoryHistoryStore {
     max_rows: usize,
@@ -30,6 +31,8 @@ struct Tables {
     approval_seqs: BTreeMap<u64, String>,
     schedule_runs: HashMap<String, (u64, ScheduleFireRecord)>,
     schedule_run_seqs: BTreeMap<u64, String>,
+    usage: HashMap<String, (u64, UsageRecord)>,
+    usage_seqs: BTreeMap<u64, String>,
 }
 
 impl MemoryHistoryStore {
@@ -177,6 +180,57 @@ impl HistoryStore for MemoryHistoryStore {
                     && approval.created_at_ms >= query.since_ms
                     && query.before.as_ref().is_none_or(|(at_ms, id)| {
                         (approval.created_at_ms, approval.id.as_str()) < (*at_ms, id.as_str())
+                    })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        rows.sort_by(|left, right| {
+            (right.created_at_ms, &right.id).cmp(&(left.created_at_ms, &left.id))
+        });
+        rows.truncate(query.limit);
+        Ok(rows)
+    }
+
+    async fn upsert_usage(&self, records: &[UsageRecord]) -> Result<(), HistoryError> {
+        let mut guard = self.tables();
+        let tables = &mut *guard;
+        for record in records {
+            let mut record = record.clone();
+            if let Some((_, existing)) = tables.usage.get(&record.id) {
+                record.cost_micros = existing.cost_micros;
+                record.pricing_source = existing.pricing_source;
+            }
+            upsert(
+                &mut tables.usage,
+                &mut tables.usage_seqs,
+                &mut tables.next_seq,
+                record.id.clone(),
+                record,
+                self.max_rows,
+            );
+        }
+        Ok(())
+    }
+
+    async fn page_usage(&self, query: &UsagePageQuery) -> Result<Vec<UsageRecord>, HistoryError> {
+        let tables = self.tables();
+        let mut rows = tables
+            .usage
+            .values()
+            .map(|(_, record)| record)
+            .filter(|record| {
+                record.created_at_ms >= query.from_ms
+                    && record.created_at_ms < query.to_ms
+                    && query
+                        .agent_id
+                        .as_deref()
+                        .is_none_or(|agent_id| record.agent_id == agent_id)
+                    && query
+                        .session_id
+                        .as_deref()
+                        .is_none_or(|session_id| record.session_id.as_deref() == Some(session_id))
+                    && query.before.as_ref().is_none_or(|(at_ms, id)| {
+                        (record.created_at_ms, record.id.as_str()) < (*at_ms, id.as_str())
                     })
             })
             .cloned()
@@ -404,7 +458,8 @@ mod tests {
         assert_history_store_conformance, assert_history_store_diacritics_conformance,
         assert_history_store_indexed_text_cap_conformance,
         assert_history_store_schedule_run_conformance,
-        assert_history_store_session_search_conformance, history_message,
+        assert_history_store_session_search_conformance, assert_history_store_usage_conformance,
+        history_message,
     };
     use anima_core::MessageRole;
 
@@ -418,6 +473,7 @@ mod tests {
         assert_history_store_diacritics_conformance(&store).await;
         assert_history_store_approval_conformance(&store).await;
         assert_history_store_schedule_run_conformance(&store).await;
+        assert_history_store_usage_conformance(&store).await;
     }
 
     #[tokio::test]

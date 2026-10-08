@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
 
+use anima_core::primitives::now_millis;
 use anima_core::{RunControl, TokenUsage};
 use serde::Serialize;
 
@@ -48,6 +49,8 @@ struct LiveRunState {
     /// length rather than a recount of the retained text.
     text_units: u64,
     steps: Vec<RunStepUsage>,
+    /// The current step's id and when it started, for its duration.
+    step_started: Option<(String, u64)>,
     /// Distinct tool names, noted here instead of under the state write lock
     /// (M1 carry-forward); saves and reads merge them into the ledger record.
     tools_started: Vec<String>,
@@ -91,6 +94,7 @@ impl LiveRuns {
                 view: LiveRunView::default(),
                 text_units: 0,
                 steps: Vec::new(),
+                step_started: None,
                 tools_started: Vec::new(),
             })
             .control
@@ -128,7 +132,13 @@ impl LiveRuns {
     }
 
     pub(crate) fn start_step(&self, run_id: &str, step_id: &str) {
+        self.start_step_at(run_id, step_id, now_millis());
+    }
+
+    /// [`Self::start_step`] with the clock passed in.
+    pub(crate) fn start_step_at(&self, run_id: &str, step_id: &str, now_ms: u64) {
         if let Some(run) = self.lock().get_mut(run_id) {
+            run.step_started = Some((step_id.to_string(), now_ms));
             run.view.step_id = Some(step_id.to_string());
             run.view.text.clear();
             run.view.text_offset = 0;
@@ -203,11 +213,31 @@ impl LiveRuns {
 
     /// Keeps one model call's usage (spec §4.1 `steps`, at most 50).
     pub(crate) fn record_step_usage(&self, run_id: &str, step_id: &str, usage: TokenUsage) {
+        self.record_step_usage_at(run_id, step_id, usage, now_millis());
+    }
+
+    /// [`Self::record_step_usage`] with the clock passed in: the step records
+    /// when it reported and how long it ran since `start_step` (0 when this
+    /// step was not started here).
+    pub(crate) fn record_step_usage_at(
+        &self,
+        run_id: &str,
+        step_id: &str,
+        usage: TokenUsage,
+        now_ms: u64,
+    ) {
         if let Some(run) = self.lock().get_mut(run_id) {
             if run.steps.len() < MAX_RUN_STEPS {
+                let duration_ms = run
+                    .step_started
+                    .as_ref()
+                    .filter(|(started_id, _)| started_id == step_id)
+                    .map_or(0, |(_, started_ms)| now_ms.saturating_sub(*started_ms));
                 run.steps.push(RunStepUsage {
                     step_id: step_id.to_string(),
                     usage,
+                    at_ms: now_ms,
+                    duration_ms,
                 });
             }
         }

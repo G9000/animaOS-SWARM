@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use crate::approvals::ApprovalRequest;
 use crate::runs::RunRecord;
 use crate::schedules::ScheduleFireRecord;
+use crate::usage::UsageRecord;
 
 /// Rows per in-memory table in ephemeral mode (spec §13.1).
 pub(crate) const EPHEMERAL_HISTORY_MAX_ROWS: usize = 100_000;
@@ -106,6 +107,21 @@ pub(crate) struct ApprovalPageQuery {
     /// Only approvals created at or after this time (spec §7.3's 30 days).
     pub(crate) since_ms: u64,
     /// Only approvals strictly older than this `(createdAtMs, id)`.
+    pub(crate) before: Option<(u64, String)>,
+    pub(crate) limit: usize,
+}
+
+/// One page of usage records, newest first by `(createdAtMs, id)` (byte
+/// order on the id).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UsagePageQuery {
+    /// Records created at or after this time.
+    pub(crate) from_ms: u64,
+    /// Records created before this time (exclusive).
+    pub(crate) to_ms: u64,
+    pub(crate) agent_id: Option<String>,
+    pub(crate) session_id: Option<String>,
+    /// Only records strictly older than this `(createdAtMs, id)`.
     pub(crate) before: Option<(u64, String)>,
     pub(crate) limit: usize,
 }
@@ -216,6 +232,16 @@ pub(crate) trait HistoryStore: Send + Sync {
         schedule_id: &str,
         limit: usize,
     ) -> Result<Vec<ScheduleFireRecord>, HistoryError>;
+
+    /// Usage records (spec §11), idempotent by id. A record already stored
+    /// keeps its price fields (`costMicros`, `pricingSource`): a run row is
+    /// priced when first mirrored, and re-mirroring must not change it.
+    async fn upsert_usage(&self, records: &[UsageRecord]) -> Result<(), HistoryError>;
+
+    /// Usage records in `[from_ms, to_ms)`, newest first (then by id,
+    /// descending, in byte order), strictly older than `query.before`, at
+    /// most `query.limit`.
+    async fn page_usage(&self, query: &UsagePageQuery) -> Result<Vec<UsageRecord>, HistoryError>;
 
     async fn existing_message_ids(&self, ids: &[String]) -> Result<HashSet<String>, HistoryError>;
 

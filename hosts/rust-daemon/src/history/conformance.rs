@@ -10,7 +10,7 @@ use tokio::sync::Semaphore;
 
 use super::{
     ApprovalPageQuery, HistoryError, HistoryMessage, HistoryStore, MemoryHistoryStore,
-    MessagePageQuery,
+    MessagePageQuery, UsagePageQuery,
 };
 use crate::approvals::{
     ApprovalDecisionKind, ApprovalRequest, ApprovalResolution, ApprovalStatus,
@@ -18,6 +18,7 @@ use crate::approvals::{
 };
 use crate::runs::{RunRecord, RunSource, RunStart, RunStatus};
 use crate::schedules::{ScheduleFireRecord, ScheduleOutcomeStatus};
+use crate::usage::{PricingSource, UsageRecord, UsageSource};
 
 pub(crate) fn history_message(
     id: &str,
@@ -329,6 +330,190 @@ pub(crate) async fn assert_history_store_schedule_run_conformance(store: &dyn Hi
             .unwrap(),
         vec![foreign],
         "another agent's history stays"
+    );
+}
+
+pub(crate) fn usage_fixture(
+    id: &str,
+    agent_id: &str,
+    session_id: Option<&str>,
+    created_at_ms: u64,
+) -> UsageRecord {
+    UsageRecord {
+        id: id.into(),
+        agent_id: agent_id.into(),
+        session_id: session_id.map(str::to_string),
+        run_id: Some(format!("run_{id}")),
+        source: UsageSource::Chat,
+        provider: "anthropic".into(),
+        model: "claude-fable-5-1".into(),
+        prompt_tokens: 10,
+        completion_tokens: 5,
+        cached_prompt_tokens: 2,
+        reasoning_tokens: 1,
+        total_tokens: 15,
+        cost_micros: Some(100),
+        pricing_source: PricingSource::Table,
+        duration_ms: 7,
+        created_at_ms,
+    }
+}
+
+fn usage_ids(rows: &[UsageRecord]) -> Vec<String> {
+    rows.iter().map(|row| row.id.clone()).collect()
+}
+
+fn usage_query(agent_id: &str, limit: usize) -> UsagePageQuery {
+    UsagePageQuery {
+        from_ms: 0,
+        to_ms: u64::MAX / 4,
+        agent_id: Some(agent_id.to_string()),
+        session_id: None,
+        before: None,
+        limit,
+    }
+}
+
+/// Usage records: idempotent by id with the first price kept, filtered by
+/// range, agent, and session, paged newest first with a byte-order id
+/// tie-break, and kept when a session or agent is deleted. Ids and agents are
+/// unique per call, so a shared Postgres database can run it repeatedly.
+pub(crate) async fn assert_history_store_usage_conformance(store: &dyn HistoryStore) {
+    let tag = uuid::Uuid::new_v4().to_string();
+    let agent = format!("agent-{tag}");
+    let other = format!("agent-other-{tag}");
+    let (chat, notes) = (format!("chat:{tag}"), format!("notes:{tag}"));
+    let id = |name: &str| format!("{tag}-{name}");
+
+    // Idempotent by id; a rewrite changes the fields but not the first price.
+    let first = usage_fixture(&id("a"), &agent, Some(&chat), 1_000);
+    store.upsert_usage(&[]).await.unwrap();
+    store.upsert_usage(&[first.clone()]).await.unwrap();
+    store.upsert_usage(&[first.clone()]).await.unwrap();
+    assert_eq!(
+        store.page_usage(&usage_query(&agent, 50)).await.unwrap(),
+        vec![first.clone()],
+        "writing an id twice keeps one row"
+    );
+    let mut rewritten = first.clone();
+    rewritten.duration_ms = 99;
+    rewritten.cost_micros = Some(999_999);
+    rewritten.pricing_source = PricingSource::Override;
+    store.upsert_usage(&[rewritten]).await.unwrap();
+    let kept = store.page_usage(&usage_query(&agent, 50)).await.unwrap();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].duration_ms, 99, "other fields are replaced");
+    assert_eq!(
+        (kept[0].cost_micros, kept[0].pricing_source),
+        (Some(100), PricingSource::Table),
+        "re-upserting an id must not change its stored price"
+    );
+
+    // An unpriced row stays unpriced when the id is written again.
+    let mut unpriced = usage_fixture(&id("unpriced"), &agent, Some(&notes), 1_100);
+    unpriced.cost_micros = None;
+    unpriced.pricing_source = PricingSource::Unknown;
+    store.upsert_usage(&[unpriced.clone()]).await.unwrap();
+    let mut priced_later = unpriced.clone();
+    priced_later.cost_micros = Some(5);
+    priced_later.pricing_source = PricingSource::Table;
+    store.upsert_usage(&[priced_later]).await.unwrap();
+    let rows = store.page_usage(&usage_query(&agent, 50)).await.unwrap();
+    let stored = rows.iter().find(|row| row.id == unpriced.id).unwrap();
+    assert_eq!(
+        (stored.cost_micros, stored.pricing_source),
+        (None, PricingSource::Unknown)
+    );
+
+    // Filters: range [from, to), agent, session; a row with no session never
+    // matches a session filter.
+    let loose = usage_fixture(&id("loose"), &agent, None, 1_200);
+    let elsewhere = usage_fixture(&id("elsewhere"), &other, Some(&chat), 1_300);
+    store
+        .upsert_usage(&[loose.clone(), elsewhere.clone()])
+        .await
+        .unwrap();
+    let mut by_range = usage_query(&agent, 50);
+    by_range.from_ms = 1_100;
+    by_range.to_ms = 1_200;
+    assert_eq!(
+        usage_ids(&store.page_usage(&by_range).await.unwrap()),
+        vec![id("unpriced")],
+        "from is inclusive and to is exclusive"
+    );
+    let mut by_session = usage_query(&agent, 50);
+    by_session.session_id = Some(chat.clone());
+    assert_eq!(
+        usage_ids(&store.page_usage(&by_session).await.unwrap()),
+        vec![id("a")]
+    );
+    let mut everyone = usage_query(&agent, 50);
+    everyone.agent_id = None;
+    everyone.session_id = Some(chat.clone());
+    let both = store.page_usage(&everyone).await.unwrap();
+    assert_eq!(
+        usage_ids(&both),
+        vec![id("elsewhere"), id("a")],
+        "no agent filter spans agents"
+    );
+    assert_eq!(
+        usage_ids(&store.page_usage(&usage_query(&other, 50)).await.unwrap()),
+        vec![id("elsewhere")]
+    );
+
+    // Paging: newest first, ties broken by id in byte order (uppercase
+    // sorts before lowercase), with a strict cursor.
+    let paged_agent = format!("agent-paged-{tag}");
+    let ties = ["pB", "pa", "pc"]
+        .iter()
+        .map(|name| usage_fixture(&id(name), &paged_agent, Some(&chat), 5_000))
+        .collect::<Vec<_>>();
+    let older = usage_fixture(&id("older"), &paged_agent, Some(&chat), 4_000);
+    let newer = usage_fixture(&id("newer"), &paged_agent, Some(&chat), 6_000);
+    store
+        .upsert_usage(&[
+            ties[0].clone(),
+            older,
+            ties[1].clone(),
+            newer,
+            ties[2].clone(),
+        ])
+        .await
+        .unwrap();
+    let expected = vec![id("newer"), id("pc"), id("pa"), id("pB"), id("older")];
+    assert_eq!(
+        usage_ids(
+            &store
+                .page_usage(&usage_query(&paged_agent, 50))
+                .await
+                .unwrap()
+        ),
+        expected,
+        "newest first, then the id descending in byte order"
+    );
+    let mut walked = Vec::new();
+    let mut query = usage_query(&paged_agent, 2);
+    loop {
+        let page = store.page_usage(&query).await.unwrap();
+        assert!(page.len() <= 2);
+        let Some(last) = page.last() else { break };
+        query.before = Some((last.created_at_ms, last.id.clone()));
+        walked.extend(usage_ids(&page));
+    }
+    assert_eq!(walked, expected, "a cursor walk visits every row once");
+
+    // Deleting a session or an agent leaves usage rows.
+    store.delete_session(&agent, &chat).await.unwrap();
+    assert_eq!(
+        usage_ids(&store.page_usage(&usage_query(&agent, 50)).await.unwrap()).len(),
+        3,
+        "deleting a session keeps its usage rows"
+    );
+    store.delete_agent(&agent).await.unwrap();
+    assert_eq!(
+        usage_ids(&store.page_usage(&usage_query(&agent, 50)).await.unwrap()).len(),
+        3,
+        "deleting an agent keeps its usage rows"
     );
 }
 
@@ -1045,6 +1230,16 @@ impl HistoryStore for FlakyHistoryStore {
         self.inner
             .page_schedule_runs(agent_id, schedule_id, limit)
             .await
+    }
+
+    async fn upsert_usage(&self, records: &[UsageRecord]) -> Result<(), HistoryError> {
+        self.check()?;
+        self.inner.upsert_usage(records).await
+    }
+
+    async fn page_usage(&self, query: &UsagePageQuery) -> Result<Vec<UsageRecord>, HistoryError> {
+        self.check()?;
+        self.inner.page_usage(query).await
     }
 
     async fn existing_message_ids(&self, ids: &[String]) -> Result<HashSet<String>, HistoryError> {

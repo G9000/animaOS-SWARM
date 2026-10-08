@@ -198,6 +198,43 @@ fn the_registry_tracks_a_steps_text_in_utf16_units_and_keeps_its_tail() {
 }
 
 #[test]
+fn a_step_usage_records_when_and_how_long() {
+    let hub = LiveHub::new(8);
+    let runs = hub.runs();
+    runs.register("run_1");
+    runs.start_step_at("run_1", "run_1:1", 1_000);
+    let usage = TokenUsage {
+        prompt_tokens: 3,
+        completion_tokens: 2,
+        total_tokens: 5,
+        ..TokenUsage::default()
+    };
+    runs.record_step_usage_at("run_1", "run_1:1", usage.clone(), 1_750);
+    let steps = runs.steps("run_1");
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0].at_ms, 1_750);
+    assert_eq!(steps[0].duration_ms, 750);
+    assert_eq!(steps[0].usage, usage);
+}
+
+#[test]
+fn a_usage_without_a_started_step_has_zero_duration() {
+    let hub = LiveHub::new(8);
+    let runs = hub.runs();
+    runs.register("run_1");
+    runs.record_step_usage_at("run_1", "run_1:1", TokenUsage::default(), 2_000);
+    runs.start_step_at("run_1", "run_1:2", 2_100);
+    runs.record_step_usage_at("run_1", "run_1:3", TokenUsage::default(), 2_200);
+    let steps = runs.steps("run_1");
+    assert_eq!((steps[0].at_ms, steps[0].duration_ms), (2_000, 0));
+    assert_eq!(
+        (steps[1].at_ms, steps[1].duration_ms),
+        (2_200, 0),
+        "a different step than the started one has no start"
+    );
+}
+
+#[test]
 fn a_run_keeps_only_its_newest_tool_cards() {
     let hub = LiveHub::new(8);
     let runs = hub.runs();

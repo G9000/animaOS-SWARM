@@ -20,6 +20,7 @@ mod sessions;
 mod skills;
 mod state;
 mod tools;
+mod usage;
 
 pub mod postgres;
 
