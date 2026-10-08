@@ -893,7 +893,7 @@ mod tests {
         source.skills.put_draft(agent_draft("agent-1", "draft", 3));
 
         let payload = serde_json::to_value(source.control_plane_snapshot()).unwrap();
-        assert_eq!(payload["version"], 9);
+        assert_eq!(payload["version"], 10);
         assert_eq!(payload["skills"][0]["slug"], "notes");
         assert_eq!(payload["skillDrafts"][0]["slug"], "draft");
 

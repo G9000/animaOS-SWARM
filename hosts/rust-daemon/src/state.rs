@@ -583,6 +583,57 @@ mod tests {
         );
     }
 
+    fn override_for_tests(model: &str, input: u64) -> crate::usage::PricingOverride {
+        crate::usage::PricingOverride {
+            provider: "openai".into(),
+            model: model.into(),
+            input_micros_per_mtok: input,
+            output_micros_per_mtok: 2 * input,
+            cached_input_micros_per_mtok: Some(input / 2),
+        }
+    }
+
+    #[test]
+    fn pricing_overrides_round_trip_through_a_snapshot() {
+        let mut source = DaemonState::new();
+        let previous = source.set_pricing_overrides(vec![override_for_tests("gpt-x", 100)]);
+        assert!(previous.is_empty());
+        let snapshot = source.control_plane_snapshot();
+        let payload = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(payload["pricingOverrides"][0]["model"], "gpt-x");
+        assert_eq!(payload["pricingOverrides"][0]["inputMicrosPerMtok"], 100);
+
+        let mut restored = DaemonState::new();
+        restored
+            .restore_control_plane_snapshot(serde_json::from_value(payload).unwrap())
+            .expect("a snapshot with overrides restores");
+        assert_eq!(
+            restored.pricing_overrides,
+            vec![override_for_tests("gpt-x", 100)]
+        );
+        let swapped = restored.set_pricing_overrides(vec![]);
+        assert_eq!(swapped, vec![override_for_tests("gpt-x", 100)]);
+    }
+
+    #[test]
+    fn invalid_saved_overrides_are_dropped_with_a_warning_not_fatal() {
+        let mut snapshot = DaemonState::new().control_plane_snapshot();
+        snapshot.pricing_overrides = vec![
+            override_for_tests("gpt-x", 100),
+            override_for_tests(
+                "gpt-y",
+                crate::usage::pricing::MAX_PRICE_MICROS_PER_MTOK + 1,
+            ),
+        ];
+        let mut state = DaemonState::new();
+
+        state
+            .restore_control_plane_snapshot(snapshot)
+            .expect("a restore never fails on the overrides");
+
+        assert!(state.pricing_overrides.is_empty());
+    }
+
     #[test]
     fn version_one_snapshot_restores_with_empty_connector_state() {
         let snapshot: ControlPlaneSnapshot = serde_json::from_value(serde_json::json!({
@@ -1226,7 +1277,7 @@ mod tests {
         }
 
         let snapshot = source.control_plane_snapshot();
-        assert_eq!(snapshot.version, 9);
+        assert_eq!(snapshot.version, 10);
         assert_eq!(
             snapshot.runs.len(),
             3,
@@ -1408,7 +1459,7 @@ mod tests {
             snapshot.version,
             crate::control_plane_store::CONTROL_PLANE_STORE_VERSION
         );
-        assert_eq!(snapshot.version, 9);
+        assert_eq!(snapshot.version, 10);
 
         let payload = serde_json::to_value(&snapshot).unwrap();
         assert_eq!(payload["inbound"][0]["processingState"], "stopped");
@@ -1430,7 +1481,7 @@ mod tests {
             .await
             .unwrap()
             .expect("the saved snapshot should load");
-        assert_eq!(loaded.version, 9);
+        assert_eq!(loaded.version, 10);
         assert_eq!(
             loaded.inbound[0].processing_state,
             InboundProcessingState::Stopped
@@ -1444,7 +1495,7 @@ mod tests {
 
         DaemonState::new()
             .restore_control_plane_snapshot(loaded)
-            .expect("a v9 snapshot holding stopped/suppressed values restores");
+            .expect("a v10 snapshot holding stopped/suppressed values restores");
         let _ = std::fs::remove_file(path);
     }
 
@@ -1560,6 +1611,8 @@ pub(crate) struct DaemonState {
     pub(crate) skills: crate::skills::SkillRegistry,
     /// Automation fires the history store does not hold yet (spec §9.1).
     pub(crate) schedule_fires: crate::schedules::FireLog,
+    /// The owner's price overrides (spec §11.1); saved in the control plane.
+    pub(crate) pricing_overrides: Vec<crate::usage::PricingOverride>,
     pub(crate) history: crate::history::SharedHistory,
     /// Session creations per agent per minute (spec §14); not persisted.
     pub(crate) session_limiter: crate::sessions::SessionCreateLimiter,
@@ -1724,6 +1777,7 @@ impl DaemonState {
             approvals: crate::approvals::ApprovalRegistry::default(),
             skills: crate::skills::SkillRegistry::default(),
             schedule_fires: crate::schedules::FireLog::default(),
+            pricing_overrides: Vec::new(),
             history: crate::history::HistoryService::ephemeral(),
             session_limiter: crate::sessions::SessionCreateLimiter::default(),
             tool_grants_applied: std::collections::BTreeSet::new(),
@@ -1935,7 +1989,17 @@ impl DaemonState {
         snapshot.skills = skills.skills;
         snapshot.skill_drafts = skills.drafts;
         snapshot.schedule_fires = self.schedule_fires.snapshot();
+        snapshot.pricing_overrides = self.pricing_overrides.clone();
         snapshot
+    }
+
+    /// Replaces the pricing overrides and returns the previous list (for a
+    /// rollback after a failed save).
+    pub(crate) fn set_pricing_overrides(
+        &mut self,
+        overrides: Vec<crate::usage::PricingOverride>,
+    ) -> Vec<crate::usage::PricingOverride> {
+        std::mem::replace(&mut self.pricing_overrides, overrides)
     }
 
     pub(crate) fn restore_control_plane_snapshot(
@@ -2087,6 +2151,16 @@ impl DaemonState {
             anima_core::primitives::now_millis(),
         );
         self.schedule_fires = crate::schedules::FireLog::restored(snapshot.schedule_fires);
+        // A saved list that no longer validates is dropped whole: pricing is
+        // advisory, so a restore never fails on it.
+        self.pricing_overrides =
+            match crate::usage::pricing::validate_overrides(snapshot.pricing_overrides) {
+                Ok(overrides) => overrides,
+                Err(problem) => {
+                    warn!(problem, "dropped the saved pricing overrides");
+                    Vec::new()
+                }
+            };
 
         if relabelled_messages > 0 || relabelled_runs > 0 || mapped_runs > 0 {
             info!(

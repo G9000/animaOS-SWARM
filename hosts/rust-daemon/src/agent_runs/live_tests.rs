@@ -443,7 +443,7 @@ async fn the_version_six_snapshot_saves_reply_ids() {
     // Carry-forward (M3 Task 6): kept out of version-5 snapshots, which an
     // M2 daemon would load and silently drop it from; version 6 and later save it.
     let snapshot = guard.control_plane_snapshot();
-    assert_eq!(snapshot.version, 9);
+    assert_eq!(snapshot.version, 10);
     let saved = snapshot
         .runs
         .into_iter()
