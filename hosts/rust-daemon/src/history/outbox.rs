@@ -8,6 +8,12 @@
 //! (`pendingHistoryDeletions`) until the store applies them. After a restart
 //! or a queue overflow the hot transcript is reconciled against the store;
 //! five minutes of failures become a readiness issue.
+//!
+//! Usage (spec §11): a terminal run's rows are derived from its record as it
+//! is mirrored, so they are as durable as the run. Secondary calls (titles,
+//! compaction, profile, agency) queue their rows in a separate bounded
+//! in-memory queue, never ordered against deletions (usage survives them);
+//! those rows are lost on a crash before the next flush.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,6 +30,7 @@ use super::{
 use crate::app::SharedDaemonState;
 use crate::sessions::{hidden_message_ids, session_id_for_room};
 use crate::state::DaemonState;
+use crate::usage::{usage_records_for_run, UsageRecord, HISTORY_USAGE_BATCH, USAGE_QUEUE_MAX};
 
 /// The outbox flushes at least this often (spec §13.1).
 pub(crate) const HISTORY_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
@@ -98,12 +105,27 @@ pub(crate) struct FlushReport {
     pub(crate) fires: usize,
     pub(crate) deletions: usize,
     pub(crate) reconciled: usize,
+    /// Usage rows written: those derived from mirrored runs and the queued
+    /// secondary-call rows.
+    pub(crate) usage: usize,
+}
+
+/// Secondary-call usage rows waiting for the store, oldest first.
+#[derive(Debug, Default)]
+struct UsageQueue {
+    next_seq: u64,
+    rows: VecDeque<(u64, UsageRecord)>,
+    /// Set by the first drop of an overflow burst, so it warns once; cleared
+    /// once the queue is back under its bound.
+    overflowing: bool,
 }
 
 pub(crate) struct HistoryService {
     store: Arc<dyn HistoryStore>,
     max_items: usize,
     outbox: StdMutex<OutboxState>,
+    max_usage: usize,
+    usage: StdMutex<UsageQueue>,
     /// Hot message ids the store is known to hold; only these may be pruned.
     mirrored: StdMutex<HashSet<String>>,
     reconciled: AtomicBool,
@@ -119,15 +141,34 @@ impl HistoryService {
     }
 
     pub(crate) fn with_capacity(store: Arc<dyn HistoryStore>, max_items: usize) -> SharedHistory {
+        Self::with_capacities(store, max_items, USAGE_QUEUE_MAX)
+    }
+
+    fn with_capacities(
+        store: Arc<dyn HistoryStore>,
+        max_items: usize,
+        max_usage: usize,
+    ) -> SharedHistory {
         Arc::new(Self {
             store,
             max_items: max_items.max(1),
             outbox: StdMutex::new(OutboxState::default()),
+            max_usage: max_usage.max(1),
+            usage: StdMutex::new(UsageQueue::default()),
             mirrored: StdMutex::new(HashSet::new()),
             reconciled: AtomicBool::new(false),
             wake: Notify::new(),
             flushing: Mutex::new(()),
         })
+    }
+
+    /// A service whose usage queue holds at most `max_usage` rows.
+    #[cfg(test)]
+    pub(crate) fn with_usage_capacity(
+        store: Arc<dyn HistoryStore>,
+        max_usage: usize,
+    ) -> SharedHistory {
+        Self::with_capacities(store, MAX_OUTBOX_ITEMS, max_usage)
     }
 
     /// The ephemeral default: bounded in-memory tables (spec §13.1).
@@ -154,6 +195,53 @@ impl HistoryService {
 
     fn mirrored(&self) -> MutexGuard<'_, HashSet<String>> {
         lock(&self.mirrored)
+    }
+
+    fn usage(&self) -> MutexGuard<'_, UsageQueue> {
+        lock(&self.usage)
+    }
+
+    /// Queues secondary-call usage rows (titles, compaction, profile,
+    /// agency) for the next flush. The queue holds at most `USAGE_QUEUE_MAX`
+    /// rows: past it the oldest are dropped, with one warning per overflow
+    /// burst (controller ruling 2), logged once the queue's lock is released.
+    pub(crate) fn enqueue_usage(&self, records: Vec<UsageRecord>) {
+        if records.is_empty() {
+            return;
+        }
+        let (dropped, first_of_burst) = {
+            let mut usage = self.usage();
+            for record in records {
+                usage.next_seq += 1;
+                let seq = usage.next_seq;
+                usage.rows.push_back((seq, record));
+            }
+            let excess = usage.rows.len().saturating_sub(self.max_usage);
+            usage.rows.drain(..excess);
+            let first_of_burst = excess > 0 && !usage.overflowing;
+            if excess > 0 {
+                usage.overflowing = true;
+            }
+            (excess, first_of_burst)
+        };
+        if first_of_burst {
+            warn!(
+                dropped,
+                limit = self.max_usage,
+                "the usage queue is full; the oldest usage rows were dropped"
+            );
+        }
+        self.wake.notify_one();
+    }
+
+    /// Usage rows queued and not yet written, oldest first.
+    #[cfg(test)]
+    pub(crate) fn pending_usage(&self) -> Vec<UsageRecord> {
+        self.usage()
+            .rows
+            .iter()
+            .map(|(_, record)| record.clone())
+            .collect()
     }
 
     /// Queues one durable commit's messages. Call only after the control-plane
@@ -333,7 +421,9 @@ impl HistoryService {
         self.write_queue(state, transactions, report).await?;
         self.write_runs(state, transactions, report).await?;
         self.write_approvals(state, transactions, report).await?;
-        self.write_schedule_fires(state, transactions, report).await
+        self.write_schedule_fires(state, transactions, report)
+            .await?;
+        self.write_usage(report).await
     }
 
     /// Writes queued items in order until the queue is empty. Each applied
@@ -397,6 +487,11 @@ impl HistoryService {
     /// Writes terminal runs in batches, read under the control-plane
     /// transaction; `mark_mirrored` skips any record that changed since. Runs
     /// of deleted agents are never saved, so they are never mirrored either.
+    /// Each run's usage rows (one per step, plus any remainder) are derived
+    /// and written first, priced with the overrides read under the same
+    /// hold; both writes are idempotent by id, so a failure of either leaves
+    /// the runs unmirrored and the next flush repeats both. A row the store
+    /// already holds keeps its price (controller ruling 3).
     async fn write_runs(
         &self,
         state: &SharedDaemonState,
@@ -404,16 +499,25 @@ impl HistoryService {
         report: &mut FlushReport,
     ) -> Result<(), HistoryError> {
         loop {
-            let runs = {
+            let (runs, overrides) = {
                 let _transaction = transactions.lock().await;
-                state
-                    .read()
-                    .await
-                    .unmirrored_terminal_runs(HISTORY_RUN_BATCH)
+                let guard = state.read().await;
+                (
+                    guard.unmirrored_terminal_runs(HISTORY_RUN_BATCH),
+                    guard.pricing_overrides.clone(),
+                )
             };
             if runs.is_empty() {
                 return Ok(());
             }
+            let usage = runs
+                .iter()
+                .flat_map(|run| usage_records_for_run(run, &overrides))
+                .collect::<Vec<_>>();
+            for chunk in usage.chunks(HISTORY_USAGE_BATCH) {
+                self.store.upsert_usage(chunk).await?;
+            }
+            report.usage += usage.len();
             self.store.upsert_runs(&runs).await?;
             let marked = state.write().await.runs.mark_mirrored(&runs);
             report.runs += marked;
@@ -478,6 +582,37 @@ impl HistoryService {
             report.fires += removed;
             if removed == 0 || fires.len() < HISTORY_FIRE_BATCH {
                 return Ok(());
+            }
+        }
+    }
+
+    /// Writes the queued secondary-call usage rows in batches. A batch
+    /// leaves the queue only once the store holds it (by sequence, so rows
+    /// an overflow dropped meanwhile are not dropped twice); a failure keeps
+    /// it queued for the next flush.
+    async fn write_usage(&self, report: &mut FlushReport) -> Result<(), HistoryError> {
+        loop {
+            let (through, records) = {
+                let usage = self.usage();
+                let Some((through, _)) = usage.rows.iter().take(HISTORY_USAGE_BATCH).last() else {
+                    return Ok(());
+                };
+                let records = usage
+                    .rows
+                    .iter()
+                    .take(HISTORY_USAGE_BATCH)
+                    .map(|(_, record)| record.clone())
+                    .collect::<Vec<_>>();
+                (*through, records)
+            };
+            self.store.upsert_usage(&records).await?;
+            report.usage += records.len();
+            let mut usage = self.usage();
+            while usage.rows.front().is_some_and(|(seq, _)| *seq <= through) {
+                usage.rows.pop_front();
+            }
+            if usage.rows.len() < self.max_usage {
+                usage.overflowing = false;
             }
         }
     }
@@ -774,7 +909,9 @@ mod tests {
                 approvals: 0,
                 fires: 0,
                 deletions: 0,
-                reconciled: 0
+                reconciled: 0,
+                // The run's one model call.
+                usage: 1
             }
         );
         assert_eq!(history.pending_count(), 0);
@@ -1398,6 +1535,396 @@ mod tests {
             "a deleted agent's fire is dropped, never written"
         );
         assert_eq!(state.read().await.schedule_fires.len(), 0);
+    }
+
+    fn tokens(prompt: u64, completion: u64) -> anima_core::TokenUsage {
+        anima_core::TokenUsage {
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            total_tokens: prompt + completion,
+            ..anima_core::TokenUsage::default()
+        }
+    }
+
+    fn all_usage(agent_id: &str) -> crate::history::UsagePageQuery {
+        crate::history::UsagePageQuery {
+            from_ms: 0,
+            to_ms: u64::MAX,
+            agent_id: Some(agent_id.into()),
+            session_id: None,
+            before: None,
+            limit: 10_000,
+        }
+    }
+
+    /// A finished run of `agent_id` in `chat:one` whose `steps` model calls
+    /// each spent 10 + 2 tokens, saved in the ledger unmirrored.
+    async fn finished_run(
+        state: &SharedDaemonState,
+        agent_id: &str,
+        run_id: &str,
+        provider: &str,
+        model: &str,
+        steps: u64,
+    ) -> crate::runs::RunRecord {
+        let mut run = crate::runs::RunRecord::running(
+            crate::runs::RunStart {
+                agent_id: agent_id.into(),
+                session_id: "chat:one".into(),
+                source: RunSource::Web,
+                source_ref: None,
+                idempotency_key: None,
+                text: "hi".into(),
+                model: model.into(),
+                provider: Some(provider.into()),
+                parent_run_id: None,
+            },
+            1_000,
+        );
+        run.id = run_id.into();
+        run.steps = (1..=steps)
+            .map(|step| crate::runs::RunStepUsage {
+                step_id: format!("{run_id}:{step}"),
+                usage: tokens(10, 2),
+                at_ms: 1_000 + step,
+                duration_ms: 5,
+            })
+            .collect();
+        run.usage = tokens(10 * steps, 2 * steps);
+        run.finish(crate::runs::RunStatus::Completed, None, 2_000);
+        state.write().await.runs.insert(run.clone());
+        run
+    }
+
+    fn secondary_row(id: &str, agent_id: &str, at_ms: u64) -> UsageRecord {
+        crate::usage::usage_record(
+            &crate::usage::UsageCall {
+                id: id.into(),
+                agent_id: agent_id.into(),
+                session_id: Some("chat:one".into()),
+                run_id: None,
+                source: crate::usage::UsageSource::Title,
+                provider: "anthropic".into(),
+                model: "claude-fable-5-1".into(),
+                duration_ms: 1,
+                created_at_ms: at_ms,
+            },
+            &tokens(1, 1),
+            &[],
+        )
+    }
+
+    fn ids(rows: &[UsageRecord]) -> Vec<String> {
+        let mut ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
+        ids.sort();
+        ids
+    }
+
+    #[tokio::test]
+    async fn mirroring_a_run_writes_one_usage_row_per_step() {
+        let store = Arc::new(MemoryHistoryStore::new());
+        let (state, coordinator, agent_id) = state_with(HistoryService::new(store.clone())).await;
+        let transactions = coordinator.control_plane_transactions();
+        finished_run(
+            &state,
+            &agent_id,
+            "run_a",
+            "anthropic",
+            "claude-fable-5-1",
+            2,
+        )
+        .await;
+        let history = state.read().await.history.clone();
+
+        let report = history
+            .flush_once(&state, &transactions, now_millis())
+            .await
+            .unwrap();
+
+        assert_eq!((report.runs, report.usage), (1, 2));
+        let rows = store.page_usage(&all_usage(&agent_id)).await.unwrap();
+        assert_eq!(ids(&rows), ["run_a:1", "run_a:2"]);
+        for row in &rows {
+            assert_eq!(row.session_id.as_deref(), Some("chat:one"));
+            assert_eq!(row.run_id.as_deref(), Some("run_a"));
+            assert_eq!(row.source, crate::usage::UsageSource::Chat);
+            assert_eq!(row.total_tokens, 12);
+            assert_eq!(row.pricing_source, crate::usage::PricingSource::Table);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_remirrored_run_does_not_duplicate_usage() {
+        let store = Arc::new(MemoryHistoryStore::new());
+        let (state, coordinator, agent_id) = state_with(HistoryService::new(store.clone())).await;
+        let transactions = coordinator.control_plane_transactions();
+        finished_run(
+            &state,
+            &agent_id,
+            "run_a",
+            "anthropic",
+            "claude-fable-5-1",
+            2,
+        )
+        .await;
+        let history = state.read().await.history.clone();
+        history
+            .flush_once(&state, &transactions, now_millis())
+            .await
+            .unwrap();
+
+        // A restart re-mirrors a run whose mirrored mark was not saved.
+        state.write().await.runs.get_mut("run_a").unwrap().mirrored = false;
+        let report = history
+            .flush_once(&state, &transactions, now_millis())
+            .await
+            .unwrap();
+
+        assert_eq!((report.runs, report.usage), (1, 2));
+        assert_eq!(
+            store.page_usage(&all_usage(&agent_id)).await.unwrap().len(),
+            2,
+            "the same ids are upserted, not added"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_usage_write_keeps_the_run_unmirrored_and_a_retry_succeeds() {
+        let store = Arc::new(FlakyHistoryStore::new());
+        let (state, coordinator, agent_id) = state_with(HistoryService::new(store.clone())).await;
+        let transactions = coordinator.control_plane_transactions();
+        finished_run(
+            &state,
+            &agent_id,
+            "run_a",
+            "anthropic",
+            "claude-fable-5-1",
+            2,
+        )
+        .await;
+        let history = state.read().await.history.clone();
+        store.set_usage_failing(true);
+
+        assert!(history
+            .flush_once(&state, &transactions, now_millis())
+            .await
+            .is_err());
+        assert_eq!(state.read().await.unmirrored_terminal_runs(10).len(), 1);
+        assert!(store.get_run("run_a").await.unwrap().is_none());
+
+        store.set_usage_failing(false);
+        let report = history
+            .flush_once(&state, &transactions, now_millis())
+            .await
+            .unwrap();
+        assert_eq!((report.runs, report.usage), (1, 2));
+        assert!(state.read().await.unmirrored_terminal_runs(10).is_empty());
+        assert!(store.get_run("run_a").await.unwrap().is_some());
+        assert_eq!(
+            store.page_usage(&all_usage(&agent_id)).await.unwrap().len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn secondary_usage_flushes_in_batches_of_500() {
+        let store = Arc::new(FlakyHistoryStore::new());
+        let (state, coordinator, agent_id) = state_with(HistoryService::new(store.clone())).await;
+        let transactions = coordinator.control_plane_transactions();
+        let history = state.read().await.history.clone();
+        history.enqueue_usage(
+            (0..1_201)
+                .map(|index| secondary_row(&format!("usage_{index:04}"), &agent_id, 10 + index))
+                .collect(),
+        );
+        assert_eq!(history.pending_usage().len(), 1_201);
+
+        let report = history
+            .flush_once(&state, &transactions, now_millis())
+            .await
+            .unwrap();
+
+        assert_eq!(report.usage, 1_201);
+        assert_eq!(store.usage_batches(), [500, 500, 201]);
+        assert!(history.pending_usage().is_empty());
+        assert_eq!(
+            store.page_usage(&all_usage(&agent_id)).await.unwrap().len(),
+            1_201
+        );
+    }
+
+    #[tokio::test]
+    async fn the_usage_queue_drops_the_oldest_past_its_bound() {
+        let store = Arc::new(FlakyHistoryStore::new());
+        let history = HistoryService::with_usage_capacity(store.clone(), 3);
+        let mut daemon = DaemonState::new();
+        daemon.set_history(Arc::clone(&history));
+        let state = Arc::new(RwLock::new(daemon));
+        let transactions = Mutex::new(());
+        history.enqueue_usage(vec![
+            secondary_row("usage_1", "agent-1", 1),
+            secondary_row("usage_2", "agent-1", 2),
+        ]);
+        history.enqueue_usage(vec![
+            secondary_row("usage_3", "agent-1", 3),
+            secondary_row("usage_4", "agent-1", 4),
+            secondary_row("usage_5", "agent-1", 5),
+        ]);
+        assert_eq!(
+            ids(&history.pending_usage()),
+            ["usage_3", "usage_4", "usage_5"]
+        );
+
+        store.set_usage_failing(true);
+        assert!(history
+            .flush_once(&state, &transactions, now_millis())
+            .await
+            .is_err());
+        assert_eq!(
+            history.pending_usage().len(),
+            3,
+            "a failed write keeps the rows queued"
+        );
+
+        store.set_usage_failing(false);
+        let report = history
+            .flush_once(&state, &transactions, now_millis())
+            .await
+            .unwrap();
+        assert_eq!(report.usage, 3);
+        assert_eq!(
+            ids(&store.page_usage(&all_usage("agent-1")).await.unwrap()),
+            ["usage_3", "usage_4", "usage_5"]
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_rows_survive_deleting_the_session_and_the_agent() {
+        let store = Arc::new(MemoryHistoryStore::new());
+        let (state, coordinator, agent_id) = state_with(HistoryService::new(store.clone())).await;
+        let transactions = coordinator.control_plane_transactions();
+        finished_run(
+            &state,
+            &agent_id,
+            "run_a",
+            "anthropic",
+            "claude-fable-5-1",
+            2,
+        )
+        .await;
+        let history = state.read().await.history.clone();
+        history.enqueue_usage(vec![secondary_row("usage_title", &agent_id, 3_000)]);
+        history
+            .flush_once(&state, &transactions, now_millis())
+            .await
+            .unwrap();
+        assert_eq!(
+            store.page_usage(&all_usage(&agent_id)).await.unwrap().len(),
+            3
+        );
+
+        history.enqueue_session_deletion(&agent_id, "chat:one");
+        let report = history
+            .flush_once(&state, &transactions, now_millis())
+            .await
+            .unwrap();
+        assert_eq!(report.deletions, 1);
+        history.enqueue_agent_deletion(&agent_id);
+        let report = history
+            .flush_once(&state, &transactions, now_millis())
+            .await
+            .unwrap();
+        assert_eq!(report.deletions, 1);
+
+        assert_eq!(
+            store.page_usage(&all_usage(&agent_id)).await.unwrap().len(),
+            3,
+            "usage outlives its session and its agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_rows_use_the_overrides_at_mirror_time() {
+        let store = Arc::new(MemoryHistoryStore::new());
+        let (state, coordinator, agent_id) = state_with(HistoryService::new(store.clone())).await;
+        let transactions = coordinator.control_plane_transactions();
+        let run = finished_run(&state, &agent_id, "run_a", "openai", "gpt-x-1", 1).await;
+        let at_mirror = vec![crate::usage::PricingOverride {
+            provider: "openai".into(),
+            model: "gpt-x".into(),
+            input_micros_per_mtok: 1_000_000,
+            output_micros_per_mtok: 4_000_000,
+            cached_input_micros_per_mtok: None,
+        }];
+        // Set after the run ended and before its mirror: the mirror prices.
+        state.write().await.set_pricing_overrides(at_mirror.clone());
+        let history = state.read().await.history.clone();
+        history
+            .flush_once(&state, &transactions, now_millis())
+            .await
+            .unwrap();
+        let expected =
+            crate::usage::price_call("openai", "gpt-x-1", &run.steps[0].usage, &at_mirror).0;
+        let stored = store.page_usage(&all_usage(&agent_id)).await.unwrap();
+        assert_eq!(
+            stored[0].pricing_source,
+            crate::usage::PricingSource::Override
+        );
+        assert_eq!(stored[0].cost_micros, expected);
+        assert_eq!(expected, Some(10 + 8));
+
+        // Controller ruling 3: a re-mirror under other prices keeps the cost.
+        state
+            .write()
+            .await
+            .set_pricing_overrides(vec![crate::usage::PricingOverride {
+                input_micros_per_mtok: 9_000_000,
+                ..at_mirror[0].clone()
+            }]);
+        state.write().await.runs.get_mut("run_a").unwrap().mirrored = false;
+        history
+            .flush_once(&state, &transactions, now_millis())
+            .await
+            .unwrap();
+        let again = store.page_usage(&all_usage(&agent_id)).await.unwrap();
+        assert_eq!(again[0].cost_micros, expected);
+    }
+
+    #[tokio::test]
+    async fn steps_past_the_cap_add_one_remainder_row() {
+        let store = Arc::new(MemoryHistoryStore::new());
+        let (state, coordinator, agent_id) = state_with(HistoryService::new(store.clone())).await;
+        let transactions = coordinator.control_plane_transactions();
+        let steps = crate::runs::MAX_RUN_STEPS as u64;
+        let mut run = finished_run(
+            &state,
+            &agent_id,
+            "run_a",
+            "anthropic",
+            "claude-fable-5-1",
+            steps,
+        )
+        .await;
+        // Three more model calls than the record keeps steps for.
+        run.usage = tokens(10 * (steps + 3), 2 * (steps + 3));
+        state.write().await.runs.insert(run.clone());
+        let history = state.read().await.history.clone();
+
+        let report = history
+            .flush_once(&state, &transactions, now_millis())
+            .await
+            .unwrap();
+
+        assert_eq!(report.usage, crate::runs::MAX_RUN_STEPS + 1);
+        let rows = store.page_usage(&all_usage(&agent_id)).await.unwrap();
+        assert_eq!(rows.len(), crate::runs::MAX_RUN_STEPS + 1);
+        let rest = rows.iter().find(|row| row.id == "run_a:rest").unwrap();
+        assert_eq!(rest.total_tokens, 36);
+        assert_eq!(
+            rows.iter().map(|row| row.total_tokens).sum::<u64>(),
+            run.usage.total_tokens,
+            "the rows add up to the run"
+        );
     }
 
     // The hand-simulated agent-delete test that used to live here (Task 12) is

@@ -17,6 +17,8 @@ use crate::tools::{
     canonical_workspace_root, normalized_relative_path, resolve_workspace_write_path,
     workspace_root_path, ToolRegistry,
 };
+use crate::usage::metered::{record_secondary, Metered, SecondaryCall, USAGE_NO_AGENT};
+use crate::usage::UsageSource;
 
 const TEAM_MIN: u64 = 2;
 const TEAM_MAX: u64 = 10;
@@ -427,8 +429,7 @@ async fn generate_agency_from_prepared(
         max_tokens: None,
     };
 
-    let response = adapter
-        .generate(&agent_config, &request)
+    let response = generate_metered(state, adapter, &agent_config, &request)
         .await
         .map_err(|message| ApiError::bad_request(format!("model error: {message}")))?;
 
@@ -679,12 +680,26 @@ async fn generate_seed_memories(
         max_tokens: None,
     };
 
-    let response = adapter
-        .generate(&agent_config, &request)
+    let response = generate_metered(state, adapter, &agent_config, &request)
         .await
         .map_err(|message| ApiError::bad_request(format!("seed model error: {message}")))?;
 
     parse_seed_payload(&response.content.text, &agency.agents)
+}
+
+/// One agency generation call, its usage recorded as the system's (an
+/// agency request names no agent; spec §11).
+async fn generate_metered(
+    state: &SharedDaemonState,
+    adapter: Arc<dyn ModelAdapter>,
+    config: &AgentConfig,
+    request: &ModelGenerateRequest,
+) -> Result<anima_core::ModelGenerateResponse, String> {
+    let meter = Metered::new(adapter);
+    let response = meter.generate(config, request).await;
+    let call = SecondaryCall::for_config(USAGE_NO_AGENT, None, UsageSource::Agency, config);
+    record_secondary(state, &meter, call).await;
+    response
 }
 
 fn build_seed_prompt(agency: &AgencyGenerateResponse) -> String {
@@ -2099,5 +2114,82 @@ agents:
         let result = load_agency_yaml(&path);
         assert!(result.is_err());
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Answers each `generate` with the next scripted text.
+    struct TwoReplies(std::sync::Mutex<Vec<&'static str>>);
+
+    #[async_trait::async_trait]
+    impl anima_core::ModelAdapter for TwoReplies {
+        fn provider(&self) -> &str {
+            "scripted"
+        }
+
+        async fn generate(
+            &self,
+            _config: &anima_core::AgentConfig,
+            _request: &anima_core::ModelGenerateRequest,
+        ) -> Result<anima_core::ModelGenerateResponse, String> {
+            let text = self.0.lock().unwrap().remove(0);
+            Ok(anima_core::ModelGenerateResponse {
+                content: anima_core::Content {
+                    text: text.into(),
+                    ..anima_core::Content::default()
+                },
+                tool_calls: None,
+                usage: anima_core::TokenUsage {
+                    prompt_tokens: 100,
+                    completion_tokens: 50,
+                    total_tokens: 150,
+                    ..anima_core::TokenUsage::default()
+                },
+                stop_reason: anima_core::ModelStopReason::End,
+            })
+        }
+    }
+
+    /// M8 Task 4: the team generation and the seed memories are one
+    /// `agency` row each, for no agent.
+    #[tokio::test]
+    async fn agency_generation_records_usage_for_the_team_and_the_seed_memories() {
+        let adapter = TwoReplies(std::sync::Mutex::new(vec![
+            r#"{"agents": [{"name": "Lead", "role": "orchestrator"}, {"name": "Writer", "role": "worker"}]}"#,
+            r#"{"seeds": []}"#,
+        ]));
+        let state: crate::app::SharedDaemonState = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::state::DaemonState::with_model_adapter(std::sync::Arc::new(adapter)),
+        ));
+        let prepared = super::prepare_generate_request(
+            serde_json::from_value(json!({
+                "name": "Studio",
+                "description": "Make videos",
+                "teamSize": 2,
+                "provider": "anthropic",
+                "model": "claude-fable-5-1"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let agency = super::generate_agency_from_prepared(prepared.clone(), &state)
+            .await
+            .unwrap();
+        super::generate_seed_memories(&prepared, &agency, &state)
+            .await
+            .unwrap();
+
+        let rows = state.read().await.history.pending_usage();
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            assert_eq!(row.source, crate::usage::UsageSource::Agency);
+            assert_eq!(row.agent_id, crate::usage::metered::USAGE_NO_AGENT);
+            assert_eq!(row.session_id, None);
+            assert_eq!(
+                (row.provider.as_str(), row.model.as_str()),
+                ("anthropic", "claude-fable-5-1")
+            );
+            assert_eq!(row.total_tokens, 150);
+            assert!(row.cost_micros.is_some(), "a table model is priced");
+        }
     }
 }

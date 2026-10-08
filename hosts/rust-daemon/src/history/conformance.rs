@@ -1115,6 +1115,10 @@ pub(crate) struct FlakyHistoryStore {
     /// `get_message` (or the hot tail) through a `before` lookup and then
     /// fail just the page read that follows it.
     page_messages_failing: AtomicBool,
+    /// Fails only `upsert_usage`, independent of `failing`.
+    usage_failing: AtomicBool,
+    /// The size of every `upsert_usage` batch that reached the store.
+    usage_batches: Mutex<Vec<usize>>,
     panic_on_write: AtomicBool,
     existence_gate: Mutex<Option<StoreGate>>,
 }
@@ -1133,6 +1137,8 @@ impl FlakyHistoryStore {
             inner: MemoryHistoryStore::new(),
             failing: AtomicBool::new(false),
             page_messages_failing: AtomicBool::new(false),
+            usage_failing: AtomicBool::new(false),
+            usage_batches: Mutex::new(Vec::new()),
             panic_on_write: AtomicBool::new(false),
             existence_gate: Mutex::new(None),
         }
@@ -1145,6 +1151,19 @@ impl FlakyHistoryStore {
     /// Fails only `page_messages` calls, leaving every other method healthy.
     pub(crate) fn set_page_messages_failing(&self, failing: bool) {
         self.page_messages_failing.store(failing, Ordering::SeqCst);
+    }
+
+    /// Fails only `upsert_usage` calls, leaving every other method healthy.
+    pub(crate) fn set_usage_failing(&self, failing: bool) {
+        self.usage_failing.store(failing, Ordering::SeqCst);
+    }
+
+    /// The size of each `upsert_usage` batch written so far, oldest first.
+    pub(crate) fn usage_batches(&self) -> Vec<usize> {
+        self.usage_batches
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// Makes the next `upsert_messages` call panic.
@@ -1234,7 +1253,15 @@ impl HistoryStore for FlakyHistoryStore {
 
     async fn upsert_usage(&self, records: &[UsageRecord]) -> Result<(), HistoryError> {
         self.check()?;
-        self.inner.upsert_usage(records).await
+        if self.usage_failing.load(Ordering::SeqCst) {
+            return Err(HistoryError::new("injected usage write failure"));
+        }
+        self.inner.upsert_usage(records).await?;
+        self.usage_batches
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(records.len());
+        Ok(())
     }
 
     async fn page_usage(&self, query: &UsagePageQuery) -> Result<Vec<UsageRecord>, HistoryError> {
