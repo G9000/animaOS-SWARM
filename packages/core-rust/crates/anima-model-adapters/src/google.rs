@@ -249,21 +249,10 @@ pub(super) fn parse_google_response(payload: &Value) -> Result<ModelGenerateResp
         ModelStopReason::End
     };
 
-    let usage = if let Some(usage) = payload.get("usageMetadata") {
-        let prompt = value_to_u64(usage.get("promptTokenCount"))
-            + value_to_u64(usage.get("toolUsePromptTokenCount"));
-        let thoughts = value_to_u64(usage.get("thoughtsTokenCount"));
-        let completion = value_to_u64(usage.get("candidatesTokenCount")) + thoughts;
-        TokenUsage {
-            prompt_tokens: prompt,
-            completion_tokens: completion,
-            total_tokens: prompt + completion,
-            cached_prompt_tokens: value_to_u64(usage.get("cachedContentTokenCount")),
-            reasoning_tokens: thoughts,
-        }
-    } else {
-        TokenUsage::default()
-    };
+    let usage = payload
+        .get("usageMetadata")
+        .map(google_usage)
+        .unwrap_or_default();
 
     Ok(ModelGenerateResponse {
         content: Content {
@@ -282,6 +271,21 @@ pub(super) fn parse_google_response(payload: &Value) -> Result<ModelGenerateResp
         usage,
         stop_reason,
     })
+}
+
+/// Usage from a `usageMetadata` object; thought tokens count as completion tokens.
+fn google_usage(usage: &Value) -> TokenUsage {
+    let prompt = value_to_u64(usage.get("promptTokenCount"))
+        + value_to_u64(usage.get("toolUsePromptTokenCount"));
+    let thoughts = value_to_u64(usage.get("thoughtsTokenCount"));
+    let completion = value_to_u64(usage.get("candidatesTokenCount")) + thoughts;
+    TokenUsage {
+        prompt_tokens: prompt,
+        completion_tokens: completion,
+        total_tokens: prompt + completion,
+        cached_prompt_tokens: value_to_u64(usage.get("cachedContentTokenCount")),
+        reasoning_tokens: thoughts,
+    }
 }
 
 /// A response with no candidate names Google's `promptFeedback.blockReason` when it
@@ -361,6 +365,14 @@ impl GoogleStreamAccumulator {
             self.parts.push(part.clone());
         }
         Ok((!delta.is_empty()).then_some(delta))
+    }
+
+    /// The usage the stream reported so far; `None` until a nonzero total.
+    pub(crate) fn running_usage(&self) -> Option<TokenUsage> {
+        self.usage
+            .as_ref()
+            .map(google_usage)
+            .filter(|usage| usage.total_tokens > 0)
     }
 
     /// The whole response, parsed like a non-streamed one. A candidate's

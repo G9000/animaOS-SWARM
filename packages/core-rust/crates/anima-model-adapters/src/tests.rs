@@ -94,7 +94,7 @@ async fn openai_compatible_stream_normalizes_ordered_deltas_and_final_response()
         .await
         .unwrap();
 
-    let frames = sink.0.lock().unwrap().clone();
+    let frames = without_usage(sink.0.lock().unwrap().clone());
     assert_eq!(frames[0], ModelStreamFrame::TextDelta("hello ".into()));
     assert_eq!(frames[1], ModelStreamFrame::TextDelta("world".into()));
     let ModelStreamFrame::Final(response) = &frames[2] else {
@@ -145,7 +145,7 @@ async fn anthropic_stream_normalizes_ordered_deltas_and_final_response() {
         .await
         .unwrap();
 
-    let frames = sink.0.lock().unwrap().clone();
+    let frames = without_usage(sink.0.lock().unwrap().clone());
     assert_eq!(frames[0], ModelStreamFrame::TextDelta("hi ".into()));
     assert_eq!(frames[1], ModelStreamFrame::TextDelta("there".into()));
     let ModelStreamFrame::Final(response) = &frames[2] else {
@@ -1389,7 +1389,7 @@ async fn google_streams_text_deltas_and_keeps_raw_parts_for_replay() {
         .await
         .unwrap();
 
-    let frames = sink.0.lock().unwrap().clone();
+    let frames = without_usage(sink.0.lock().unwrap().clone());
     assert_eq!(frames[0], ModelStreamFrame::TextDelta("Hel".into()));
     assert_eq!(frames[1], ModelStreamFrame::TextDelta("lo".into()));
     let ModelStreamFrame::Final(response) = &frames[2] else {
@@ -2023,7 +2023,10 @@ async fn an_anthropic_stream_without_message_stop_is_incomplete() {
         result.unwrap_err(),
         "Anthropic stream ended before it was done"
     );
-    assert_eq!(frames, vec![ModelStreamFrame::TextDelta("Half".into())]);
+    assert_eq!(
+        without_usage(frames),
+        vec![ModelStreamFrame::TextDelta("Half".into())]
+    );
 }
 
 #[tokio::test]
@@ -2045,7 +2048,10 @@ async fn a_google_stream_error_payload_fails_the_call() {
         result.unwrap_err(),
         "Google stream failed: INTERNAL: An internal error has occurred."
     );
-    assert_eq!(frames, vec![ModelStreamFrame::TextDelta("Half".into())]);
+    assert_eq!(
+        without_usage(frames),
+        vec![ModelStreamFrame::TextDelta("Half".into())]
+    );
 }
 
 #[tokio::test]
@@ -2061,7 +2067,7 @@ async fn a_google_stream_without_any_candidate_fails() {
     )
     .await;
     assert_eq!(result.unwrap_err(), "Google blocked the prompt: SAFETY");
-    assert!(frames.is_empty());
+    assert!(without_usage(frames).is_empty());
 
     let empty = sse_server(
         "/v1beta/models/gemini-2.0-flash:streamGenerateContent",
@@ -2102,7 +2108,10 @@ async fn a_google_stream_without_a_finish_reason_is_incomplete() {
         result.unwrap_err(),
         "Google stream ended before it was done"
     );
-    assert_eq!(frames, vec![ModelStreamFrame::TextDelta("Half".into())]);
+    assert_eq!(
+        without_usage(frames),
+        vec![ModelStreamFrame::TextDelta("Half".into())]
+    );
 }
 
 #[tokio::test]
@@ -2373,4 +2382,179 @@ fn google_calls_without_ids_get_unique_ids_per_response() {
         ids,
         vec!["call_delegate_task_0", "call_delegate_task_1", "given-id"]
     );
+}
+
+fn usage_frames(frames: &[ModelStreamFrame]) -> Vec<anima_core::TokenUsage> {
+    frames
+        .iter()
+        .filter_map(|frame| match frame {
+            ModelStreamFrame::Usage(usage) => Some(usage.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn without_usage(frames: Vec<ModelStreamFrame>) -> Vec<ModelStreamFrame> {
+    frames
+        .into_iter()
+        .filter(|frame| !matches!(frame, ModelStreamFrame::Usage(_)))
+        .collect()
+}
+
+#[tokio::test]
+async fn anthropic_stream_emits_usage_after_message_start() {
+    let app = Router::new().route(
+        "/v1/messages",
+        post(|| async {
+            (
+                [("content-type", "text/event-stream")],
+                concat!(
+                    "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3,\"cache_read_input_tokens\":40,\"cache_creation_input_tokens\":2}}}\n\n",
+                    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+                    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":6}}\n\n",
+                    "data: {\"type\":\"message_stop\"}\n\n"
+                ),
+            )
+        }),
+    );
+    let base_url = spawn_server(app).await;
+    let adapter = adapter_with(&[("anthropic", Some("key"), &base_url)]);
+    let sink = FrameSink(Mutex::new(Vec::new()));
+
+    adapter
+        .stream(&agent_config("anthropic", false), &request(), &sink)
+        .await
+        .unwrap();
+
+    let frames = sink.0.lock().unwrap().clone();
+    let ModelStreamFrame::Usage(first) = &frames[0] else {
+        panic!("the prompt tokens are reported before the first delta: {frames:?}")
+    };
+    assert_eq!(first.prompt_tokens, 45);
+    assert_eq!(first.cached_prompt_tokens, 40);
+    assert_eq!(first.completion_tokens, 0);
+    assert_eq!(first.total_tokens, 45);
+    assert_eq!(frames[1], ModelStreamFrame::TextDelta("ok".into()));
+    let Some(ModelStreamFrame::Final(response)) = frames.last() else {
+        panic!("expected final response")
+    };
+    assert_eq!(response.usage.prompt_tokens, 45);
+    assert_eq!(response.usage.completion_tokens, 6);
+    assert_eq!(response.usage.total_tokens, 51);
+    assert_eq!(usage_frames(&frames).len(), 2);
+}
+
+#[tokio::test]
+async fn google_stream_emits_usage_when_it_changes_only() {
+    let app = Router::new().route(
+        "/v1beta/models/gemini-2.0-flash:streamGenerateContent",
+        post(|| async {
+            (
+                [("content-type", "text/event-stream")],
+                concat!(
+                    "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Hel\"}]}}],\"usageMetadata\":{\"promptTokenCount\":4,\"totalTokenCount\":4}}\n\n",
+                    "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"l\"}]}}],\"usageMetadata\":{\"promptTokenCount\":4,\"totalTokenCount\":4}}\n\n",
+                    "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"o\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":4,\"candidatesTokenCount\":2,\"totalTokenCount\":6}}\n\n"
+                ),
+            )
+        }),
+    );
+    let base_url = spawn_server(app).await;
+    let adapter = adapter_with(&[("google", Some("key"), &base_url)]);
+    let sink = FrameSink(Mutex::new(Vec::new()));
+
+    adapter
+        .stream(&google_config(false), &request(), &sink)
+        .await
+        .unwrap();
+
+    let frames = sink.0.lock().unwrap().clone();
+    let reported = usage_frames(&frames);
+    assert_eq!(reported.len(), 2);
+    assert_eq!(reported[0].prompt_tokens, 4);
+    assert_eq!(reported[0].total_tokens, 4);
+    assert_eq!(reported[1].completion_tokens, 2);
+    assert_eq!(reported[1].total_tokens, 6);
+    assert!(matches!(frames.last(), Some(ModelStreamFrame::Final(_))));
+}
+
+#[tokio::test]
+async fn openai_compatible_final_chunk_usage_emits_no_early_frame() {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            (
+                [("content-type", "text/event-stream")],
+                concat!(
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"o\"}}],\"usage\":null}\n\n",
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"k\"},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n",
+                    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":6,\"total_tokens\":16}}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+            )
+        }),
+    );
+    let base_url = spawn_server(app).await;
+    let adapter = adapter_with(&[("vllm", Some("key"), &format!("{base_url}/v1"))]);
+    let sink = FrameSink(Mutex::new(Vec::new()));
+
+    adapter
+        .stream(&agent_config("vllm", false), &request(), &sink)
+        .await
+        .unwrap();
+
+    let frames = sink.0.lock().unwrap().clone();
+    let last_delta = frames
+        .iter()
+        .rposition(|frame| matches!(frame, ModelStreamFrame::TextDelta(_)))
+        .unwrap();
+    let first_usage = frames
+        .iter()
+        .position(|frame| matches!(frame, ModelStreamFrame::Usage(_)))
+        .expect("the usage of the last chunk still arrives, just before the final response");
+    assert!(
+        first_usage > last_delta,
+        "no usage is known while the text streams: {frames:?}"
+    );
+}
+
+#[tokio::test]
+async fn usage_frames_do_not_change_the_final_response() {
+    let app = Router::new().route(
+        "/v1/messages",
+        post(|| async {
+            (
+                [("content-type", "text/event-stream")],
+                concat!(
+                    "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":9}}}\n\n",
+                    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+                    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":4}}\n\n",
+                    "data: {\"type\":\"message_stop\"}\n\n"
+                ),
+            )
+        }),
+    );
+    let base_url = spawn_server(app).await;
+    let adapter = adapter_with(&[("anthropic", Some("key"), &base_url)]);
+    let sink = FrameSink(Mutex::new(Vec::new()));
+    adapter
+        .stream(&agent_config("anthropic", false), &request(), &sink)
+        .await
+        .unwrap();
+
+    let frames = sink.0.lock().unwrap().clone();
+    assert!(!usage_frames(&frames).is_empty());
+    let Some(ModelStreamFrame::Final(response)) = frames.last() else {
+        panic!("expected final response")
+    };
+    assert_eq!(response.content.text, "hi");
+    assert_eq!(response.usage.prompt_tokens, 9);
+    assert_eq!(response.usage.completion_tokens, 4);
+    assert_eq!(response.usage.total_tokens, 13);
+    assert_eq!(
+        usage_frames(&frames).last().map(|usage| usage.total_tokens),
+        Some(13),
+        "the last partial frame matches the final usage"
+    );
+    assert_eq!(without_usage(frames).len(), 2, "one delta and the final");
 }

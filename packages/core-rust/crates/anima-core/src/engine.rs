@@ -3185,6 +3185,7 @@ impl<L: EngineLiveEventSink> ModelStreamSink for EngineModelSink<'_, L> {
                     })
                     .await;
             }
+            ModelStreamFrame::Usage(_) => {}
             ModelStreamFrame::Final(response) => {
                 let mut final_response = self
                     .final_response
