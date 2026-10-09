@@ -34,6 +34,8 @@ import { ApprovalsPage } from './pages/ApprovalsPage';
 import { AutomationsPage } from './pages/AutomationsPage';
 import { MemoryPage } from './pages/MemoryPage';
 import { SkillsPage } from './pages/SkillsPage';
+import { HealthPage } from './pages/HealthPage';
+import { LogsPage } from './pages/LogsPage';
 import { UsagePage } from './pages/UsagePage';
 import {
   SESSION_MESSAGES_LIVE_POLL_MS,
@@ -1330,6 +1332,13 @@ export function ViewHarness() {
                   ? conversationRoute.sessionId
                   : null
               }
+            />
+          }
+          logs={<LogsPage online={connection === 'online'} />}
+          health={
+            <HealthPage
+              online={connection === 'online'}
+              epoch={live.state.epoch}
             />
           }
           skills={

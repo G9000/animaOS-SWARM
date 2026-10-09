@@ -19,6 +19,8 @@ import {
   type AutomationTrigger,
   type HeartbeatInput,
   type MemoryFactOptions,
+  type LogLevel,
+  type LogsQuery,
   type MemoryPatch,
   type PricingOverride,
   type RelationshipEndpointKind,
@@ -459,6 +461,15 @@ export const daemon = {
   usagePricing: () => setupClient.usage.pricing(),
   setUsagePricing: (overrides: PricingOverride[]) =>
     setupClient.usage.setPricing(overrides),
+  /** Logs and health (spec §11.2, §11.3, §15.4). */
+  logs: (query: LogsQuery) => setupClient.logs.list(query),
+  logStream: (options: {
+    level?: LogLevel;
+    q?: string;
+    after?: number;
+    signal?: AbortSignal;
+  }) => setupClient.logs.stream(options),
+  status: () => setupClient.status.get(),
   /** Automations (spec §9.2, §15.4). */
   listAutomations: (agentId: string, options: { signal?: AbortSignal } = {}) =>
     setupClient.automations.list(agentId, options),

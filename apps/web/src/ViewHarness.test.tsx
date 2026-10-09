@@ -41,6 +41,7 @@ import { automationFixture } from './test/automations';
 import { memoryFixture } from './test/memory';
 import { sessionFixture } from './test/sessions';
 import { skillFixture } from './test/skills';
+import { logLineFixture, statusFixture } from './test/system';
 import { groupFixture, summaryFixture, totalsFixture } from './test/usage';
 import {
   approvalEvent,
@@ -2158,15 +2159,15 @@ it('stays in a session opened while the first send was creating its chat', async
   expect(screen.getByText('Earlier answer')).toBeVisible();
 });
 
-it('opens the new session on a page that still shows the conversation', async () => {
+it('opens the new session on the conversation so a reload finds it', async () => {
   const user = userEvent.setup();
   vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
   vi.spyOn(daemon, 'listAgents').mockResolvedValue({
     agents: [snapshot('agent-main', 'Nova', 1)],
   });
   mockProviders();
-  // Logs arrives in a later release; until then it shows the chat.
-  window.history.replaceState(null, '', '/#/logs');
+  // Every page is built now, so only the home route shows the chat.
+  window.history.replaceState(null, '', '/#/');
   render(<ViewHarness />);
 
   await user.type(await screen.findByPlaceholderText('Message Nova…'), 'Hello');
@@ -2238,6 +2239,43 @@ it('shows the companion’s usage at #/usage', async () => {
   expect(daemon.usageSummary).toHaveBeenCalledWith(
     expect.objectContaining({ agentId: 'agent-main', groupBy: 'day' }),
   );
+});
+
+it('#/logs and #/health show their pages', async () => {
+  vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+  vi.spyOn(daemon, 'listAgents').mockResolvedValue({
+    agents: [snapshot('agent-main', 'Nova', 1)],
+  });
+  mockProviders();
+  vi.spyOn(daemon, 'logs').mockResolvedValue({
+    lines: [logLineFixture(1, { message: 'Daemon is listening' })],
+    newestSeq: 1,
+  });
+  vi.spyOn(daemon, 'logStream').mockImplementation(async function* (options) {
+    await new Promise<void>((resolve) =>
+      options.signal?.addEventListener('abort', () => resolve(), {
+        once: true,
+      }),
+    );
+  });
+  vi.spyOn(daemon, 'status').mockResolvedValue(statusFixture());
+  window.history.replaceState(null, '', '/#/logs');
+  render(<ViewHarness />);
+
+  expect(await screen.findByText('Daemon is listening')).toBeVisible();
+  expect(
+    screen.getByRole('heading', { name: 'What the daemon is saying' }),
+  ).toBeVisible();
+
+  window.history.replaceState(null, '', '/#/health');
+  act(() => {
+    window.dispatchEvent(new HashChangeEvent('hashchange'));
+  });
+  expect(
+    await screen.findByRole('heading', { name: 'How the daemon is doing' }),
+  ).toBeVisible();
+  expect(await screen.findByText('Version 0.9.1')).toBeVisible();
+  expect(daemon.status).toHaveBeenCalled();
 });
 
 it('keeps a page open when the first send creates its session, then returns to that session', async () => {

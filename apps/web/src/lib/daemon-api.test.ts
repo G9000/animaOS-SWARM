@@ -818,3 +818,46 @@ describe('daemon usage requests', () => {
     ]);
   });
 });
+
+describe('daemon logs and status requests', () => {
+  it('lists logs, opens the stream, and reads the status through the SDK routes', async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async (input) => {
+        const url = String(input);
+        if (url.startsWith('/api/logs/stream'))
+          return new Response(
+            'event: log\ndata: {"seq":7,"at":1,"level":"info","target":"t","message":"m"}\n\nevent: resync\ndata: {"newestSeq":9}\n\n',
+            {
+              status: 200,
+              headers: { 'content-type': 'text/event-stream' },
+            },
+          );
+        const body = url.startsWith('/api/logs')
+          ? { lines: [], newestSeq: 0 }
+          : { version: '1' };
+        return new Response(JSON.stringify(body), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await daemon.logs({ level: 'warn', q: 'a b', after: 3, limit: 500 });
+    const events = [];
+    for await (const event of daemon.logStream({ level: 'info', after: 5 }))
+      events.push(event);
+    await daemon.status();
+
+    expect(
+      fetchMock.mock.calls.map(
+        ([url, init]) => `${init?.method ?? 'GET'} ${String(url)}`,
+      ),
+    ).toEqual([
+      'GET /api/logs?level=warn&q=a+b&after=3&limit=500',
+      'GET /api/logs/stream?level=info&after=5',
+      'GET /api/status',
+    ]);
+    expect(events.map((event) => event.kind)).toEqual(['line', 'resync']);
+  });
+});
