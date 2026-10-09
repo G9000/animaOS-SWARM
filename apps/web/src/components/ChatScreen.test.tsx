@@ -126,6 +126,81 @@ describe('MessageList', () => {
     expect(await navigator.clipboard.readText()).toBe('**bold**');
     expect(screen.getByRole('button', { name: 'Copied' })).toBeVisible();
   });
+  it('offers Save to memory on user and assistant messages only when the action is provided', async () => {
+    const user = userEvent.setup();
+    const onSaveToMemory = vi
+      .fn()
+      .mockResolvedValue({ kind: 'saved', shortened: false });
+    const { rerender } = render(
+      <MessageList
+        agent={agent}
+        sending={false}
+        scrollerRef={{ current: null }}
+        onSuggestion={vi.fn()}
+      />,
+    );
+    expect(
+      screen.queryByRole('button', { name: 'Save to memory' }),
+    ).not.toBeInTheDocument();
+
+    rerender(
+      <MessageList
+        agent={agent}
+        sending={false}
+        scrollerRef={{ current: null }}
+        onSuggestion={vi.fn()}
+        actions={{ onSaveToMemory }}
+      />,
+    );
+    // The user and the assistant message, not the system or tool ones.
+    const buttons = screen.getAllByRole('button', { name: 'Save to memory' });
+    expect(buttons).toHaveLength(2);
+
+    await user.click(buttons[1]);
+    expect(onSaveToMemory).toHaveBeenCalledWith(messages[1]);
+    expect(
+      await screen.findByRole('button', { name: '✓ Saved to memory' }),
+    ).toBeDisabled();
+  });
+
+  it('does not offer Save to memory on tool or system messages', () => {
+    render(
+      <MessageList
+        agent={{ ...agent, messages: messages.slice(2) }}
+        sending={false}
+        scrollerRef={{ current: null }}
+        onSuggestion={vi.fn()}
+        actions={{ onSaveToMemory: vi.fn() }}
+      />,
+    );
+    expect(screen.getByText('system · **system marker**')).toBeVisible();
+    expect(
+      screen.queryByRole('button', { name: 'Save to memory' }),
+    ).not.toBeInTheDocument();
+  });
+
+  it('shows a message saved before as saved when its bubble mounts again', () => {
+    render(
+      <MessageList
+        agent={agent}
+        sending={false}
+        scrollerRef={{ current: null }}
+        onSuggestion={vi.fn()}
+        actions={{
+          onSaveToMemory: vi.fn(),
+          savedToMemory: (id) =>
+            id === 'user-message' ? { shortened: false } : null,
+        }}
+      />,
+    );
+    expect(
+      screen.getAllByRole('button', { name: '✓ Saved to memory' }),
+    ).toHaveLength(1);
+    expect(
+      screen.getAllByRole('button', { name: 'Save to memory' }),
+    ).toHaveLength(1);
+  });
+
   it('renders Markdown bubbles, literal event pills, and tool results as cards', async () => {
     const user = userEvent.setup();
     const scrollerRef = { current: null };

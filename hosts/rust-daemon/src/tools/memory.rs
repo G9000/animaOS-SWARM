@@ -6,6 +6,7 @@ use futures::future::BoxFuture;
 use tracing::warn;
 
 use crate::memory_store::MemoryMutation;
+use crate::memory_text::{has_hidden_text, MEMORY_TEXT_HIDDEN};
 
 use super::ToolExecutionContext;
 
@@ -96,6 +97,9 @@ pub(super) fn execute_memory_add(
             Some(DataValue::String(value)) if !value.trim().is_empty() => value.trim().to_string(),
             _ => return TaskResult::error("memory_add content must be a non-empty string", 0),
         };
+        if has_hidden_text(&content) {
+            return TaskResult::error(MEMORY_TEXT_HIDDEN, 0);
+        }
 
         let memory_type =
             match tool_call.args.get("type") {

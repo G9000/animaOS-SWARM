@@ -650,3 +650,62 @@ async fn app_with_config_enforces_max_request_bytes() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(response, "{\"error\":\"malformed request\"}");
 }
+
+const MEMORY_TEXT_HIDDEN_MESSAGE: &str =
+    "Memory text must not contain invisible tag or direction-override characters";
+
+#[tokio::test]
+async fn create_memory_refuses_hidden_text_in_content_and_tags() {
+    let app = test_app();
+    let hidden_content = serde_json::json!({
+        "agentId": "agent-1",
+        "agentName": "researcher",
+        "type": "fact",
+        "content": "looks fine\u{202E}but is not",
+        "importance": 0.8,
+    })
+    .to_string();
+    let hidden_tag = serde_json::json!({
+        "agentId": "agent-1",
+        "agentName": "researcher",
+        "type": "fact",
+        "content": "looks fine",
+        "importance": 0.8,
+        "tags": ["ok", "sneaky\u{E0041}"],
+    })
+    .to_string();
+
+    for body in [hidden_content, hidden_tag] {
+        let (status, response) = send_json_request(&app, "POST", "/api/memories", &body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+        assert_eq!(
+            parse_json_body(&response)["error"].as_str(),
+            Some(MEMORY_TEXT_HIDDEN_MESSAGE)
+        );
+    }
+
+    let (status, recent) = send_empty_request(&app, "GET", "/api/memories/recent").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        recent.contains("\"memories\":[]"),
+        "nothing should be stored: {recent}"
+    );
+}
+
+#[tokio::test]
+async fn create_memory_still_accepts_plain_and_zero_width_text() {
+    let app = test_app();
+    for content in ["plain note", "zero\u{200B}width note"] {
+        let body = serde_json::json!({
+            "agentId": "agent-1",
+            "agentName": "researcher",
+            "type": "fact",
+            "content": content,
+            "importance": 0.8,
+            "tags": ["plain"],
+        })
+        .to_string();
+        let (status, response) = send_json_request(&app, "POST", "/api/memories", &body).await;
+        assert_eq!(status, StatusCode::CREATED, "{response}");
+    }
+}

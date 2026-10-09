@@ -33,6 +33,8 @@ pub enum MemoryError {
     InvalidTemporalStrength,
     InvalidTemporalConfidence,
     InvalidTemporalValidityRange,
+    InvalidMemoryContent,
+    EntityOwnsMemories,
 }
 
 impl MemoryError {
@@ -62,6 +64,8 @@ impl MemoryError {
             Self::InvalidTemporalValidityRange => {
                 "validTo must be greater than or equal to validFrom"
             }
+            Self::InvalidMemoryContent => "content must not be empty",
+            Self::EntityOwnsMemories => "entity still owns memories",
         }
     }
 }

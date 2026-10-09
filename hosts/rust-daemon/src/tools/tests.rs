@@ -1732,3 +1732,76 @@ fn create_temp_workspace(prefix: &str) -> PathBuf {
     fs::create_dir_all(&path).expect("create temp workspace");
     path
 }
+
+#[tokio::test]
+async fn memory_add_refuses_hidden_text_and_stores_nothing() {
+    use crate::memory_text::MEMORY_TEXT_HIDDEN;
+    use anima_core::{AgentConfig, AgentStatus};
+
+    let memory = Arc::new(AsyncRwLock::new(MemoryManager::new()));
+    let context = ToolExecutionContext::new(
+        memory.clone(),
+        Arc::new(AsyncRwLock::new(MemoryEmbeddingRuntime::disabled())),
+        None,
+        ToolRegistry::new(),
+        new_shared_process_manager_with_limit(DEFAULT_MAX_BACKGROUND_PROCESSES),
+        None,
+        None,
+    );
+    let agent = AgentState {
+        id: "agent-memory-add".into(),
+        name: "memory-add".into(),
+        status: AgentStatus::Running,
+        config: AgentConfig {
+            name: "memory-add".into(),
+            model: "deterministic".into(),
+            bio: None,
+            lore: None,
+            knowledge: None,
+            topics: None,
+            adjectives: None,
+            style: None,
+            provider: None,
+            system: None,
+            tools: None,
+            plugins: None,
+            settings: None,
+        },
+        created_at_ms: 1,
+        token_usage: Default::default(),
+    };
+    let user_message = Message {
+        id: "message-memory-add".into(),
+        agent_id: agent.id.clone(),
+        room_id: "room-memory-add".into(),
+        content: Content::default(),
+        role: MessageRole::User,
+        created_at_ms: 1,
+    };
+    let call = |content: &str| ToolCall {
+        id: "memory-add-call".into(),
+        name: "memory_add".into(),
+        args: BTreeMap::from([("content".into(), DataValue::String(content.into()))]),
+    };
+
+    let hidden = super::memory::execute_memory_add(
+        context.clone(),
+        agent.clone(),
+        user_message.clone(),
+        call("remember\u{E0041} this"),
+    )
+    .await;
+    assert_eq!(hidden.status, TaskStatus::Error);
+    assert_eq!(hidden.error.as_deref(), Some(MEMORY_TEXT_HIDDEN));
+    assert_eq!(memory.read().await.size(), 0);
+
+    let zero_width = super::memory::execute_memory_add(
+        context,
+        agent,
+        user_message,
+        call("zero\u{200B}width note"),
+    )
+    .await;
+    assert_eq!(zero_width.status, TaskStatus::Success);
+    assert_eq!(memory.read().await.size(), 1);
+}

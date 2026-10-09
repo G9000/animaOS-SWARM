@@ -11,6 +11,8 @@ import {
 } from 'react';
 import { ConversationTools } from './ConversationTools';
 import { CopyMessage } from './CopyMessage';
+import { SaveToMemory } from './memory/SaveToMemory';
+import type { SaveOutcome, SavedState } from '../hooks/useSaveToMemory';
 import type { AgentDetail, ChatMessage } from '../lib/types';
 import { AlertIcon, BoltIcon, PulseIcon, SendIcon, StopIcon } from './icons';
 import { MarkdownMessage } from './MarkdownMessage';
@@ -52,7 +54,16 @@ function messageFlag(message: ChatMessage): string | null {
 
 /** Memoized on its message: a committed message renders once, however
  *  often the transcript around it changes (a streamed reply's deltas). */
-const Bubble = memo(function Bubble({ message }: { message: ChatMessage }) {
+const Bubble = memo(function Bubble({
+  message,
+  onSave,
+  savedLookup,
+}: {
+  message: ChatMessage;
+  /** Offers Save to memory on a user or assistant message with text. */
+  onSave?: (message: ChatMessage) => Promise<SaveOutcome>;
+  savedLookup?: (messageId: string) => SavedState | null;
+}) {
   if (message.role !== 'User' && message.role !== 'Assistant') {
     return <EventPill message={message} />;
   }
@@ -78,6 +89,13 @@ const Bubble = memo(function Bubble({ message }: { message: ChatMessage }) {
           <span>{formatTime(message.created_at_ms)}</span>
           {flag && <span className="message-flag">{flag}</span>}
           <CopyMessage text={message.content.text} />
+          {onSave && message.content.text.trim() !== '' && (
+            <SaveToMemory
+              message={message}
+              save={onSave}
+              saved={savedLookup?.(message.id) ?? null}
+            />
+          )}
         </div>
       </div>
     </div>
@@ -245,7 +263,13 @@ const TranscriptEntry = memo(function TranscriptEntry({
 }) {
   switch (item.kind) {
     case 'message':
-      return <Bubble message={item.message} />;
+      return (
+        <Bubble
+          message={item.message}
+          onSave={actions?.onSaveToMemory}
+          savedLookup={actions?.savedToMemory}
+        />
+      );
     case 'revised':
       return (
         <details className="revised-draft">

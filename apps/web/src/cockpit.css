@@ -306,6 +306,9 @@
   color: var(--color-danger);
   max-width: 230px;
 }
+.studio-save-memory [role='status']:not([data-failed]) {
+  color: var(--color-ink-3);
+}
 .studio-jump-latest {
   position: absolute;
   z-index: 5;

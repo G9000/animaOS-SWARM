@@ -11,6 +11,7 @@ import {
   type Session,
 } from '@animaOS-SWARM/sdk';
 
+import { useSaveToMemory } from '../../hooks/useSaveToMemory';
 import { describeTrigger } from '../../lib/automations';
 import type { LiveRun } from '../../lib/session-events';
 import { SESSION_KIND_LABELS } from '../../lib/session-groups';
@@ -223,6 +224,9 @@ const EMPTY_RUNS: readonly LiveRun[] = [];
 // One element, so a render of the view keeps the message list's props.
 const NO_MESSAGES = <p className="session-footer-note">No messages yet.</p>;
 
+/** The name saved with a memory when the agent's own name is not at hand. */
+const GENERIC_SAVE_AGENT_NAME = 'Helper agent';
+
 /** One session (or a new chat): its transcript and composer (spec §15.2). */
 export function SessionView({
   agent,
@@ -250,6 +254,25 @@ export function SessionView({
   onEditAutomation,
   notice = null,
 }: SessionViewProps) {
+  // The session record names its agent, so a helper's session saves to that
+  // helper even when the agents list does not hold it (then `agent` is the
+  // companion); the name is the agent's only when the ids match.
+  const saveAgentId = session?.agentId ?? null;
+  const saveAgentName =
+    saveAgentId === agent.id ? agent.name : GENERIC_SAVE_AGENT_NAME;
+  const sessionId = session?.id ?? null;
+  const saveTarget = useMemo(
+    () =>
+      saveAgentId && sessionId
+        ? { agentId: saveAgentId, agentName: saveAgentName, sessionId }
+        : null,
+    [saveAgentId, saveAgentName, sessionId],
+  );
+  const { save, savedState } = useSaveToMemory(saveTarget);
+  const transcriptActions = useMemo<TranscriptActions>(
+    () => ({ ...actions, onSaveToMemory: save, savedToMemory: savedState }),
+    [actions, save, savedState],
+  );
   const conversation = useMemo(
     () => ({ ...agent, messages }),
     [agent, messages],
@@ -315,7 +338,7 @@ export function SessionView({
       <MessageList
         agent={conversation}
         items={items}
-        actions={actions}
+        actions={transcriptActions}
         sending={thinking}
         scrollerRef={scrollerRef}
         onSuggestion={onSuggestion}

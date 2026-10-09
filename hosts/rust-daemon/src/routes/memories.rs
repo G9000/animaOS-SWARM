@@ -18,6 +18,7 @@ use super::ApiError;
 use crate::app::SharedDaemonState;
 use crate::memory_embeddings::SharedMemoryEmbeddings;
 use crate::memory_store::{MemoryMutation, MemoryStoreConfig};
+use crate::memory_text::{has_hidden_text, MEMORY_TEXT_HIDDEN};
 
 pub(crate) async fn handle_create_memory(
     body: Vec<u8>,
@@ -27,6 +28,15 @@ pub(crate) async fn handle_create_memory(
     let new_memory = request
         .into_domain()
         .map_err(ApiError::bad_request_static)?;
+    if has_hidden_text(&new_memory.content)
+        || new_memory
+            .tags
+            .iter()
+            .flatten()
+            .any(|tag| has_hidden_text(tag))
+    {
+        return Err(ApiError::bad_request_static(MEMORY_TEXT_HIDDEN));
+    }
 
     let (memory_handle, embeddings_handle, memory_store) = {
         let guard = state.read().await;
@@ -349,7 +359,10 @@ async fn index_memory_embedding(embeddings: &SharedMemoryEmbeddings, memory: &Me
     }
 }
 
-async fn remove_memory_embeddings(embeddings: &SharedMemoryEmbeddings, memory_ids: &[String]) {
+pub(super) async fn remove_memory_embeddings(
+    embeddings: &SharedMemoryEmbeddings,
+    memory_ids: &[String],
+) {
     if memory_ids.is_empty() {
         return;
     }
@@ -362,7 +375,7 @@ async fn remove_memory_embeddings(embeddings: &SharedMemoryEmbeddings, memory_id
     }
 }
 
-async fn persist_memory_store(
+pub(super) async fn persist_memory_store(
     memory_store: Option<&MemoryStoreConfig>,
     manager: &mut MemoryMutation<'_>,
     message: &'static str,

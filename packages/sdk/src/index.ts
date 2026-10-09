@@ -195,7 +195,14 @@ export type {
   FetchLike,
 } from './client.js';
 
-export { MemoriesClient } from './memories.js';
+export {
+  MAX_FACT_VALUE_CHARS,
+  MAX_FACTS_SHOWN,
+  MAX_MEMORY_EDIT_CHARS,
+  MAX_MEMORY_TAG_CHARS,
+  MAX_MEMORY_TAGS,
+  MemoriesClient,
+} from './memories.js';
 export { GoalsClient } from './goals.js';
 export type { GoalInput, GoalView, GoalStatus } from './goals.js';
 export type {
@@ -208,7 +215,14 @@ export type {
   CreateMemoryInput,
   EvaluatedMemoryInput,
   MemoryEntity,
+  MemoryDeleteResult,
+  MemoryEntityDeleteResult,
   MemoryEntityOptions,
+  MemoryFact,
+  MemoryFactOptions,
+  MemoryFactReplaced,
+  MemoryFactStatus,
+  MemoryPatch,
   MemoryEmbeddingStatus,
   MemoryEvidenceTrace,
   MemoryEvalCaseResult,

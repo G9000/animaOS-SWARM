@@ -4,6 +4,7 @@ import {
   type Run,
 } from '@animaOS-SWARM/sdk';
 
+import type { SaveOutcome, SavedState } from '../hooks/useSaveToMemory';
 import type { ApprovalDecide } from './approvals';
 import { emptyLiveRun, stepRunId, type LiveRun } from './session-events';
 import type { ChatMessage } from './types';
@@ -91,6 +92,11 @@ export interface TranscriptActions {
   automationNotice?: (step: ToolStep) => Automation | null;
   /** Undo (delete) an automation the companion made; true when it went. */
   onUndoAutomation?: (automation: Automation) => Promise<boolean>;
+  /** Saves a chat message to the companion's memory (spec §10, §15.2). */
+  onSaveToMemory?: (message: ChatMessage) => Promise<SaveOutcome>;
+  /** Whether a message was saved from this page, for a bubble that mounts
+   *  again; `shortened` when only its first characters were kept. */
+  savedToMemory?: (messageId: string) => SavedState | null;
 }
 
 export interface TranscriptInput {

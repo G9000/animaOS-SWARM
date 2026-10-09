@@ -40,7 +40,7 @@
 | M4 Approvals               | `2026-09-23-companion-console-m4.md` | done (Nx rust-daemon:test 1654 passed; sdk + web test, typecheck, build green at 20c6221)  |
 | M5 Skills                  | `2026-09-23-companion-console-m5.md` | done (Nx rust-daemon:test 1775 passed; sdk + web test, typecheck, build green at e9d57f9)  |
 | M6 Automations             | `2026-09-23-companion-console-m6.md` | done (Nx rust-daemon:test 1874 passed; sdk + web test, typecheck, build green at ccce91b)  |
-| M7 Memory                  | (written before M7)                  | pending                                                                                    |
+| M7 Memory                  | `2026-09-23-companion-console-m7.md` | done (Nx rust-daemon:test 1925 passed; sdk + web test, typecheck, build green at e33f919)  |
 | M8 Usage, logs, health     | (written before M8)                  | pending                                                                                    |
 | M9 Attachments and voice   | (written before M9)                  | pending                                                                                    |
 | M10 Deployment and docs    | (written before M10)                 | pending                                                                                    |

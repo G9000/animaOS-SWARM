@@ -246,7 +246,7 @@ describe('WorkspaceShell', () => {
   });
 
   it('shows the conversation for pages that arrive in later releases', () => {
-    render(<Shell initialRoute={{ kind: 'page', page: 'memory' }} />);
+    render(<Shell initialRoute={{ kind: 'page', page: 'usage' }} />);
     expect(screen.getByText('Workspace canvas')).toBeVisible();
     expect(
       screen.queryByRole('button', { name: 'Open companion chat' }),
@@ -356,6 +356,37 @@ describe('WorkspaceShell', () => {
 
     await user.keyboard('{Control>}k{/Control}');
     expect(screen.getByRole('option', { name: /Go to Skills/ })).toBeVisible();
+  });
+
+  it('offers Memory between Automations and Skills', () => {
+    render(<Shell />);
+    const names = within(
+      screen.getByRole('navigation', { name: 'Workspace navigation' }),
+    )
+      .getAllByRole('button')
+      .map((button) => button.textContent);
+    const memory = names.findIndex((name) => name?.includes('Memory'));
+    expect(memory).toBeGreaterThan(-1);
+    expect(names[memory - 1]).toContain('Automations');
+    expect(names[memory + 1]).toContain('Skills');
+  });
+
+  it('opens Memory from the navigation and the command menu', async () => {
+    const user = userEvent.setup();
+    render(<Shell memory={<div>Memory page</div>} />);
+    const nav = screen.getByRole('navigation', {
+      name: 'Workspace navigation',
+    });
+
+    await user.click(within(nav).getByRole('button', { name: 'Memory' }));
+    expect(screen.getByText('Memory page')).toBeVisible();
+    expect(within(nav).getByRole('button', { name: 'Memory' })).toHaveAttribute(
+      'aria-current',
+      'page',
+    );
+
+    await user.keyboard('{Control>}k{/Control}');
+    expect(screen.getByRole('option', { name: /Go to Memory/ })).toBeVisible();
   });
 
   it('shows the main agent identity in the sidebar presence block', () => {
