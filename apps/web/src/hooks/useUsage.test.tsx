@@ -230,4 +230,41 @@ describe('useUsage', () => {
     expect(saved).toBe(false);
     expect(result.current.error).toBe(USAGE_EXPORT_FAILED);
   });
+
+  it('exportCsv uses the range at the click, not the last read', async () => {
+    let current = NOW;
+    const { result, rerender } = renderHook(
+      (props: UsageOptions) => useUsage(props),
+      { initialProps: { ...online, now: () => current } },
+    );
+    await waitFor(() => expect(result.current.loaded).toBe(true));
+
+    // A day passes and the selection changes before the next read lands.
+    current = new Date(2026, 8, 24, 12);
+    rerender({ ...online, days: 30, now: () => current });
+    await act(async () => {
+      await result.current.exportCsv();
+    });
+    expect(daemon.exportUsageCsv).toHaveBeenLastCalledWith({
+      from: new Date(2026, 8, 25 - 30).getTime(),
+      to: new Date(2026, 8, 25).getTime(),
+      agentId: 'agent-main',
+    });
+  });
+
+  it('exportCsv shows the daemon message for a refused range', async () => {
+    const { result } = renderHook(() => useUsage(online));
+    await waitFor(() => expect(result.current.loaded).toBe(true));
+
+    vi.mocked(daemon.exportUsageCsv).mockRejectedValue(
+      new DaemonHttpError(400, { error: 'That range is too large to export' }),
+    );
+    let saved = true;
+    await act(async () => {
+      saved = await result.current.exportCsv();
+    });
+    expect(saved).toBe(false);
+    expect(result.current.error).toBe('That range is too large to export');
+    expect(result.current.errorStatus).toBeNull();
+  });
 });

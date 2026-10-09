@@ -153,7 +153,6 @@ export function useLogs({
             setLoaded(true);
           }
 
-          setConnected(true);
           let received = false;
           for await (const event of daemon.logStream({
             ...filter,
@@ -164,6 +163,9 @@ export function useLogs({
             if (!received) {
               received = true;
               attempt = 0;
+              // Only a stream that has delivered is connected, and only
+              // then is an earlier failure stale.
+              setConnected(true);
               setFailure(null);
             }
             if (event.kind === 'line') {
@@ -180,8 +182,13 @@ export function useLogs({
               });
               if (!live()) return;
               accept(page.lines);
-              after = Math.max(after, page.newestSeq, newestSeq(page.lines));
-              if (page.lines.length < LOGS_FETCH_LIMIT) break;
+              const full = page.lines.length >= LOGS_FETCH_LIMIT;
+              // A full page may have more behind it: stop at its newest line
+              // so the next page starts there, not past the lines between.
+              after = full
+                ? Math.max(after, newestSeq(page.lines))
+                : Math.max(after, page.newestSeq, newestSeq(page.lines));
+              if (!full) break;
             }
           }
         } catch (error) {

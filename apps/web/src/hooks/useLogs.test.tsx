@@ -91,9 +91,9 @@ describe('useLogs', () => {
     expect(streams[0].options.after).toBe(2);
     expect(seqs(result.current.lines)).toEqual([1, 2]);
     expect(result.current.loaded).toBe(true);
-    expect(result.current.connected).toBe(true);
 
     await act(async () => streams[0].line(3));
+    expect(result.current.connected).toBe(true);
     expect(seqs(result.current.lines)).toEqual([1, 2, 3]);
   });
 
@@ -124,6 +124,45 @@ describe('useLogs', () => {
       after: 2,
       limit: 500,
     });
+  });
+
+  it('a resync with a full page catches up from that page, not past it', async () => {
+    const { result } = renderHook(() => useLogs(options));
+    await waitFor(() => expect(streams).toHaveLength(1));
+    await act(async () => streams[0].line(3));
+
+    const full = Array.from({ length: 500 }, (_, index) => 4 + index);
+    // The daemon's newest seq is far ahead of the page it returned.
+    vi.mocked(daemon.logs)
+      .mockResolvedValueOnce(page(full, 900))
+      .mockResolvedValueOnce(page([504, 505], 900));
+    await act(async () => streams[0].send({ kind: 'resync', newestSeq: 900 }));
+    await waitFor(() => expect(result.current.lines).toHaveLength(505));
+
+    const calls = vi.mocked(daemon.logs).mock.calls;
+    expect(calls[1][0]).toMatchObject({ after: 3 });
+    expect(calls[2][0]).toMatchObject({ after: 503 });
+    expect(seqs(result.current.lines).slice(-3)).toEqual([503, 504, 505]);
+  });
+
+  it('is not connected, and keeps a failure, until the stream delivers', async () => {
+    vi.mocked(daemon.logStream).mockImplementationOnce(() => {
+      // eslint-disable-next-line require-yield
+      return (async function* (): AsyncGenerator<LogEvent> {
+        throw new DaemonHttpError(429, {
+          error: 'Too many log streams are open',
+        });
+      })();
+    });
+    const { result } = renderHook(() => useLogs(options));
+    await waitFor(() => expect(streams).toHaveLength(1));
+    // The stream is open but has said nothing.
+    expect(result.current.connected).toBe(false);
+    expect(result.current.error).toBe('Too many log streams are open');
+
+    await act(async () => streams[0].line(3));
+    expect(result.current.connected).toBe(true);
+    expect(result.current.error).toBeNull();
   });
 
   it('a closed stream reconnects after the delay and resumes after the newest seq', async () => {

@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type {
-  UsageGroup,
-  UsageGroupBy,
-  UsageSummary,
-  UsageTotals,
+import {
+  DaemonHttpError,
+  type UsageGroup,
+  type UsageGroupBy,
+  type UsageSummary,
+  type UsageTotals,
 } from '@animaOS-SWARM/sdk';
 
 import { daemon } from '../lib/daemon-api';
@@ -89,7 +90,8 @@ export function useUsage({
   // The newest read wins; a late answer to an older one is dropped.
   const sequence = useRef(0);
   const unmounted = useRef(false);
-  const rangeRef = useRef(range);
+  const daysRef = useRef(days);
+  daysRef.current = days;
   const agentRef = useRef(agentId);
   agentRef.current = agentId;
 
@@ -113,7 +115,6 @@ export function useUsage({
       result.status === 'fulfilled' ? result.value : null;
     const failure = settled.find((result) => result.status === 'rejected');
 
-    rangeRef.current = next;
     setRange((previous) => keepSame(previous, next));
     const daySummary = value(day);
     if (daySummary) {
@@ -168,14 +169,22 @@ export function useUsage({
   const exportCsv = useCallback(async () => {
     const owner = agentRef.current;
     if (!owner) return false;
-    const { from, to } = rangeRef.current;
+    // The range as of the click, from the current selection and clock: the
+    // last read may be older than either.
+    const { from, to } = usageRange(daysRef.current, clock.current());
     setExportError(null);
     try {
       const text = await daemon.exportUsageCsv({ from, to, agentId: owner });
       downloadText(usageCsvFilename({ from, to }), text, 'text/csv');
       return true;
-    } catch {
-      if (!unmounted.current) setExportError(USAGE_EXPORT_FAILED);
+    } catch (error) {
+      // The daemon's own words for a refused range; anything else is generic.
+      if (!unmounted.current)
+        setExportError(
+          error instanceof DaemonHttpError && error.status === 400
+            ? error.message
+            : USAGE_EXPORT_FAILED,
+        );
       return false;
     }
   }, []);
