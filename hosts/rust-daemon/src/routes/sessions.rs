@@ -170,12 +170,12 @@ pub(super) async fn get_session(
         return rejected(ApiError::not_found());
     }
     match views::session_view(&state.daemon, &agent_id, &session_id).await {
-        Some(view) => no_store(json_response(
-            StatusCode::OK,
-            &SessionEnvelope {
-                session: SessionResponse::from(&view),
-            },
-        )),
+        Some(view) => {
+            let mut session = SessionResponse::from(&view);
+            session.usage =
+                Some(super::usage::session_totals(&state, &agent_id, &session_id).await);
+            no_store(json_response(StatusCode::OK, &SessionEnvelope { session }))
+        }
         None => rejected(ApiError::not_found()),
     }
 }

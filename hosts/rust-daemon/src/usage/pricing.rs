@@ -66,10 +66,11 @@ pub(crate) fn validate_overrides(
         {
             return Err(PRICING_ENTRY_INVALID);
         }
-        if cleaned
-            .iter()
-            .any(|known: &PricingOverride| known.provider == provider && known.model == model)
-        {
+        // Two names of one provider (`google` and `gemini`) are one provider.
+        let key = provider_key(&provider);
+        if cleaned.iter().any(|known: &PricingOverride| {
+            known.model == model && provider_key(&known.provider) == key
+        }) {
             return Err(PRICING_DUPLICATE);
         }
         cleaned.push(PricingOverride {
@@ -282,6 +283,25 @@ mod tests {
             Err(PRICING_DUPLICATE)
         );
         assert_eq!(PRICING_DUPLICATE, "each provider and model may appear once");
+    }
+
+    #[test]
+    fn aliases_of_one_provider_are_duplicates() {
+        assert_eq!(
+            validate_overrides(vec![
+                entry("google", "gemini-x", 1, 1),
+                entry(" Gemini ", "GEMINI-X", 2, 2),
+            ]),
+            Err(PRICING_DUPLICATE)
+        );
+        assert!(
+            validate_overrides(vec![
+                entry("google", "gemini-x", 1, 1),
+                entry("gemini", "gemini-y", 2, 2),
+            ])
+            .is_ok(),
+            "another model of the same provider is not a duplicate"
+        );
     }
 
     #[test]

@@ -4,8 +4,6 @@
 
 pub(crate) mod metered;
 pub(crate) mod pricing;
-// The usage routes (M8 Task 5) are the summary's only callers.
-#[allow(dead_code)]
 pub(crate) mod summary;
 
 use anima_core::TokenUsage;
@@ -14,22 +12,13 @@ use serde::{Deserialize, Serialize};
 use crate::runs::{RunRecord, RunSource};
 pub(crate) use pricing::{price_call, PricingOverride};
 
-// The usage routes (M8 Task 5) read the `allow(dead_code)` limits below.
-#[allow(dead_code)]
 pub(crate) const DEFAULT_USAGE_RANGE_DAYS: u64 = 30;
-#[allow(dead_code)]
 pub(crate) const MAX_USAGE_RANGE_DAYS: u64 = 366;
-#[allow(dead_code)]
 pub(crate) const DEFAULT_RECORDS_LIMIT: usize = 50;
-#[allow(dead_code)]
 pub(crate) const MAX_RECORDS_LIMIT: usize = 200;
-#[allow(dead_code)]
 pub(crate) const USAGE_SCAN_PAGE: usize = 2_000;
-#[allow(dead_code)]
 pub(crate) const MAX_SUMMARY_ROWS: usize = 200_000;
-#[allow(dead_code)]
 pub(crate) const MAX_SESSION_GROUPS: usize = 20;
-#[allow(dead_code)]
 pub(crate) const MAX_CSV_ROWS: usize = 100_000;
 pub(crate) const USAGE_QUEUE_MAX: usize = 10_000;
 pub(crate) const HISTORY_USAGE_BATCH: usize = 500;
@@ -51,8 +40,6 @@ pub(crate) enum UsageSource {
 }
 
 impl UsageSource {
-    // The usage summary and CSV (M8 Task 5) name sources with it.
-    #[allow(dead_code)]
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Chat => "chat",
@@ -91,6 +78,18 @@ pub(crate) enum PricingSource {
     Free,
     Subscription,
     Unknown,
+}
+
+impl PricingSource {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Table => "table",
+            Self::Override => "override",
+            Self::Free => "free",
+            Self::Subscription => "subscription",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

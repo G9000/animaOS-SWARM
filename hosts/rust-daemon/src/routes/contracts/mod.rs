@@ -12,6 +12,7 @@ mod sessions;
 mod shared;
 mod skills;
 mod swarms;
+mod usage;
 mod workspace;
 
 pub(crate) use agencies::{
@@ -53,6 +54,10 @@ pub(crate) use skills::*;
 pub(crate) use swarms::{
     SwarmCreateRequest, SwarmEnvelope, SwarmEventResponse, SwarmRunEnvelope, SwarmStateResponse,
     SwarmsEnvelope,
+};
+pub(crate) use usage::{
+    PricingEnvelope, PricingOverrideBody, PricingPutRequest, UsageRecordResponse,
+    UsageRecordsEnvelope, UsageSummaryResponse, UsageTotalsResponse,
 };
 pub(crate) use workspace::{
     BootstrapAgentRequest, WorkspaceBootstrapRequest, WorkspaceBootstrapResponse,

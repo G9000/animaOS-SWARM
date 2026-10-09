@@ -24,6 +24,7 @@ mod schedules;
 mod sessions;
 mod skills;
 mod swarms;
+mod usage;
 mod workspace;
 mod workspace_agent_yaml;
 mod workspace_files;
@@ -189,6 +190,8 @@ use crate::runtime_model::provider_summaries;
         memory_edits::patch_memory, memory_edits::delete_memory,
         memory_edits::list_facts, memory_edits::patch_fact, memory_edits::delete_fact,
         memory_edits::delete_entity,
+        usage::usage_summary, usage::usage_records, usage::usage_export,
+        usage::get_pricing, usage::put_pricing,
     ),
     components(schemas(self::contracts::AgentSummariesEnvelope)),
     tags(
@@ -205,6 +208,7 @@ use crate::runtime_model::provider_summaries;
         (name = "runs", description = "Live runs: the agent event stream, session runs, and stop"),
         (name = "approvals", description = "Tool approvals: pending requests, decisions, policies, and rules"),
         (name = "skills", description = "Owner-approved skills, drafts, and imports"),
+        (name = "usage", description = "Model-call usage, cost summaries, CSV export, and price overrides"),
         (name = "workspace", description = "Workspace configuration and onboarding"),
     )
 )]
@@ -574,6 +578,13 @@ fn router_with_services_with_policies(
         .route(
             "/api/skills/{slug}/approve",
             axum::routing::post(skills::approve_skill),
+        )
+        .route("/api/usage/summary", get(usage::usage_summary))
+        .route("/api/usage/records", get(usage::usage_records))
+        .route("/api/usage/export.csv", get(usage::usage_export))
+        .route(
+            "/api/usage/pricing",
+            get(usage::get_pricing).put(usage::put_pricing),
         )
         .route("/api/ready", get(ready_entry))
         .route(
@@ -2007,6 +2018,7 @@ mod tests {
     mod sessions;
     mod skills;
     mod swarm_reliability;
+    mod usage;
 
     use super::{router, router_with_services, router_with_services_with_policies};
     use crate::agent_runs::AgentRunCoordinator;
