@@ -165,9 +165,9 @@ export function LogsPage({ online }: LogsPageProps) {
           {view.error}
         </p>
       )}
-      {!view.connected && (
+      {!view.connected && (view.retrying || !view.loaded) && (
         <p className="system-note" role="status">
-          {view.loaded ? LOGS_RECONNECTING : LOGS_CONNECTING}
+          {view.retrying ? LOGS_RECONNECTING : LOGS_CONNECTING}
         </p>
       )}
       {view.loaded && view.lines.length === 0 && (

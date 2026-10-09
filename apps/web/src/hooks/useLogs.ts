@@ -29,6 +29,8 @@ export interface LogsView {
   held: number;
   /** True while the stream is open. */
   connected: boolean;
+  /** True after a stream dropped or was refused, until it delivers again. */
+  retrying: boolean;
   /** The tail has been read (or failed to read). */
   loaded: boolean;
   error: string | null;
@@ -71,6 +73,7 @@ export function useLogs({
   const [lines, setLines] = useState<LogLine[]>(NO_LINES);
   const [held, setHeld] = useState(0);
   const [connected, setConnected] = useState(false);
+  const [retrying, setRetrying] = useState(false);
   const [loaded, setLoaded] = useState(false);
   const [failure, setFailure] = useState<{
     message: string;
@@ -123,6 +126,7 @@ export function useLogs({
     setHeld(0);
     show(NO_LINES);
     setConnected(false);
+    setRetrying(false);
     setLoaded(false);
     setFailure(null);
     if (!enabled) return;
@@ -166,6 +170,7 @@ export function useLogs({
               // Only a stream that has delivered is connected, and only
               // then is an earlier failure stale.
               setConnected(true);
+              setRetrying(false);
               setFailure(null);
             }
             if (event.kind === 'line') {
@@ -204,6 +209,7 @@ export function useLogs({
           }
         }
         setConnected(false);
+        setRetrying(true);
         await pause(delayRef.current(attempt), signal);
         attempt += 1;
       }
@@ -219,6 +225,7 @@ export function useLogs({
     lines,
     held,
     connected,
+    retrying,
     loaded,
     error: failure?.message ?? null,
     errorStatus: failure?.status ?? null,

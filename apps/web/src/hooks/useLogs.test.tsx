@@ -158,10 +158,12 @@ describe('useLogs', () => {
     await waitFor(() => expect(streams).toHaveLength(1));
     // The stream is open but has said nothing.
     expect(result.current.connected).toBe(false);
+    expect(result.current.retrying).toBe(true);
     expect(result.current.error).toBe('Too many log streams are open');
 
     await act(async () => streams[0].line(3));
     expect(result.current.connected).toBe(true);
+    expect(result.current.retrying).toBe(false);
     expect(result.current.error).toBeNull();
   });
 

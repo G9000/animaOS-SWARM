@@ -24,6 +24,7 @@ function view(overrides: Partial<LogsView> = {}): LogsView {
     lines: [],
     held: 0,
     connected: true,
+    retrying: false,
     loaded: true,
     error: null,
     errorStatus: null,
@@ -194,6 +195,14 @@ describe('LogsPage', () => {
 
     vi.mocked(useLogs).mockReturnValue(
       view({ connected: false, loaded: true }),
+    );
+    rerender(<LogsPage online />);
+    // A quiet stream that has not dropped shows no note.
+    expect(screen.queryByText(LOGS_RECONNECTING)).not.toBeInTheDocument();
+    expect(screen.queryByText(LOGS_CONNECTING)).not.toBeInTheDocument();
+
+    vi.mocked(useLogs).mockReturnValue(
+      view({ connected: false, loaded: true, retrying: true }),
     );
     rerender(<LogsPage online />);
     expect(screen.getByText(LOGS_RECONNECTING)).toBeVisible();
