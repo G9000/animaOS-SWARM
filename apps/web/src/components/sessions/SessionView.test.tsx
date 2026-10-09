@@ -1,7 +1,7 @@
-import { render, screen } from '@testing-library/react';
+import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { createRef } from 'react';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { daemon } from '../../lib/daemon-api';
 import { memoryFixture } from '../../test/memory';
@@ -11,6 +11,7 @@ import type { AgentDetail } from '../../lib/types';
 import { automationFixture } from '../../test/automations';
 import { runFixture } from '../../test/live';
 import { sessionFixture } from '../../test/sessions';
+import { totalsFixture } from '../../test/usage';
 import { SessionView, type SessionViewProps } from './SessionView';
 
 const agent: AgentDetail = {
@@ -64,9 +65,18 @@ function renderView(overrides: Partial<SessionViewProps> = {}) {
     onExport: vi.fn(),
     ...overrides,
   };
-  render(<SessionView {...props} />);
-  return props;
+  const { rerender } = render(<SessionView {...props} />);
+  return {
+    ...props,
+    rerender: (next: Partial<SessionViewProps>) =>
+      rerender(<SessionView {...props} {...next} />),
+  };
 }
+
+beforeEach(() => {
+  // The header reads the session's usage; most tests have none.
+  vi.spyOn(daemon, 'getSession').mockResolvedValue(sessionFixture('room-7'));
+});
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -137,6 +147,63 @@ describe('SessionView', () => {
     expect(saved.agentId).toBe('helper-9');
     expect(saved.agentName).not.toBe('Nova');
     expect(saved.agentName).toBeTruthy();
+  });
+
+  it('the header shows the session’s usage line and hides it when there are no calls', async () => {
+    vi.mocked(daemon.getSession).mockResolvedValue(
+      sessionFixture('room-7', {
+        usage: totalsFixture({
+          calls: 2,
+          totalTokens: 12_300,
+          costMicros: 40_000,
+        }),
+      }),
+    );
+    renderView({ session: sessionFixture('room-7') });
+    expect(await screen.findByText('12.3k tokens · $0.04')).toBeVisible();
+    expect(daemon.getSession).toHaveBeenCalledWith('agent-main', 'room-7');
+  });
+
+  it('shows no usage line for a session without calls', async () => {
+    vi.mocked(daemon.getSession).mockResolvedValue(
+      sessionFixture('room-7', { usage: totalsFixture() }),
+    );
+    renderView({ session: sessionFixture('room-7') });
+    await waitFor(() => expect(daemon.getSession).toHaveBeenCalled());
+    expect(screen.queryByText(/tokens ·/)).not.toBeInTheDocument();
+  });
+
+  it('the line refreshes when a run finishes', async () => {
+    const working = runFixture('run_1', { status: 'working' });
+    const done = runFixture('run_1', { status: 'completed' });
+    vi.mocked(daemon.getSession).mockResolvedValue(
+      sessionFixture('room-7', {
+        usage: totalsFixture({
+          calls: 1,
+          totalTokens: 100,
+          costMicros: 10_000,
+        }),
+      }),
+    );
+    const props = renderView({
+      session: sessionFixture('room-7'),
+      runs: [emptyLiveRun(working)],
+    });
+    expect(await screen.findByText('100 tokens · $0.01')).toBeVisible();
+    expect(daemon.getSession).toHaveBeenCalledTimes(1);
+
+    vi.mocked(daemon.getSession).mockResolvedValue(
+      sessionFixture('room-7', {
+        usage: totalsFixture({
+          calls: 2,
+          totalTokens: 250,
+          costMicros: 20_000,
+        }),
+      }),
+    );
+    props.rerender({ runs: [emptyLiveRun(done)] });
+    expect(await screen.findByText('250 tokens · $0.02')).toBeVisible();
+    expect(daemon.getSession).toHaveBeenCalledTimes(2);
   });
 
   it('opens a new chat on the welcome screen with the companion composer', () => {

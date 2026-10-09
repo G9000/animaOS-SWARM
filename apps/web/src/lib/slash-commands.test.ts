@@ -30,6 +30,17 @@ describe('parseSlashCommand', () => {
   });
 });
 
+describe('SLASH_COMMANDS', () => {
+  it('/usage is offered before /help', () => {
+    const names = SLASH_COMMANDS.map((command) => command.name);
+    expect(names.indexOf('usage')).toBeGreaterThan(-1);
+    expect(names.indexOf('usage')).toBe(names.indexOf('help') - 1);
+    expect(parseSlashCommand('/usage')?.command.description).toBe(
+      'Show usage for this chat and today',
+    );
+  });
+});
+
 describe('slashSuggestions', () => {
   it('suggests commands while only the first word is typed', () => {
     expect(slashSuggestions('/').map((command) => command.name)).toEqual(

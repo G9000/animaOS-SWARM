@@ -9,6 +9,7 @@
 @import './skills.css';
 @import './automations.css';
 @import './memory.css';
+@import './system.css';
 
 @source '../../packages/ui/src/**/*.{ts,tsx}';
 

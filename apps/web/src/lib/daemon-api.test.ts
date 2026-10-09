@@ -772,3 +772,49 @@ describe('daemon memory requests', () => {
     ]);
   });
 });
+
+describe('daemon usage requests', () => {
+  it('reads usage, exports the csv, and reads and sets the pricing through the SDK routes', async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async (input) => {
+        const url = String(input);
+        if (url.includes('export.csv'))
+          return new Response('id,agent\n', { status: 200 });
+        const body = url.includes('/pricing')
+          ? { overrides: [], tableDate: '2026-09-01' }
+          : url.includes('/records')
+            ? { records: [], nextCursor: null }
+            : {};
+        return new Response(JSON.stringify(body), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await daemon.usageSummary({
+      from: 1,
+      to: 2,
+      agentId: 'agent 1',
+      groupBy: 'day',
+      tzOffsetMinutes: 60,
+    });
+    await daemon.usageRecords({ agentId: 'agent 1', limit: 50 });
+    expect(await daemon.exportUsageCsv({ from: 1, to: 2 })).toBe('id,agent\n');
+    await daemon.usagePricing();
+    await daemon.setUsagePricing([]);
+
+    expect(
+      fetchMock.mock.calls.map(
+        ([url, init]) => `${init?.method ?? 'GET'} ${String(url)}`,
+      ),
+    ).toEqual([
+      'GET /api/usage/summary?from=1&to=2&agentId=agent+1&groupBy=day&tzOffsetMinutes=60',
+      'GET /api/usage/records?agentId=agent+1&limit=50',
+      'GET /api/usage/export.csv?from=1&to=2',
+      'GET /api/usage/pricing',
+      'PUT /api/usage/pricing',
+    ]);
+  });
+});

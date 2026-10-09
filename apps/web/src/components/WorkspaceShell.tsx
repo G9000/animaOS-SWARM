@@ -13,6 +13,7 @@ import { PROMPT_LIBRARY } from '../lib/prompt-library';
 import { sessionKey } from '../lib/session-groups';
 import {
   BoltIcon,
+  ChartIcon,
   ChipIcon,
   ClockIcon,
   GearIcon,
@@ -33,6 +34,7 @@ export const AVAILABLE_PAGES = [
   'work',
   'files',
   'connectors',
+  'usage',
   'capabilities',
 ] as const satisfies readonly HashPage[];
 export type AvailablePage = (typeof AVAILABLE_PAGES)[number];
@@ -60,6 +62,7 @@ const PRIMARY_DESTINATIONS: Destination[] = [
   { page: 'connectors', label: 'Connectors', icon: <GearIcon size={16} /> },
 ];
 const SYSTEM_DESTINATIONS: Destination[] = [
+  { page: 'usage', label: 'Usage', icon: <ChartIcon size={16} /> },
   {
     page: 'capabilities',
     label: 'Capabilities',
@@ -296,6 +299,7 @@ export function WorkspaceShell({
   automations = null,
   skills = null,
   memory = null,
+  usage = null,
   pendingApprovals = 0,
   sessions = [],
   onOpenSession,
@@ -325,6 +329,8 @@ export function WorkspaceShell({
   skills?: ReactNode | null;
   /** The Memory page, shown at `#/memory`. */
   memory?: ReactNode | null;
+  /** The Usage page, shown at `#/usage`. */
+  usage?: ReactNode | null;
   /** Approvals waiting for the owner, for the destination's badge. */
   pendingApprovals?: number;
   /** The listed sessions the command menu offers by title. */
@@ -622,6 +628,8 @@ export function WorkspaceShell({
                 memory
               ) : page === 'skills' ? (
                 skills
+              ) : page === 'usage' ? (
+                usage
               ) : page === 'connectors' ? (
                 connectors
               ) : page === 'files' ? (

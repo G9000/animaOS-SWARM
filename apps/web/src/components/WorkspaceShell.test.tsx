@@ -246,7 +246,7 @@ describe('WorkspaceShell', () => {
   });
 
   it('shows the conversation for pages that arrive in later releases', () => {
-    render(<Shell initialRoute={{ kind: 'page', page: 'usage' }} />);
+    render(<Shell initialRoute={{ kind: 'page', page: 'logs' }} />);
     expect(screen.getByText('Workspace canvas')).toBeVisible();
     expect(
       screen.queryByRole('button', { name: 'Open companion chat' }),
@@ -387,6 +387,38 @@ describe('WorkspaceShell', () => {
 
     await user.keyboard('{Control>}k{/Control}');
     expect(screen.getByRole('option', { name: /Go to Memory/ })).toBeVisible();
+  });
+
+  it('the System group offers Usage before Capabilities', async () => {
+    render(<Shell />);
+    await userEvent.click(screen.getByRole('button', { name: 'System' }));
+    const names = within(
+      screen.getByRole('navigation', { name: 'Workspace navigation' }),
+    )
+      .getAllByRole('button')
+      .map((button) => button.textContent);
+    const usage = names.findIndex((name) => name?.includes('Usage'));
+    expect(usage).toBeGreaterThan(-1);
+    expect(names[usage + 1]).toContain('Capabilities');
+  });
+
+  it('Usage opens the usage page and the command menu offers Go to Usage', async () => {
+    const user = userEvent.setup();
+    render(<Shell usage={<div>Usage page</div>} />);
+    const nav = screen.getByRole('navigation', {
+      name: 'Workspace navigation',
+    });
+
+    await user.click(within(nav).getByRole('button', { name: 'System' }));
+    await user.click(within(nav).getByRole('button', { name: 'Usage' }));
+    expect(screen.getByText('Usage page')).toBeVisible();
+    expect(within(nav).getByRole('button', { name: 'Usage' })).toHaveAttribute(
+      'aria-current',
+      'page',
+    );
+
+    await user.keyboard('{Control>}k{/Control}');
+    expect(screen.getByRole('option', { name: /Go to Usage/ })).toBeVisible();
   });
 
   it('shows the main agent identity in the sidebar presence block', () => {

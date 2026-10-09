@@ -189,6 +189,16 @@ describe('useSessionCommands', () => {
     expect(options.queueSend).not.toHaveBeenCalled();
   });
 
+  it('/usage opens the usage page', () => {
+    const { result, options } = setup();
+    act(() => result.current.send('/usage'));
+    expect(options.navigate).toHaveBeenCalledWith({
+      kind: 'page',
+      page: 'usage',
+    });
+    expect(options.queueSend).not.toHaveBeenCalled();
+  });
+
   it('shows Compact pending while a manual compaction is in flight (S3b-C)', async () => {
     const pending = deferred<Session>();
     vi.spyOn(daemon, 'compactSession').mockReturnValue(pending.promise);

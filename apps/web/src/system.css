@@ -1,0 +1,121 @@
+/* The System pages: Usage, Logs, and Health (spec §15.4). */
+.usage-page {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  overflow-y: auto;
+  padding: 24px;
+}
+.usage-header,
+.usage-ranges {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.usage-header h2,
+.usage-chart-section h3,
+.usage-table-section h3 {
+  color: var(--color-ink);
+  font-size: 15px;
+  font-weight: 600;
+}
+.usage-header h2 {
+  margin-right: auto;
+}
+.usage-ranges button[aria-pressed='true'] {
+  border-color: var(--color-accent);
+  color: var(--color-ink);
+}
+.usage-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 12px;
+}
+.usage-card {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  border: 1px solid var(--color-line);
+  border-radius: 12px;
+  padding: 12px;
+}
+.usage-card-label {
+  color: var(--color-ink-2);
+  font-size: 12px;
+}
+.usage-card-value {
+  color: var(--color-ink);
+  font-size: 22px;
+  font-weight: 600;
+}
+.usage-card small,
+.usage-note {
+  color: var(--color-ink-3);
+  font-size: 12px;
+}
+.usage-error {
+  color: var(--color-danger);
+  font-size: 13px;
+}
+.usage-chart-section,
+.usage-table-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.usage-chart {
+  width: 100%;
+  height: auto;
+  max-height: 220px;
+}
+.usage-bar {
+  fill: var(--color-accent);
+}
+.usage-bar:hover {
+  fill: var(--color-action);
+}
+.usage-chart-axis {
+  stroke: var(--color-line);
+  stroke-width: 1;
+}
+.usage-chart-label {
+  fill: var(--color-ink-3);
+  font-size: 11px;
+}
+.usage-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.usage-table th,
+.usage-table td {
+  border-bottom: 1px solid var(--color-line);
+  padding: 6px 8px;
+  text-align: right;
+  color: var(--color-ink-2);
+  font-weight: 400;
+  overflow-wrap: anywhere;
+}
+.usage-table th:first-child {
+  text-align: left;
+  color: var(--color-ink);
+}
+.usage-table thead th {
+  color: var(--color-ink-3);
+  font-size: 12px;
+}
+.usage-table a {
+  color: var(--color-action);
+  text-decoration: underline;
+}
+@media (max-width: 640px) {
+  .usage-page {
+    padding: 16px;
+  }
+}
+.session-usage-line {
+  flex-shrink: 0;
+  color: var(--color-ink-3);
+  font-size: 12px;
+}

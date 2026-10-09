@@ -41,6 +41,7 @@ import { automationFixture } from './test/automations';
 import { memoryFixture } from './test/memory';
 import { sessionFixture } from './test/sessions';
 import { skillFixture } from './test/skills';
+import { groupFixture, summaryFixture, totalsFixture } from './test/usage';
 import {
   approvalEvent,
   approvalFixture,
@@ -2164,8 +2165,8 @@ it('opens the new session on a page that still shows the conversation', async ()
     agents: [snapshot('agent-main', 'Nova', 1)],
   });
   mockProviders();
-  // Usage arrives in a later release; until then it shows the chat.
-  window.history.replaceState(null, '', '/#/usage');
+  // Logs arrives in a later release; until then it shows the chat.
+  window.history.replaceState(null, '', '/#/logs');
   render(<ViewHarness />);
 
   await user.type(await screen.findByPlaceholderText('Message Nova…'), 'Hello');
@@ -2209,6 +2210,34 @@ it('shows the companion’s memory at #/memory', async () => {
 
   expect(await screen.findByText('Likes green tea')).toBeVisible();
   expect(daemon.recentMemories).toHaveBeenCalledWith('agent-main', 200);
+});
+
+it('shows the companion’s usage at #/usage', async () => {
+  vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+  vi.spyOn(daemon, 'listAgents').mockResolvedValue({
+    agents: [snapshot('agent-main', 'Nova', 1)],
+  });
+  mockProviders();
+  vi.spyOn(daemon, 'usageSummary').mockImplementation(async (query) =>
+    summaryFixture({
+      groupBy: query.groupBy ?? null,
+      totals: totalsFixture({ calls: 4, totalTokens: 4_200 }),
+      groups:
+        query.groupBy === 'model'
+          ? [groupFixture('openai/gpt-5.4', { calls: 4, totalTokens: 4_200 })]
+          : [],
+    }),
+  );
+  window.history.replaceState(null, '', '/#/usage');
+  render(<ViewHarness />);
+
+  expect(await screen.findByText('openai/gpt-5.4')).toBeVisible();
+  expect(
+    screen.getByRole('heading', { name: 'What your companion costs' }),
+  ).toBeVisible();
+  expect(daemon.usageSummary).toHaveBeenCalledWith(
+    expect.objectContaining({ agentId: 'agent-main', groupBy: 'day' }),
+  );
 });
 
 it('keeps a page open when the first send creates its session, then returns to that session', async () => {

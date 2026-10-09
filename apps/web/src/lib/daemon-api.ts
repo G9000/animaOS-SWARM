@@ -20,6 +20,7 @@ import {
   type HeartbeatInput,
   type MemoryFactOptions,
   type MemoryPatch,
+  type PricingOverride,
   type RelationshipEndpointKind,
   type WorkspaceBootstrapRequest,
   type AgentMemory,
@@ -38,6 +39,8 @@ import {
   type SkillDraftApproval,
   type SkillInput,
   type StartRunInput,
+  type UsageQuery,
+  type UsageRecordsQuery,
 } from '@animaOS-SWARM/sdk';
 
 const setupClient = createDaemonClient({
@@ -448,6 +451,14 @@ export const daemon = {
   rejectSkillDraft: (id: string) => setupClient.skills.rejectDraft(id),
   importSkill: (file: File) =>
     setupClient.skills.importFile(file, { filename: file.name }),
+  /** Usage (spec §11, §15.4). */
+  usageSummary: (query: UsageQuery) => setupClient.usage.summary(query),
+  usageRecords: (query: UsageRecordsQuery) => setupClient.usage.records(query),
+  exportUsageCsv: (query: { from?: number; to?: number; agentId?: string }) =>
+    setupClient.usage.exportCsv(query),
+  usagePricing: () => setupClient.usage.pricing(),
+  setUsagePricing: (overrides: PricingOverride[]) =>
+    setupClient.usage.setPricing(overrides),
   /** Automations (spec §9.2, §15.4). */
   listAutomations: (agentId: string, options: { signal?: AbortSignal } = {}) =>
     setupClient.automations.list(agentId, options),

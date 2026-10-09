@@ -1,7 +1,7 @@
 import type { Skill } from '@animaOS-SWARM/sdk';
 
-/** Composer slash commands (spec §15.3). `/usage` arrives with the Usage
- *  page (M8); `/<skill>` comes from the owner's skills (M5). */
+/** Composer slash commands (spec §15.3). `/<skill>` comes from the owner's
+ *  skills (M5). */
 export type SlashCommandName =
   | 'new'
   | 'stop'
@@ -11,6 +11,7 @@ export type SlashCommandName =
   | 'search'
   | 'model'
   | 'compact'
+  | 'usage'
   | 'help';
 
 export interface SlashCommand {
@@ -55,6 +56,7 @@ export const SLASH_COMMANDS: readonly (SlashCommand & {
     name: 'compact',
     description: 'Summarize earlier messages to make room',
   },
+  { name: 'usage', description: 'Show usage for this chat and today' },
   { name: 'help', description: 'Show every command' },
 ];
 
