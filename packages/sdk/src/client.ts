@@ -11,6 +11,9 @@ import { RunsClient } from './runs.js';
 import { ApprovalsClient } from './approvals.js';
 import { SkillsClient } from './skills.js';
 import { AutomationsClient } from './automations.js';
+import { UsageClient } from './usage.js';
+import { LogsClient } from './logs.js';
+import { StatusClient } from './status.js';
 import { AgentEventsClient } from './events.js';
 import type { DaemonCapabilities } from './capabilities.js';
 
@@ -81,6 +84,9 @@ export class DaemonClient {
   readonly approvals: ApprovalsClient;
   readonly skills: SkillsClient;
   readonly automations: AutomationsClient;
+  readonly usage: UsageClient;
+  readonly logs: LogsClient;
+  readonly status: StatusClient;
 
   private readonly baseUrl: string;
   private readonly fetchImpl: FetchLike;
@@ -108,6 +114,9 @@ export class DaemonClient {
     this.approvals = new ApprovalsClient(this);
     this.skills = new SkillsClient(this);
     this.automations = new AutomationsClient(this);
+    this.usage = new UsageClient(this);
+    this.logs = new LogsClient(this);
+    this.status = new StatusClient(this);
   }
 
   async health(): Promise<DaemonHealth> {

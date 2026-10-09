@@ -5,7 +5,13 @@ import {
   createDaemonClient,
   DaemonConnectionError,
   DaemonHttpError,
+  LOG_LEVELS,
+  LogsClient,
+  MAX_USAGE_RECORDS_LIMIT,
+  StatusClient,
+  StatusTooOldError,
   swarm,
+  UsageClient,
 } from './index.js';
 
 const originalFetchDescriptor = Object.getOwnPropertyDescriptor(
@@ -926,5 +932,16 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
 
     expect(cancelSpy).toHaveBeenCalledOnce();
     expect(requestSignal?.aborted).toBe(true);
+  });
+
+  it('exports the usage, logs, and status clients', () => {
+    const client = createDaemonClient({ baseUrl: '' });
+
+    expect(client.usage).toBeInstanceOf(UsageClient);
+    expect(client.logs).toBeInstanceOf(LogsClient);
+    expect(client.status).toBeInstanceOf(StatusClient);
+    expect(new StatusTooOldError().code).toBe('daemon_too_old');
+    expect(LOG_LEVELS).toHaveLength(5);
+    expect(MAX_USAGE_RECORDS_LIMIT).toBe(200);
   });
 });

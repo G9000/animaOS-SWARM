@@ -1,5 +1,6 @@
 import { DaemonHttpError } from './client.js';
 import type { DaemonClient } from './client.js';
+import type { UsageTotals } from './usage.js';
 
 export type SessionKind = 'chat' | 'telegram' | 'checkin' | 'job' | 'helper';
 export type SessionOrigin =
@@ -78,6 +79,8 @@ export interface Session {
   unread: boolean;
   capabilities: SessionCapabilities;
   match?: SessionMatch;
+  /** The session's usage totals; present only on a single-session read. */
+  usage?: UsageTotals | null;
 }
 
 export interface SessionPage {

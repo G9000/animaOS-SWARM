@@ -73,6 +73,27 @@ describe('sessions client', () => {
     ]);
   });
 
+  it('a session read keeps its usage totals', async () => {
+    const usage = {
+      calls: 2,
+      promptTokens: 10,
+      completionTokens: 5,
+      cachedPromptTokens: 0,
+      reasoningTokens: 0,
+      totalTokens: 15,
+      costMicros: 42,
+      unpricedCalls: 0,
+      subscriptionCalls: 0,
+    };
+    const { sessions } = transport(() =>
+      Response.json({ session: { ...session, usage } }),
+    );
+
+    const read = await sessions.get('agent/a', 'chat:1');
+
+    expect(read.usage).toEqual(usage);
+  });
+
   it('creates, updates, and removes sessions', async () => {
     const { sessions, requests } = transport((url) =>
       url.endsWith('chat%3A1') && requests.at(-1)?.init?.method === 'DELETE'
