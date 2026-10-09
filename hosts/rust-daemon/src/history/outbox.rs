@@ -46,6 +46,8 @@ pub(crate) const HISTORY_FIRE_BATCH: usize = 200;
 pub(crate) const HISTORY_MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// Failing this long is a readiness issue (spec §13.1).
 pub(crate) const HISTORY_READINESS_GRACE_MS: u64 = 5 * 60 * 1000;
+/// How much of the store's last error a readiness issue quotes.
+const READINESS_ERROR_MAX_CHARS: usize = 500;
 /// Queued items before the queue gives way to a reconciliation.
 pub(crate) const MAX_OUTBOX_ITEMS: usize = 100_000;
 
@@ -413,7 +415,12 @@ impl HistoryService {
             format!(
                 "history store writes have failed for {} minutes; records stay in the control plane until it recovers ({})",
                 failing_for / 60_000,
-                outbox.last_error.as_deref().unwrap_or("unknown error")
+                // The unauthenticated `/api/ready` returns this text, and a
+                // store error can echo a URL or a key.
+                crate::logs::redact(outbox.last_error.as_deref().unwrap_or("unknown error"))
+                    .chars()
+                    .take(READINESS_ERROR_MAX_CHARS)
+                    .collect::<String>()
             )
         })
     }
@@ -1094,6 +1101,38 @@ mod tests {
         );
         assert_eq!(history.retry_delay(), HISTORY_FLUSH_INTERVAL);
         assert!(state.read().await.runs.for_agent(&agent_id)[0].mirrored);
+    }
+
+    #[tokio::test]
+    async fn the_readiness_issue_redacts_and_cuts_the_stores_error() {
+        let store = Arc::new(FlakyHistoryStore::new());
+        store.set_failure_text(&format!(
+            "connection failed with key sk-proj-AbCdEfGh12345678 {}",
+            "x".repeat(2 * READINESS_ERROR_MAX_CHARS)
+        ));
+        let (state, coordinator, agent_id) = state_with(HistoryService::new(store.clone())).await;
+        let transactions = coordinator.control_plane_transactions();
+        coordinator
+            .run(request(&agent_id, "chat:one", "hello"))
+            .await
+            .unwrap();
+        let history = state.read().await.history.clone();
+        store.set_failing(true);
+        assert!(history
+            .flush_once(&state, &transactions, 1_000_000)
+            .await
+            .is_err());
+
+        let issue = history
+            .readiness_issue(1_000_000 + HISTORY_READINESS_GRACE_MS)
+            .expect("an issue after the grace");
+        assert!(issue.contains("[redacted]"), "{issue}");
+        assert!(!issue.contains("sk-proj"), "{issue}");
+        let quoted = issue.split_once("until it recovers (").unwrap().1;
+        assert!(
+            quoted.chars().count() <= READINESS_ERROR_MAX_CHARS + 1,
+            "{issue}"
+        );
     }
 
     #[tokio::test]
