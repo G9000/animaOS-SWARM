@@ -1121,6 +1121,8 @@ pub(crate) struct FlakyHistoryStore {
     usage_batches: Mutex<Vec<usize>>,
     panic_on_write: AtomicBool,
     existence_gate: Mutex<Option<StoreGate>>,
+    /// The text of the injected failure; a default when unset.
+    failure_text: Mutex<Option<String>>,
 }
 
 /// Holds one store call: the call adds a permit to `entered`, then waits for
@@ -1141,7 +1143,16 @@ impl FlakyHistoryStore {
             usage_batches: Mutex::new(Vec::new()),
             panic_on_write: AtomicBool::new(false),
             existence_gate: Mutex::new(None),
+            failure_text: Mutex::new(None),
         }
+    }
+
+    /// Sets the text of the failure `set_failing(true)` injects.
+    pub(crate) fn set_failure_text(&self, text: &str) {
+        *self
+            .failure_text
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(text.to_string());
     }
 
     pub(crate) fn set_failing(&self, failing: bool) {
@@ -1187,7 +1198,13 @@ impl FlakyHistoryStore {
 
     fn check(&self) -> Result<(), HistoryError> {
         if self.failing.load(Ordering::SeqCst) {
-            Err(HistoryError::new("injected history store failure"))
+            let text = self
+                .failure_text
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+                .unwrap_or_else(|| "injected history store failure".to_string());
+            Err(HistoryError::new(text))
         } else {
             Ok(())
         }

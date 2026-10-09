@@ -134,16 +134,16 @@ application endpoints. The summary below matches the live router in
 
 ### Operational and docs routes
 
-| Method | Path            | Description                                                                                                                        |
-| ------ | --------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| `GET`  | `/health`       | Liveness check. Always returns `200 OK` with `{"status":"ok"}`.                                                                    |
-| `GET`  | `/ready`        | Readiness check. Returns `200 OK` with `{"status":"ready",...}` when the daemon can serve traffic, otherwise `503` with issues.    |
-| `GET`  | `/metrics`      | Prometheus-style metrics for readiness, memory/runtime counts, persistence mode, configured limits, and background-process health. |
-| `GET`  | `/api/health`   | Same health payload as `/health`.                                                                                                  |
-| `GET`  | `/api/ready`    | Same readiness payload as `/ready`.                                                                                                |
-| `GET`  | `/openapi.json` | OpenAPI document for the live daemon routes.                                                                                       |
-| `GET`  | `/docs`         | Scalar API reference for exploring the daemon API in a browser.                                                                    |
-| `GET`  | `/docs/`        | Scalar API reference for exploring the daemon API in a browser.                                                                    |
+| Method | Path            | Description                                                                                                                                                                                                |
+| ------ | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET`  | `/health`       | Liveness check. Always returns `200 OK` with `{"status":"ok"}`.                                                                                                                                            |
+| `GET`  | `/ready`        | Readiness check. Returns `200 OK` with `{"status":"ready",...}` when the daemon can serve traffic, otherwise `503` with issues.                                                                            |
+| `GET`  | `/metrics`      | Prometheus-style metrics for readiness, memory/runtime counts, persistence mode, configured limits, background-process health, and the counts under Usage, logs, and health. Unauthenticated; counts only. |
+| `GET`  | `/api/health`   | Same health payload as `/health`.                                                                                                                                                                          |
+| `GET`  | `/api/ready`    | Same readiness payload as `/ready`.                                                                                                                                                                        |
+| `GET`  | `/openapi.json` | OpenAPI document for the live daemon routes.                                                                                                                                                               |
+| `GET`  | `/docs`         | Scalar API reference for exploring the daemon API in a browser.                                                                                                                                            |
+| `GET`  | `/docs/`        | Scalar API reference for exploring the daemon API in a browser.                                                                                                                                            |
 
 ### Agents
 
@@ -258,6 +258,20 @@ Both log routes require local-owner authorization and answer `Cache-Control: no-
 | ------ | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `GET`  | `/api/logs?level=&q=&after=&limit=` | `{ lines, newestSeq }`, oldest first. `level` is the lowest level to show (`error`, `warn`, `info`, `debug`, `trace`); `q` is case-insensitive text in the message or target (at most 200 characters); without `after`, the newest `limit` matches; with it, the first `limit` matches after that seq; `limit` 1–1,000 (default 200). `400` for an invalid `level`, `q`, `after`, or `limit`.                                                    |
 | `GET`  | `/api/logs/stream?level=&q=&after=` | Server-Sent Events. `event: log` carries one line; `event: resync` carries `{ "newestSeq": n }` when the stream fell behind (refetch the list after your newest seq; the stream continues after `n`). Without `after`, only new lines are sent; with it, the buffered lines after it first, then live lines, with no gap or repeat. At most 8 streams are open at once (`429`, `Too many log streams are open`); a closed stream frees its slot. |
+
+### Usage, logs, and health (owner)
+
+The Usage and Logs routes above and `GET /api/status` below are the owner's view of what the companion costs, what the daemon is doing, and whether it is healthy. Every one requires local-owner authorization and answers `Cache-Control: no-store` (errors included); `/metrics` is the one exception.
+
+| Method | Path          | Auth  | Query or body | Answers                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | Errors                                                |
+| ------ | ------------- | ----- | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------- |
+| `GET`  | `/api/status` | owner | none          | One snapshot: `version`, `buildRevision` (null unless the build set `ANIMAOS_BUILD_REVISION`), `startedAtMs`, `nowMs`, `uptimeSeconds`, `readiness`, `storage` (persistence mode, control plane, and the history store's health, queue sizes, redacted last error, and flush-error count), `providers` (whether each is configured, never a key), `connectors` (at most 50, never a credential), `automations`, `approvals` (pending), `runs`, `events`, `logs`, and `limits`. | `403` `local owner authorization required` for others |
+
+- Pricing overrides are control-plane state (snapshot version 10), and a run's usage rows are priced when the run is first mirrored; a later override changes only calls recorded afterwards. Providers that report usage before the last chunk keep it for stopped or failed calls; nothing is estimated for the others.
+- Logs are redacted at capture (bearer tokens, `sk-`, `xox`, and `ghp_` keys, `Authorization` headers, API-key query parameters, and JSON `apiKey`, `token`, and `secret` fields), then bounded: 2,000 lines of at most 4 KiB. `RUST_LOG=debug` can still surface more detail in the log tail.
+- `/metrics` stays unauthenticated and carries counts only: no agent names, ids, prompts, or costs. It adds uptime, runs by status (the run ledger prunes old finished runs, so these are not lifetime totals), pending approvals, open event streams, history outbox backlog, usage rows queued, whether the history store is failing, failing automations, buffered log lines, and the counters `anima_daemon_event_lagged_total`, `anima_daemon_history_flush_errors_total`, and `anima_daemon_messages_pruned_total`.
+- A steer sent while eight messages already wait for the companion (queued messages plus steers held by running runs) is refused with `429` and the daemon's message, like a ninth queued message.
+- Rolling back to a daemon older than M8 needs the `.pre-usage.bak` backup; see the rolling-back notes in Operational notes.
 
 ### Automations
 

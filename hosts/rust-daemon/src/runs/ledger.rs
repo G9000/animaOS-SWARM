@@ -1,7 +1,7 @@
 //! Durable run ledger (spec §4.1): one record per coordinator run, kept in the
 //! control-plane snapshot, with restart recovery (spec §4.8) and retention.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anima_core::TokenUsage;
 use serde::{Deserialize, Serialize};
@@ -468,12 +468,39 @@ impl RunLedger {
             .count()
     }
 
-    /// Runs of this agent accepted but not started (spec §4.2's queue).
+    /// Messages of this agent waiting for their turn (spec §4.2's queue): its
+    /// `Queued` runs plus the steers its other runs hold that no transcript
+    /// or run of their own has taken in yet (M3 carry-over; a steer waits as
+    /// surely as a queued run does).
     pub(crate) fn queued_count(&self, agent_id: &str) -> usize {
         self.records
             .values()
-            .filter(|record| record.agent_id == agent_id && record.status == RunStatus::Queued)
-            .count()
+            .filter(|record| record.agent_id == agent_id)
+            .map(|record| {
+                usize::from(record.status == RunStatus::Queued) + record.pending_steers.len()
+            })
+            .sum()
+    }
+
+    /// Runs the ledger holds, by status name (spec §11.3). Every status is
+    /// listed, with 0 when none.
+    pub(crate) fn status_counts(&self) -> BTreeMap<&'static str, usize> {
+        let mut counts: BTreeMap<&'static str, usize> = [
+            RunStatus::Queued,
+            RunStatus::Running,
+            RunStatus::AwaitingApproval,
+            RunStatus::Completed,
+            RunStatus::Failed,
+            RunStatus::Cancelled,
+            RunStatus::Interrupted,
+        ]
+        .into_iter()
+        .map(|status| (status.as_str(), 0))
+        .collect();
+        for record in self.records.values() {
+            *counts.entry(record.status.as_str()).or_default() += 1;
+        }
+        counts
     }
 
     /// The newest run of this agent created with `key` at or after `since_ms`.
@@ -1517,6 +1544,63 @@ mod tests {
         assert_eq!(run.started_at_ms, Some(20));
         assert_eq!(run.model, "gpt-5.5");
         assert_eq!(ledger.queued_count("agent-1"), 0);
+    }
+
+    fn steer(key: &str) -> RunSteer {
+        RunSteer {
+            idempotency_key: key.into(),
+            text: key.into(),
+            accepted_at_ms: 1,
+        }
+    }
+
+    #[test]
+    fn pending_steers_count_toward_the_waiting_total() {
+        let mut ledger = RunLedger::default();
+        let mut running = record("agent-1", 10);
+        running.pending_steers = vec![steer("a"), steer("b")];
+        ledger.insert(running);
+        let mut other = record("agent-2", 11);
+        other.pending_steers = vec![steer("c")];
+        ledger.insert(other);
+        ledger.insert(RunRecord::queued(start("agent-1"), 12));
+        assert_eq!(ledger.queued_count("agent-1"), 3);
+        assert_eq!(ledger.queued_count("agent-2"), 1);
+        assert_eq!(ledger.queued_count("agent-3"), 0);
+    }
+
+    #[test]
+    fn a_queued_run_is_counted_once() {
+        let mut ledger = RunLedger::default();
+        ledger.insert(RunRecord::queued(start("agent-1"), 10));
+        ledger.insert(RunRecord::queued(start("agent-1"), 11));
+        assert_eq!(ledger.queued_count("agent-1"), 2);
+    }
+
+    #[test]
+    fn status_counts_lists_every_status() {
+        let mut ledger = RunLedger::default();
+        ledger.insert(RunRecord::queued(start("agent-1"), 10));
+        ledger.insert(record("agent-1", 11));
+        ledger.insert(record("agent-2", 12));
+        ledger.insert(finished("agent-1", 13));
+        let counts = ledger.status_counts();
+        assert_eq!(
+            counts.keys().copied().collect::<Vec<_>>(),
+            [
+                "awaiting_approval",
+                "cancelled",
+                "completed",
+                "failed",
+                "interrupted",
+                "queued",
+                "running"
+            ]
+        );
+        assert_eq!(counts["queued"], 1);
+        assert_eq!(counts["running"], 2);
+        assert_eq!(counts["completed"], 1);
+        assert_eq!(counts["failed"], 0);
     }
 
     #[test]

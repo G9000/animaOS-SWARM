@@ -12,6 +12,7 @@ mod schedules;
 mod sessions;
 mod shared;
 mod skills;
+mod status;
 mod swarms;
 mod usage;
 mod workspace;
@@ -53,6 +54,7 @@ pub(crate) use shared::{
     TaskResultResponse,
 };
 pub(crate) use skills::*;
+pub(crate) use status::*;
 pub(crate) use swarms::{
     SwarmCreateRequest, SwarmEnvelope, SwarmEventResponse, SwarmRunEnvelope, SwarmStateResponse,
     SwarmsEnvelope,

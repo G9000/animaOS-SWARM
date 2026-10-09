@@ -16,7 +16,7 @@
 //! those rows are lost on a crash before the next flush.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
 use std::time::Duration;
 
@@ -73,6 +73,8 @@ struct OutboxState {
     failing_since_ms: Option<u64>,
     consecutive_failures: u32,
     last_error: Option<String>,
+    /// Failed flushes since start (spec 11.3).
+    flush_errors: u64,
 }
 
 impl OutboxState {
@@ -120,12 +122,28 @@ struct UsageQueue {
     overflowing: bool,
 }
 
+/// What the status and metrics routes read from the outbox (spec 11.3).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct HistoryStats {
+    /// Queued items not yet written.
+    pub(crate) pending: usize,
+    /// Secondary-call usage rows not yet written.
+    pub(crate) usage_queued: usize,
+    pub(crate) failing_since_ms: Option<u64>,
+    /// The latest failure's text, unredacted: the caller redacts it.
+    pub(crate) last_error: Option<String>,
+    pub(crate) flush_errors: u64,
+    /// Messages the pruner has moved out of the hot tail since start.
+    pub(crate) pruned_messages: u64,
+}
+
 pub(crate) struct HistoryService {
     store: Arc<dyn HistoryStore>,
     max_items: usize,
     outbox: StdMutex<OutboxState>,
     max_usage: usize,
     usage: StdMutex<UsageQueue>,
+    pruned_messages: AtomicU64,
     /// Hot message ids the store is known to hold; only these may be pruned.
     mirrored: StdMutex<HashSet<String>>,
     reconciled: AtomicBool,
@@ -155,6 +173,7 @@ impl HistoryService {
             outbox: StdMutex::new(OutboxState::default()),
             max_usage: max_usage.max(1),
             usage: StdMutex::new(UsageQueue::default()),
+            pruned_messages: AtomicU64::new(0),
             mirrored: StdMutex::new(HashSet::new()),
             reconciled: AtomicBool::new(false),
             wake: Notify::new(),
@@ -342,6 +361,26 @@ impl HistoryService {
         for id in message_ids {
             mirrored.insert(id.to_string());
         }
+    }
+
+    /// A snapshot of the outbox's health for the status and metrics routes.
+    pub(crate) fn stats(&self) -> HistoryStats {
+        let usage_queued = self.usage().rows.len();
+        let outbox = self.outbox();
+        HistoryStats {
+            pending: outbox.items.len(),
+            usage_queued,
+            failing_since_ms: outbox.failing_since_ms,
+            last_error: outbox.last_error.clone(),
+            flush_errors: outbox.flush_errors,
+            pruned_messages: self.pruned_messages.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Counts messages the pruner moved out of the hot tail.
+    pub(crate) fn note_pruned(&self, count: usize) {
+        self.pruned_messages
+            .fetch_add(count as u64, Ordering::Relaxed);
     }
 
     /// Queued items not yet written.
@@ -719,6 +758,7 @@ impl HistoryService {
             Err(error) => {
                 outbox.failing_since_ms.get_or_insert(now_ms);
                 outbox.consecutive_failures = outbox.consecutive_failures.saturating_add(1);
+                outbox.flush_errors = outbox.flush_errors.saturating_add(1);
                 outbox.last_error = Some(error.to_string());
                 warn!(
                     error = %error,
@@ -939,6 +979,67 @@ mod tests {
             FlushReport::default(),
             "nothing is written twice"
         );
+    }
+
+    #[tokio::test]
+    async fn stats_report_pending_failures_and_pruned_counts() {
+        let store = Arc::new(FlakyHistoryStore::new());
+        let (state, coordinator, agent_id) = state_with(HistoryService::new(store.clone())).await;
+        let transactions = coordinator.control_plane_transactions();
+        coordinator
+            .run(request(&agent_id, "chat:one", "hello"))
+            .await
+            .unwrap();
+        let history = state.read().await.history.clone();
+        history.enqueue_usage(vec![secondary_row("title_1", &agent_id, 5)]);
+        let before = history.stats();
+        assert_eq!((before.pending, before.usage_queued), (2, 1));
+        assert_eq!(
+            (
+                before.failing_since_ms,
+                before.last_error,
+                before.flush_errors
+            ),
+            (None, None, 0)
+        );
+
+        store.set_failing(true);
+        assert!(history
+            .flush_once(&state, &transactions, 1_000)
+            .await
+            .is_err());
+        assert!(history
+            .flush_once(&state, &transactions, 2_000)
+            .await
+            .is_err());
+        history.note_pruned(3);
+        history.note_pruned(2);
+        let failing = history.stats();
+        assert_eq!(failing.pending, 2);
+        assert_eq!(failing.failing_since_ms, Some(1_000));
+        assert_eq!(
+            failing.last_error.as_deref(),
+            Some("injected history store failure")
+        );
+        assert_eq!(failing.flush_errors, 2);
+        assert_eq!(failing.pruned_messages, 5);
+
+        store.set_failing(false);
+        history
+            .flush_once(&state, &transactions, 3_000)
+            .await
+            .unwrap();
+        let healed = history.stats();
+        assert_eq!(
+            (
+                healed.pending,
+                healed.usage_queued,
+                healed.failing_since_ms,
+                healed.last_error
+            ),
+            (0, 0, None, None)
+        );
+        assert_eq!(healed.flush_errors, 2, "the counter never resets");
     }
 
     #[tokio::test]

@@ -455,6 +455,11 @@ impl AgentRunCoordinator {
             }
             if request.mode == SessionRunMode::Steer {
                 if let Some(run_id) = joinable_run(&guard, &request.agent_id, &request.session_id) {
+                    // A steer waits like a queued message, so it counts toward
+                    // the same cap (M3 carry-over; controller ruling 5).
+                    if guard.runs.queued_count(&request.agent_id) >= MAX_QUEUED_RUNS_PER_AGENT {
+                        return Err(ApiError::too_many_requests(QUEUE_FULL));
+                    }
                     // Saved with the run it joins (audit I3); nothing else is.
                     let steer = RunSteer {
                         idempotency_key: request.idempotency_key.clone(),

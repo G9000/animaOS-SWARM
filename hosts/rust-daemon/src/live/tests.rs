@@ -342,6 +342,18 @@ async fn subscribers_are_capped_per_agent_and_released_on_drop() {
 }
 
 #[tokio::test]
+async fn total_subscribers_sums_every_agent() {
+    let hub = LiveHub::new(8);
+    assert_eq!(hub.total_subscribers(), 0);
+    let first = hub.subscribe("agent-1").unwrap();
+    let _second = hub.subscribe("agent-1").unwrap();
+    let _other = hub.subscribe("agent-2").unwrap();
+    assert_eq!(hub.total_subscribers(), 3);
+    drop(first);
+    assert_eq!(hub.total_subscribers(), 2);
+}
+
+#[tokio::test]
 async fn a_lagging_subscription_reports_how_many_events_it_missed() {
     let hub = LiveHub::new(2);
     let mut subscription = hub.subscribe("agent-1").unwrap();

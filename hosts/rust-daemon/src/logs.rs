@@ -224,7 +224,7 @@ impl LogBuffer {
         self.lock().newest_seq
     }
 
-    #[allow(dead_code)] // Serves status and metrics.
+    /// Lines held now, for status and metrics.
     pub(crate) fn buffered(&self) -> usize {
         self.lock().lines.len()
     }
