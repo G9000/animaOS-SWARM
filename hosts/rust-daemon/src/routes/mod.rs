@@ -1022,11 +1022,10 @@ async fn ready_entry(State(state): State<AppState>) -> AxumResponse {
 }
 
 async fn metrics_entry(State(state): State<AppState>) -> AxumResponse {
-    let snapshot = status::collect(
+    let snapshot = status::collect_for_metrics(
         &state.daemon,
         &state.config,
         &state.logs,
-        &state.connector_manager,
         state.started_at_ms,
         anima_core::primitives::now_millis(),
     )

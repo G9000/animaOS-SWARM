@@ -2180,6 +2180,8 @@ mod queue_tests;
 #[cfg(test)]
 mod skill_tests;
 #[cfg(test)]
+mod steer_cap_tests;
+#[cfg(test)]
 mod steer_tests;
 #[cfg(test)]
 mod stop_tests;

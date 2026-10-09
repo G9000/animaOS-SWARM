@@ -625,3 +625,98 @@ async fn metrics_need_no_authorization_and_carry_counts_only() {
         .unwrap();
     assert_eq!(refused.status(), StatusCode::FORBIDDEN);
 }
+
+#[tokio::test]
+async fn status_redacts_and_cuts_the_readiness_issues() {
+    let store = Arc::new(FlakyHistoryStore::new());
+    store.set_failure_text(&format!(
+        "connection to postgres failed with key sk-proj-AbCdEfGh12345678 {}",
+        "x".repeat(2 * MAX_STATUS_ERROR_CHARS)
+    ));
+    let history = HistoryService::new(store.clone());
+    let (mut daemon, agent) = daemon();
+    daemon.set_history(Arc::clone(&history));
+    let state = Arc::new(RwLock::new(daemon));
+    let app = app_for(&state, &LogBuffer::new());
+    history.enqueue_committed(
+        &agent,
+        "chat:one",
+        &[history_message("msg-1", &agent, "chat:one", MessageRole::User, "hi", 1).message],
+    );
+    store.set_failing(true);
+    let transactions = tokio::sync::Mutex::new(());
+    // Failing since long before the readiness grace.
+    assert!(history
+        .flush_once(&state, &transactions, 5_000)
+        .await
+        .is_err());
+
+    let body = status_of(&app).await;
+    assert_eq!(body["readiness"]["status"], "not_ready");
+    let issues = body["readiness"]["issues"].as_array().unwrap();
+    assert_eq!(issues.len(), 1);
+    let issue = issues[0].as_str().unwrap();
+    assert!(
+        issue.starts_with("history store writes have failed"),
+        "{issue}"
+    );
+    assert!(issue.contains("[redacted]"), "{issue}");
+    assert!(!issue.contains("sk-proj"), "{issue}");
+    assert!(issue.chars().count() <= MAX_STATUS_ERROR_CHARS);
+}
+
+/// The metrics skip the providers (a credential vault read) and the
+/// connectors (an await per connector), which no metric uses.
+#[tokio::test]
+async fn metrics_skip_providers_and_connectors_and_read_the_same() {
+    let (mut daemon, agent) = daemon();
+    daemon
+        .runs
+        .insert(RunRecord::running(run_start(&agent), 10));
+    daemon.connectors.insert(
+        "telegram-a".into(),
+        TelegramConnectorRecord {
+            id: "telegram-a".into(),
+            agent_id: agent.clone(),
+            room_id: "telegram-room-a".into(),
+            bot: TelegramBotIdentity {
+                id: "7".into(),
+                username: None,
+                display_name: None,
+            },
+            approved_chat: None,
+            pending_pairing: None,
+            next_update_id: 0,
+            enabled: true,
+            deleted_at_ms: None,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        },
+    );
+    let state = Arc::new(RwLock::new(daemon));
+    let limiter = Arc::new(Semaphore::new(4));
+    let manager = ConnectorManager::new(
+        Arc::clone(&state),
+        AgentRunCoordinator::new(Arc::clone(&state), limiter),
+        Arc::new(InMemoryCredentialStore::default()),
+        Arc::new(CountingTelegramTransport::default()),
+    );
+    let config = DaemonConfig::default();
+    let logs = LogBuffer::new();
+    let full = collect(&state, &config, &logs, &manager, 1_000_000, 1_090_999).await;
+    let metrics =
+        crate::routes::status::collect_for_metrics(&state, &config, &logs, 1_000_000, 1_090_999)
+            .await;
+
+    assert_eq!(full.response.connectors.len(), 1);
+    assert!(!full.response.providers.is_empty());
+    assert!(metrics.response.connectors.is_empty());
+    assert!(metrics.response.providers.is_empty());
+    let text = |snapshot| crate::routes::health::handle_metrics(&state, &config, snapshot);
+    let (from_full, from_metrics) = (text(&full).await, text(&metrics).await);
+    assert!(
+        from_full.contains("anima_daemon_runs_running 1"),
+        "{from_full}"
+    );
+    assert_eq!(from_full, from_metrics);
+}

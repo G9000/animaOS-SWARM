@@ -15,7 +15,7 @@ use super::{AcceptRun, AcceptedRun, AgentRunCoordinator, SessionRunMode};
 use crate::control_plane_store::{load_control_plane_snapshot, ControlPlaneStoreConfig};
 use crate::runs::{RunLedger, RunRecord, RunSource, RunStatus, RunSteer, RunStopRequest};
 
-fn message(agent_id: &str, key: &str, text: &str, mode: SessionRunMode) -> AcceptRun {
+pub(super) fn message(agent_id: &str, key: &str, text: &str, mode: SessionRunMode) -> AcceptRun {
     AcceptRun {
         agent_id: agent_id.into(),
         session_id: "chat:s".into(),
@@ -28,7 +28,7 @@ fn message(agent_id: &str, key: &str, text: &str, mode: SessionRunMode) -> Accep
     }
 }
 
-async fn accept(coordinator: &AgentRunCoordinator, request: AcceptRun) -> AcceptedRun {
+pub(super) async fn accept(coordinator: &AgentRunCoordinator, request: AcceptRun) -> AcceptedRun {
     let start = coordinator.web_start(
         request.agent_id.clone(),
         request.session_id.clone(),
@@ -38,7 +38,7 @@ async fn accept(coordinator: &AgentRunCoordinator, request: AcceptRun) -> Accept
     coordinator.accept_run(request, start).await.unwrap()
 }
 
-async fn wait_for_key(
+pub(super) async fn wait_for_key(
     coordinator: &AgentRunCoordinator,
     agent_id: &str,
     key: &str,

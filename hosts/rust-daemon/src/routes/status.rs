@@ -41,11 +41,46 @@ fn shown_error(error: &str) -> String {
     redact(error).chars().take(MAX_STATUS_ERROR_CHARS).collect()
 }
 
+/// The full snapshot behind `GET /api/status`.
 pub(crate) async fn collect(
     state: &SharedDaemonState,
     config: &DaemonConfig,
     logs: &LogBuffer,
     connector_manager: &ConnectorManager,
+    started_at_ms: u64,
+    now_ms: u64,
+) -> StatusSnapshot {
+    collect_parts(
+        state,
+        config,
+        logs,
+        Some(connector_manager),
+        started_at_ms,
+        now_ms,
+    )
+    .await
+}
+
+/// The snapshot `/metrics` reads: no metric comes from the providers or the
+/// connectors, so an unauthenticated scrape reads no credential vault and
+/// awaits no connector; both lists are left empty.
+pub(crate) async fn collect_for_metrics(
+    state: &SharedDaemonState,
+    config: &DaemonConfig,
+    logs: &LogBuffer,
+    started_at_ms: u64,
+    now_ms: u64,
+) -> StatusSnapshot {
+    collect_parts(state, config, logs, None, started_at_ms, now_ms).await
+}
+
+/// `connector_manager` is `None` for the metrics, which skip the providers
+/// and the connectors.
+async fn collect_parts(
+    state: &SharedDaemonState,
+    config: &DaemonConfig,
+    logs: &LogBuffer,
+    connector_manager: Option<&ConnectorManager>,
     started_at_ms: u64,
     now_ms: u64,
 ) -> StatusSnapshot {
@@ -77,12 +112,16 @@ pub(crate) async fn collect(
                 totals
             },
         );
-        let connector_records = guard
-            .connectors
-            .values()
-            .filter(|connector| connector.deleted_at_ms.is_none())
-            .cloned()
-            .collect::<Vec<_>>();
+        let connector_records = if connector_manager.is_some() {
+            guard
+                .connectors
+                .values()
+                .filter(|connector| connector.deleted_at_ms.is_none())
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         (
             guard.history.clone(),
             guard.live.clone(),
@@ -102,6 +141,9 @@ pub(crate) async fn collect(
 
     let mut connectors = Vec::with_capacity(connector_records.len());
     for record in &connector_records {
+        let Some(connector_manager) = connector_manager else {
+            break;
+        };
         let status = connector_manager.status(&record.id).await.unwrap_or(
             if record.approved_chat.is_some() {
                 ConnectorRuntimeStatus::Ready
@@ -117,15 +159,18 @@ pub(crate) async fn collect(
             enabled: record.enabled,
         });
     }
-    let providers = provider_responses(state)
-        .await
-        .into_iter()
-        .map(|provider| StatusProvider {
-            id: provider.id,
-            label: provider.label,
-            configured: provider.configured,
-        })
-        .collect();
+    let providers = match connector_manager {
+        Some(_) => provider_responses(state)
+            .await
+            .into_iter()
+            .map(|provider| StatusProvider {
+                id: provider.id,
+                label: provider.label,
+                configured: provider.configured,
+            })
+            .collect(),
+        None => Vec::new(),
+    };
 
     let stats = history.stats();
     let by_status = run_counts
@@ -141,7 +186,12 @@ pub(crate) async fn collect(
         uptime_seconds: now_ms.saturating_sub(started_at_ms) / 1_000,
         readiness: StatusReadiness {
             status: readiness.status,
-            issues: readiness.issues,
+            // An issue can quote the history store's last error.
+            issues: readiness
+                .issues
+                .iter()
+                .map(|issue| shown_error(issue))
+                .collect(),
         },
         storage: StatusStorage {
             persistence_mode: readiness.persistence_mode,
