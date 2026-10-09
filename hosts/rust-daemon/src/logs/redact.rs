@@ -37,7 +37,7 @@ fn patterns() -> &'static Patterns {
             bearer: build(r"(?i)\b(bearer\s+)[A-Za-z0-9\-._~+/]{8,}=*"),
             // (3) `key=value`, `key: value`, and JSON `"key":"value"` with a secret-looking key.
             labeled: build(
-                r#"(?i)([A-Za-z0-9_\-]*(?:api[_\-]?key|secret|token|password|passwd|credential|cookie|session_id|private[_\-]?key)[A-Za-z0-9_\-]*)(\\?["']?\s*[:=]\s*)(\[redacted\]|\\"(?:[^"\\]|\\[^"])*\\"|"(?:[^"\\]|\\.)*"|'[^']*'|[^\s,;&"'}\]]+)"#,
+                r#"(?i)([A-Za-z0-9_\-]*(?:api[_\-]?key|secret|token|password|passwd|credential|cookie|private[_\-]?key)[A-Za-z0-9_\-]*)(\\?["']?\s*[:=]\s*)(\[redacted\]|\\"(?:[^"\\]|\\[^"])*\\"|"(?:[^"\\]|\\.)*"|'[^']*'|[^\s,;&"'}\]]+)"#,
             ),
             // (4) URL query values for credential-bearing parameters.
             query: build(
@@ -48,7 +48,7 @@ fn patterns() -> &'static Patterns {
             telegram_bare: build(r"\b\d{6,12}:[A-Za-z0-9_\-]{30,}"),
             // (6) Known key prefixes.
             prefixed: build(
-                r"\b(?:(?:sk-ant-|sk-proj-|sk-|pk-|rk-|ghp_|gho_|ghu_|ghs_|github_pat_|xox[abprs]-|glpat-|AIza)[A-Za-z0-9_\-]{8,}|ya29\.[A-Za-z0-9_\-.]{8,}|AKIA[0-9A-Z]{16})",
+                r"\b(?:(?:sk-ant-|sk-proj-|sk-|pk-|rk-|ghp_|gho_|ghu_|ghs_|github_pat_|glpat-|AIza)[A-Za-z0-9_\-]{8,}|(?:xox[abprs]-|ya29\.)[A-Za-z0-9_\-.]{8,}|AKIA[0-9A-Z]{16})",
             ),
             // (7) JWTs.
             jwt: build(r"\beyJ[A-Za-z0-9_\-]{2,}\.[A-Za-z0-9_\-]{2,}\.[A-Za-z0-9_\-]*"),
@@ -257,6 +257,25 @@ mod tests {
         for (input, secrets) in &cases {
             assert_redacted(input, secrets);
         }
+    }
+
+    #[test]
+    fn a_slack_token_is_redacted_whole_including_dots_and_hyphens() {
+        let output = redact("slack xoxb-1234-5678.abcd-EFGH.ijkl9 failed");
+        assert_eq!(output, format!("slack {LOG_REDACTED} failed"));
+        assert_redacted(
+            "xoxp-111-222-333-abcdef012345",
+            &["abcdef012345", "xoxp-111"],
+        );
+    }
+
+    #[test]
+    fn a_session_id_names_a_chat_session_and_is_not_a_secret() {
+        let text = "session_id=sess_42 started and sessionId: abc";
+        assert_eq!(redact(text), text);
+        assert!(!is_secret_field("session_id"));
+        // A cookie header that carries one is still redacted by its label.
+        assert_redacted("Cookie: session_id=cookievalue123", &["cookievalue123"]);
     }
 
     #[test]

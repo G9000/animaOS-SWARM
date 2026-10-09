@@ -413,6 +413,7 @@ fn router_with_runtime(
         runtime.scheduler,
         runtime.jobs,
         history_owner.clone(),
+        crate::logs::global(),
         bind_is_loopback,
     );
     if tokio::runtime::Handle::try_current().is_ok() {

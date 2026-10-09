@@ -18,27 +18,27 @@ fn events_request(agent_id: &str, origin: &str) -> Request<Body> {
 }
 
 /// One parsed SSE block.
-struct SseEvent {
-    id: Option<String>,
-    event: Option<String>,
-    data: serde_json::Value,
+pub(super) struct SseEvent {
+    pub(super) id: Option<String>,
+    pub(super) event: Option<String>,
+    pub(super) data: serde_json::Value,
 }
 
 /// Reads a text/event-stream body one event at a time, skipping keep-alives.
-struct SseReader {
+pub(super) struct SseReader {
     body: Body,
     buffer: String,
 }
 
 impl SseReader {
-    fn new(response: axum::response::Response) -> Self {
+    pub(super) fn new(response: axum::response::Response) -> Self {
         Self {
             body: response.into_body(),
             buffer: String::new(),
         }
     }
 
-    async fn next(&mut self) -> SseEvent {
+    pub(super) async fn next(&mut self) -> SseEvent {
         loop {
             if let Some(end) = self.buffer.find("\n\n") {
                 let block: String = self.buffer.drain(..end + 2).collect();

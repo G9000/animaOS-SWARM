@@ -42,7 +42,6 @@ pub(crate) enum LogLevel {
     Error,
 }
 
-#[allow(dead_code)] // `parse` and `as_str` serve the log routes.
 impl LogLevel {
     pub(crate) fn parse(text: &str) -> Option<Self> {
         match text.to_ascii_lowercase().as_str() {
@@ -99,7 +98,6 @@ pub(crate) struct LogFilter {
     pub(crate) query: Option<String>,
 }
 
-#[allow(dead_code)] // Serves the log routes.
 impl LogFilter {
     pub(crate) fn new(min_level: Option<LogLevel>, query: Option<&str>) -> Self {
         Self {
@@ -188,7 +186,6 @@ impl LogBuffer {
 
     /// Oldest first. No `after`: the newest `limit` matches. With `after`:
     /// the first `limit` matches with seq > after.
-    #[allow(dead_code)] // Serves the log routes.
     pub(crate) fn lines(
         &self,
         filter: &LogFilter,
@@ -223,7 +220,6 @@ impl LogBuffer {
     }
 
     /// The newest seq assigned; 0 before the first line.
-    #[allow(dead_code)] // Serves the log routes and status.
     pub(crate) fn newest_seq(&self) -> u64 {
         self.lock().newest_seq
     }
@@ -235,7 +231,6 @@ impl LogBuffer {
 
     /// The lines with seq > after and a receiver, taken under one lock hold,
     /// so no line falls between them.
-    #[allow(dead_code)] // Serves the log stream.
     pub(crate) fn subscribe_after(
         &self,
         after: u64,
@@ -253,7 +248,6 @@ impl LogBuffer {
 
     /// Takes one of `max` stream slots, or `None` when all are taken. The
     /// guard's `Drop` frees the slot.
-    #[allow(dead_code)] // Serves the log stream.
     pub(crate) fn try_open_stream(self: &Arc<Self>, max: usize) -> Option<StreamGuard> {
         let mut current = self.streams.load(Ordering::Acquire);
         loop {

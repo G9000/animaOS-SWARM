@@ -3,6 +3,7 @@ mod agents;
 mod approvals;
 mod connectors;
 mod gcalendar;
+mod logs;
 mod memories;
 mod memory_edits;
 mod providers;
@@ -28,6 +29,7 @@ pub(crate) use agents::{
 pub(crate) use approvals::*;
 pub(crate) use connectors::*;
 pub(crate) use gcalendar::*;
+pub(crate) use logs::{LogLineResponse, LogsEnvelope};
 pub(crate) use memories::{
     AgentRelationshipCreateRequest, AgentRelationshipQuery, AgentRelationshipResponse,
     AgentRelationshipsEnvelope, MemoriesEnvelope, MemoryCreateRequest, MemoryEntitiesEnvelope,
