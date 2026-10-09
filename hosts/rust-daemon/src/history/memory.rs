@@ -12,6 +12,7 @@ use super::{
 };
 use crate::approvals::ApprovalRequest;
 use crate::runs::RunRecord;
+use crate::schedules::ScheduleFireRecord;
 
 pub(crate) struct MemoryHistoryStore {
     max_rows: usize,
@@ -27,6 +28,8 @@ struct Tables {
     run_seqs: BTreeMap<u64, String>,
     approvals: HashMap<String, (u64, ApprovalRequest)>,
     approval_seqs: BTreeMap<u64, String>,
+    schedule_runs: HashMap<String, (u64, ScheduleFireRecord)>,
+    schedule_run_seqs: BTreeMap<u64, String>,
 }
 
 impl MemoryHistoryStore {
@@ -313,6 +316,46 @@ impl HistoryStore for MemoryHistoryStore {
         Ok(rows)
     }
 
+    async fn upsert_schedule_runs(&self, fires: &[ScheduleFireRecord]) -> Result<(), HistoryError> {
+        let mut guard = self.tables();
+        let tables = &mut *guard;
+        for fire in fires {
+            upsert(
+                &mut tables.schedule_runs,
+                &mut tables.schedule_run_seqs,
+                &mut tables.next_seq,
+                fire.id.clone(),
+                fire.clone(),
+                self.max_rows,
+            );
+        }
+        Ok(())
+    }
+
+    async fn page_schedule_runs(
+        &self,
+        agent_id: &str,
+        schedule_id: &str,
+        limit: usize,
+    ) -> Result<Vec<ScheduleFireRecord>, HistoryError> {
+        let tables = self.tables();
+        let mut rows = tables
+            .schedule_runs
+            .values()
+            .map(|(_, fire)| fire)
+            .filter(|fire| fire.agent_id == agent_id && fire.schedule_id == schedule_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        rows.sort_by(|left, right| {
+            right
+                .fired_at_ms
+                .cmp(&left.fired_at_ms)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        rows.truncate(limit);
+        Ok(rows)
+    }
+
     async fn delete_session(&self, agent_id: &str, session_id: &str) -> Result<(), HistoryError> {
         let mut guard = self.tables();
         let tables = &mut *guard;
@@ -344,6 +387,11 @@ impl HistoryStore for MemoryHistoryStore {
             &mut tables.approval_seqs,
             |approval| approval.agent_id == agent_id,
         );
+        remove_where(
+            &mut tables.schedule_runs,
+            &mut tables.schedule_run_seqs,
+            |fire| fire.agent_id == agent_id,
+        );
         Ok(())
     }
 }
@@ -355,6 +403,7 @@ mod tests {
         assert_history_store_approval_conformance, assert_history_store_checkin_text_conformance,
         assert_history_store_conformance, assert_history_store_diacritics_conformance,
         assert_history_store_indexed_text_cap_conformance,
+        assert_history_store_schedule_run_conformance,
         assert_history_store_session_search_conformance, history_message,
     };
     use anima_core::MessageRole;
@@ -368,6 +417,7 @@ mod tests {
         assert_history_store_indexed_text_cap_conformance(&store).await;
         assert_history_store_diacritics_conformance(&store).await;
         assert_history_store_approval_conformance(&store).await;
+        assert_history_store_schedule_run_conformance(&store).await;
     }
 
     #[tokio::test]

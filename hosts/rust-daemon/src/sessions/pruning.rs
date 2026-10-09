@@ -16,7 +16,8 @@ use crate::state::DaemonState;
 
 /// Each session keeps at least its newest 200 visible messages (spec §16).
 /// Hidden messages -- silent check-in pairs (spec §3.3) -- take no place
-/// among them (Controller ruling 1, M2 pre-flight audit).
+/// among them (Controller ruling 1, M2 pre-flight audit), and since M6 they
+/// leave once old and mirrored wherever they sit.
 pub(crate) const HOT_TAIL_MESSAGES: usize = 200;
 /// Messages created in the last 24 hours always stay.
 pub(crate) const HOT_TAIL_MIN_AGE_MS: u64 = 24 * 60 * 60 * 1_000;
@@ -69,22 +70,25 @@ impl DaemonState {
             }
             let mut prunable = HashSet::new();
             for (room_id, messages) in rooms {
-                // A room no longer than the window has no candidates.
-                if messages.len() <= HOT_TAIL_MESSAGES
-                    || active_sessions.contains(&(agent_id.clone(), session_id_for_room(room_id)))
-                {
+                if active_sessions.contains(&(agent_id.clone(), session_id_for_room(room_id))) {
                     continue;
                 }
                 let hidden = hidden_message_ids(messages.iter().copied());
-                let room_prunable: Vec<&Message> = outside_newest_visible(&messages, &hidden)
-                    .iter()
-                    .copied()
-                    .filter(|message| {
-                        message.created_at_ms <= cutoff
-                            && !undelivered_references.contains(message.id.as_str())
-                            && self.history.is_mirrored(&message.id)
-                    })
-                    .collect();
+                let eligible = |message: &&Message| {
+                    message.created_at_ms <= cutoff
+                        && !undelivered_references.contains(message.id.as_str())
+                        && self.history.is_mirrored(&message.id)
+                };
+                // A room no longer than the window has no window candidates.
+                let room_prunable: Vec<&Message> = if messages.len() > HOT_TAIL_MESSAGES {
+                    outside_newest_visible(&messages, &hidden)
+                        .iter()
+                        .copied()
+                        .filter(eligible)
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 // The mark names the newest pruned message the model could
                 // see: silent check-in pairs leaving take nothing out of its
                 // view, so a pass pruning only those leaves the mark alone.
@@ -100,6 +104,15 @@ impl DaemonState {
                     ));
                 }
                 prunable.extend(room_prunable.iter().map(|message| message.id.clone()));
+                // M6: a silent check-in turn leaves once every message of it
+                // is old, mirrored, and unreferenced, wherever it sits, so a
+                // heartbeat's session does not grow the control plane forever
+                // (see the M6 plan's notes on spec §13.2).
+                for turn in silent_turns(&messages, &hidden) {
+                    if turn.iter().all(eligible) {
+                        prunable.extend(turn.iter().map(|message| message.id.clone()));
+                    }
+                }
             }
             if !prunable.is_empty() {
                 prunable_by_agent.push((agent_id.clone(), prunable));
@@ -214,6 +227,29 @@ fn outside_newest_visible<'m, 'a>(
         .find(|&start| start <= edge)
         .unwrap_or(0);
     &messages[..cut]
+}
+
+/// A room's hidden messages grouped into their turns (a user message starts
+/// one), so a silent check-in pair only ever leaves whole.
+fn silent_turns<'a>(messages: &[&'a Message], hidden: &HashSet<String>) -> Vec<Vec<&'a Message>> {
+    let mut turns = Vec::new();
+    let mut current: Vec<&'a Message> = Vec::new();
+    for &message in messages {
+        if !hidden.contains(&message.id) {
+            if !current.is_empty() {
+                turns.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        if message.role == anima_core::MessageRole::User && !current.is_empty() {
+            turns.push(std::mem::take(&mut current));
+        }
+        current.push(message);
+    }
+    if !current.is_empty() {
+        turns.push(current);
+    }
+    turns
 }
 
 /// One pruning pass inside a control-plane transaction; returns how many
@@ -465,17 +501,15 @@ mod tests {
 
         let mut pruned = undo.message_ids.clone();
         pruned.sort();
-        assert_eq!(
-            pruned,
-            [
-                "silent-0-prompt",
-                "silent-0-reply",
-                "silent-1-prompt",
-                "silent-1-reply",
-                "silent-2-prompt",
-                "silent-2-reply",
-            ]
-        );
+        let mut expected = (95..100)
+            .map(|index| format!("recent-silent-{index}"))
+            .chain((0..3).map(|index| format!("silent-{index}")))
+            .flat_map(|turn| [format!("{turn}-prompt"), format!("{turn}-reply")])
+            .collect::<Vec<_>>();
+        expected.sort();
+        // M6: old, mirrored silent pairs leave wherever they sit, including
+        // those among the newest 200 visible messages.
+        assert_eq!(pruned, expected);
         let hot = guard.get_agent(&agent).unwrap().messages;
         assert_eq!(
             hot.iter()
@@ -484,10 +518,79 @@ mod tests {
             200,
             "silent pairs never push a visible message out of the newest 200"
         );
+        assert_eq!(hot.len(), 200, "no silent pair is left");
+    }
+
+    #[tokio::test]
+    async fn silent_checkin_pairs_leave_a_small_room_once_old_and_mirrored() {
+        // M6: a heartbeat writes a silent pair every 30 minutes into a room
+        // with few visible messages; without this, those pairs would never
+        // leave the control plane.
+        let (state, agent) = mirrored_state(|agent| {
+            let mut messages = Vec::new();
+            messages.extend(checkin_turn(agent, "spoken-a", "Something came up.", 1_000));
+            for index in 0..10u64 {
+                messages.extend(checkin_turn(
+                    agent,
+                    &format!("silent-{index}"),
+                    "CHECKIN_OK",
+                    2_000 + 2 * index,
+                ));
+            }
+            messages.extend(checkin_turn(agent, "spoken-b", "Another update.", 3_000));
+            messages.extend(checkin_turn(agent, "half-mirrored", "CHECKIN_OK", 3_100));
+            messages.extend(checkin_turn(agent, "recent", "CHECKIN_OK", NOW_MS - 1_000));
+            messages
+        })
+        .await;
+        let history = state.read().await.history.clone();
+        history.forget_mirrored(["half-mirrored-reply"]);
+        let mut guard = state.write().await;
+
+        let undo = guard
+            .prune_hot_tail(NOW_MS)
+            .expect("the old, mirrored silent pairs leave");
+
+        let mut pruned = undo.message_ids.clone();
+        pruned.sort();
+        let mut expected = (0..10)
+            .flat_map(|index| {
+                [
+                    format!("silent-{index}-prompt"),
+                    format!("silent-{index}-reply"),
+                ]
+            })
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(pruned, expected);
+        let hot = guard
+            .get_agent(&agent)
+            .unwrap()
+            .messages
+            .into_iter()
+            .map(|message| message.id)
+            .collect::<Vec<_>>();
         assert_eq!(
-            hot.len(),
-            210,
-            "silent pairs among the newest 200 visible messages stay with them"
+            hot,
+            [
+                "spoken-a-prompt",
+                "spoken-a-reply",
+                "spoken-b-prompt",
+                "spoken-b-reply",
+                "half-mirrored-prompt",
+                "half-mirrored-reply",
+                "recent-prompt",
+                "recent-reply",
+            ],
+            "visible turns, a pair not wholly mirrored, and a recent pair stay"
+        );
+        assert!(
+            guard
+                .sessions
+                .get(&agent, "schedule:s1")
+                .and_then(|session| session.pruned_through.clone())
+                .is_none(),
+            "silent pairs never move the pruned-through mark"
         );
     }
 

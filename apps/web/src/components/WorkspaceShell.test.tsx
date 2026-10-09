@@ -246,7 +246,7 @@ describe('WorkspaceShell', () => {
   });
 
   it('shows the conversation for pages that arrive in later releases', () => {
-    render(<Shell initialRoute={{ kind: 'page', page: 'automations' }} />);
+    render(<Shell initialRoute={{ kind: 'page', page: 'memory' }} />);
     expect(screen.getByText('Workspace canvas')).toBeVisible();
     expect(
       screen.queryByRole('button', { name: 'Open companion chat' }),
@@ -270,6 +270,22 @@ describe('WorkspaceShell', () => {
     expect(screen.getByText('Workspace canvas')).not.toBeVisible();
     expect(
       within(nav).getByRole('button', { name: 'Approvals, 2 waiting' }),
+    ).toHaveAttribute('aria-current', 'page');
+  });
+
+  it('opens Automations from the navigation', async () => {
+    const user = userEvent.setup();
+    render(<Shell automations={<div>Automations page</div>} />);
+    const nav = screen.getByRole('navigation', {
+      name: 'Workspace navigation',
+    });
+
+    await user.click(within(nav).getByRole('button', { name: 'Automations' }));
+
+    expect(screen.getByText('Automations page')).toBeVisible();
+    expect(screen.getByText('Workspace canvas')).not.toBeVisible();
+    expect(
+      within(nav).getByRole('button', { name: 'Automations' }),
     ).toHaveAttribute('aria-current', 'page');
   });
 

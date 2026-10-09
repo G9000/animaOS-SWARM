@@ -4,6 +4,7 @@ import {
   createDaemonClient,
   isApprovalEvent,
   isRunLifecycleEvent,
+  isAutomationEvent,
   isSkillEvent,
   type AgentEvent,
 } from './index.js';
@@ -157,6 +158,30 @@ describe('isSkillEvent', () => {
         seq: 1,
         at: 1,
         missed: 2,
+      }),
+    ).toBe(false);
+  });
+});
+
+describe('isAutomationEvent', () => {
+  it('recognizes automation.updated', () => {
+    const event: AgentEvent = {
+      type: 'automation.updated',
+      agentId: 'agent-1',
+      seq: 4,
+      at: 5,
+      scheduleId: 'schedule-1',
+      deleted: false,
+    };
+    expect(isAutomationEvent(event)).toBe(true);
+    expect(
+      isAutomationEvent({
+        type: 'skill.updated',
+        agentId: 'a',
+        seq: 1,
+        at: 1,
+        slug: null,
+        draftId: null,
       }),
     ).toBe(false);
   });

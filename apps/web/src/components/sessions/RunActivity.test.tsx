@@ -2,9 +2,11 @@ import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 
+import { automationNoticeFor } from '../../lib/automations';
 import { emptyLiveRun } from '../../lib/session-events';
 import type { ToolStep } from '../../lib/transcript';
 import type { ChatMessage } from '../../lib/types';
+import { automationFixture } from '../../test/automations';
 import { approvalFixture, runFixture } from '../../test/live';
 import { PendingMessage, RunActivity, ToolBlock } from './RunActivity';
 import { RunOutcomeCard } from './RunOutcomeCard';
@@ -197,6 +199,45 @@ describe('RunActivity', () => {
 });
 
 describe('ToolBlock', () => {
+  it('shows a notice card with Undo for a created automation, even collapsed', async () => {
+    const user = userEvent.setup();
+    const made = automationFixture('schedule-1', {
+      name: 'Stretch',
+      createdBy: {
+        kind: 'agent',
+        agentId: 'agent-main',
+        sessionId: 'chat:1',
+        runId: 'run_1',
+        toolCallId: 'call-automation',
+      },
+    });
+    const undo = vi.fn().mockResolvedValue(false);
+    render(
+      <ToolBlock
+        steps={[
+          step,
+          { ...step, name: 'create_automation', toolCallId: 'call-automation' },
+        ]}
+        active={false}
+        actions={{
+          automationNotice: (candidate) =>
+            automationNoticeFor(candidate, [made]),
+          onUndoAutomation: undo,
+        }}
+      />,
+    );
+
+    const card = screen.getByRole('note', { name: 'Automation Stretch' });
+    expect(within(card).getByText(/every 30 min/)).toBeVisible();
+    await user.click(within(card).getByRole('button', { name: 'Undo' }));
+    expect(undo).toHaveBeenCalledWith(made);
+    // A refused Undo can be tried again.
+    expect(
+      await within(card).findByRole('button', { name: 'Undo' }),
+    ).toBeEnabled();
+    expect(screen.getAllByRole('note')).toHaveLength(1);
+  });
+
   it('collapses finished steps to their totals', async () => {
     const user = userEvent.setup();
     render(

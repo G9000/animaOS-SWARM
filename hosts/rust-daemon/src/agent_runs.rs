@@ -22,6 +22,7 @@ use crate::runs::{
 use crate::state::DaemonState;
 
 mod approvals;
+mod automations;
 mod compact;
 mod conversations;
 mod queue;
@@ -111,8 +112,9 @@ fn helper_config(parent: &AgentState, name: String) -> AgentConfig {
         // ruling 1, M3 Task 14 pre-flight audit) and is withheld from
         // helpers even when the parent has it, alongside the coordination
         // and process tools and `propose_skill` (spec §8.3: helpers cannot
-        // propose skills; they keep `load_skill`).
-        tools: Some(parent.config.tools.iter().flatten().filter(|tool| !is_coordination_tool(&tool.name) && !crate::tools::is_process_tool(&tool.name) && tool.name != "search_conversations" && tool.name != "propose_skill").cloned().collect()),
+        // propose skills; they keep `load_skill`). The automation tools never reach a helper either
+        // (spec §9.3: they would schedule runs of the helper).
+        tools: Some(parent.config.tools.iter().flatten().filter(|tool| !is_coordination_tool(&tool.name) && !crate::tools::is_process_tool(&tool.name) && tool.name != "search_conversations" && tool.name != "propose_skill" && !crate::tools::is_automation_tool(&tool.name)).cloned().collect()),
         settings: Some(AgentSettings {
             temperature: parent_settings.temperature,
             max_tokens: Some(parent_settings.max_tokens.unwrap_or(4096).min(4096)),
@@ -2163,6 +2165,8 @@ async fn persist_task_result_memory(
 mod approval_stop_tests;
 #[cfg(test)]
 mod approval_tests;
+#[cfg(test)]
+mod automation_tests;
 #[cfg(test)]
 mod compaction_tests;
 #[cfg(test)]

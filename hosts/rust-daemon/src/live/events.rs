@@ -67,6 +67,12 @@ pub(crate) enum LiveEventBody {
         slug: Option<String>,
         draft_id: Option<String>,
     },
+    /// An automation changed, fired, or finished an occurrence (spec §6);
+    /// clients read it again. No session or run.
+    AutomationUpdated {
+        schedule_id: String,
+        deleted: bool,
+    },
 }
 
 impl LiveEventBody {
@@ -91,6 +97,7 @@ impl LiveEventBody {
             Self::ApprovalRequested(_) => "approval.requested",
             Self::ApprovalResolved(_) => "approval.resolved",
             Self::SkillUpdated { .. } => "skill.updated",
+            Self::AutomationUpdated { .. } => "automation.updated",
         }
     }
 }
@@ -222,6 +229,13 @@ impl LiveEvent {
             LiveEventBody::SkillUpdated { slug, draft_id } => {
                 value["slug"] = json!(slug);
                 value["draftId"] = json!(draft_id);
+            }
+            LiveEventBody::AutomationUpdated {
+                schedule_id,
+                deleted,
+            } => {
+                value["scheduleId"] = json!(schedule_id);
+                value["deleted"] = json!(deleted);
             }
         }
         value

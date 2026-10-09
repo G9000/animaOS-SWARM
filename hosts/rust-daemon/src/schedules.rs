@@ -4,8 +4,6 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anima_core::{Content, DataValue, TaskStatus};
-use chrono::{LocalResult, Offset, TimeZone, Utc};
-use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{watch, Mutex};
 use tokio::task::JoinHandle;
@@ -16,6 +14,27 @@ use crate::connectors::runtime::{ConnectorManager, ConnectorRuntimeStatus};
 use crate::connectors::{OutboundDeliveryState, TelegramOutboundRecord};
 use crate::routes::ApiError;
 use crate::runs::{RunOutcome, RunSource, RunStatus};
+use crate::state::OutcomeUndo;
+
+pub(crate) mod cron;
+pub(crate) mod timing;
+pub(crate) use timing::ActiveHours;
+pub(crate) mod automations;
+pub(crate) mod history;
+#[cfg(test)]
+pub(crate) use automations::test_automation;
+pub(crate) use automations::{
+    display_name, heartbeat_input, preview, validate_stored_automation, AutomationCounters,
+    AutomationCreator, AutomationInput, AutomationPatch, AutomationPreset, AutomationService,
+    AUTOMATION_ALREADY_RUNNING, AUTOMATION_HISTORY_UNAVAILABLE, MAX_AUTOMATION_HISTORY_SHOWN,
+    PROMPT_AND_TRIGGER_REQUIRED, TOO_MANY_RUNNING_AUTOMATIONS,
+};
+#[cfg(test)]
+pub(crate) use automations::{
+    AGENT_AUTOMATION_TOO_FREQUENT, HEARTBEAT_NEEDS_TIME_ZONE, MAX_AUTOMATIONS_PER_AGENT,
+    TOO_MANY_AUTOMATIONS,
+};
+pub(crate) use history::{FireLog, ScheduleFireRecord};
 
 const CHECKIN_SENTINEL: &str = "CHECKIN_OK";
 const CHECKIN_SUFFIX: &str = "(This is a scheduled check-in. If you have nothing worth saying right now, reply with exactly CHECKIN_OK and nothing else.)";
@@ -43,6 +62,18 @@ pub(crate) struct ScheduledPromptRecord {
     pub(crate) last_safe_outcome: Option<ScheduleSafeOutcome>,
     pub(crate) created_at_ms: u64,
     pub(crate) updated_at_ms: u64,
+    /// Spec §9.1. Empty for records saved before M6 (`display_name` reads the
+    /// prompt's first line for those).
+    #[serde(default)]
+    pub(crate) name: String,
+    #[serde(default)]
+    pub(crate) active_hours: Option<ActiveHours>,
+    #[serde(default)]
+    pub(crate) created_by: AutomationCreator,
+    #[serde(default)]
+    pub(crate) preset: Option<AutomationPreset>,
+    #[serde(default)]
+    pub(crate) counters: AutomationCounters,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,6 +88,17 @@ pub(crate) enum ScheduleTrigger {
         minute: u8,
         #[serde(rename = "timeZone")]
         time_zone: String,
+    },
+    /// Five-field cron on `time_zone`'s wall clock (spec §9.1).
+    Cron {
+        expression: String,
+        #[serde(rename = "timeZone")]
+        time_zone: String,
+    },
+    /// Fires once; the claim turns the automation off (spec §9.1).
+    Once {
+        #[serde(rename = "atMs")]
+        at_ms: u64,
     },
 }
 
@@ -75,6 +117,9 @@ pub(crate) enum ScheduleTarget {
 pub(crate) struct ScheduleLastFired {
     pub(crate) fired_at_ms: u64,
     pub(crate) run_idempotency_key: String,
+    /// Run now (spec §9.2) fired it, not the trigger.
+    #[serde(default)]
+    pub(crate) manual: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,6 +185,14 @@ pub(crate) enum ScheduleError {
     AgentNotFound,
     NotFound,
     Invalid(&'static str),
+    /// A trigger or active hours the daemon refuses, with a built message (400).
+    Rejected(String),
+    /// The change conflicts with the automation's state or a limit (409).
+    Conflict(&'static str),
+    /// The scheduler is at its admission cap (429).
+    Busy(&'static str),
+    /// The history store could not be read (503).
+    HistoryUnavailable,
     TargetUnavailable,
     Persistence,
 }
@@ -156,6 +209,11 @@ struct SchedulerInner {
     connectors: ConnectorManager,
     // One live run per automation (spec §4.3); a job owns its entry until the
     // detached agent run and durable commit finish.
+    //
+    // Lock order (controller ruling 4): `jobs` comes before the control-plane
+    // transaction. The tick and Run now take `jobs` first, then the
+    // transaction; nothing may take `jobs` while holding the transaction, or
+    // the two would deadlock.
     jobs: Mutex<BTreeMap<String, JoinHandle<()>>>,
 }
 
@@ -214,26 +272,19 @@ impl SchedulerService {
         }
     }
 
+    /// Owner and companion changes to automations (spec §9).
+    pub(crate) fn automations(&self) -> AutomationService {
+        AutomationService::new(
+            Arc::clone(&self.inner.state),
+            self.inner.runs.control_plane_transactions(),
+        )
+    }
+
     pub(crate) async fn list(
         &self,
         agent_id: &str,
     ) -> Result<Vec<ScheduledPromptRecord>, ScheduleError> {
-        let state = self.inner.state.read().await;
-        if state.get_agent(agent_id).is_none() {
-            return Err(ScheduleError::AgentNotFound);
-        }
-        let mut records = state
-            .schedules
-            .values()
-            .filter(|item| item.agent_id == agent_id)
-            .cloned()
-            .collect::<Vec<_>>();
-        records.sort_by(|a, b| {
-            a.created_at_ms
-                .cmp(&b.created_at_ms)
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        Ok(records)
+        self.automations().list(agent_id).await
     }
 
     pub(crate) async fn create(
@@ -247,79 +298,15 @@ impl SchedulerService {
         explicit_next_due_at_ms: Option<u64>,
         created_at_override_ms: Option<u64>,
     ) -> Result<(ScheduledPromptRecord, bool), ScheduleError> {
-        validate_prompt(&prompt)?;
-        validate_trigger(&trigger)?;
-        let now = now_ms();
-        let created_at_ms = created_at_override_ms.unwrap_or(now);
-        if created_at_ms == 0 || created_at_ms > now.saturating_add(300_000) {
-            return Err(ScheduleError::Invalid("createdAtMs is invalid"));
-        }
-        let next_due_at_ms = match explicit_next_due_at_ms {
-            Some(value) if value > 0 => value,
-            Some(_) => return Err(ScheduleError::Invalid("next due time is invalid")),
-            None => next_due_at_ms(&trigger, now)?,
-        };
-        if import_idempotency_key
-            .as_ref()
-            .is_some_and(|key| key.trim().is_empty() || key.len() > 256)
-        {
-            return Err(ScheduleError::Invalid("import idempotency key is invalid"));
-        }
-        let _transaction = self.inner.runs.control_plane_transaction().await;
-        let (record, previous, persist) = {
-            let mut state = self.inner.state.write().await;
-            if state.get_agent(&agent_id).is_none() {
-                return Err(ScheduleError::AgentNotFound);
-            }
-            if let Some(key) = import_idempotency_key.as_ref() {
-                if let Some(existing) = state
-                    .schedules
-                    .values()
-                    .find(|item| {
-                        item.agent_id == agent_id
-                            && item.import_idempotency_key.as_ref() == Some(key)
-                    })
-                    .cloned()
-                {
-                    return Ok((existing, false));
-                }
-            }
-            validate_target(&state, &agent_id, &target, enabled)?;
-            let id = loop {
-                let candidate = next_schedule_id(now);
-                if !state.schedules.contains_key(&candidate) {
-                    break candidate;
-                }
-            };
-            let record = ScheduledPromptRecord {
-                id: id.clone(),
-                import_idempotency_key,
-                agent_id,
-                prompt,
-                trigger,
-                enabled,
-                target,
-                next_due_at_ms,
-                last_fired: None,
-                last_safe_outcome: None,
-                created_at_ms,
-                updated_at_ms: now.max(created_at_ms),
-            };
-            let previous = state.schedules.insert(id, record.clone());
-            (record, previous, state.control_plane_persist_request())
-        };
-        if persist.save().await.is_err() {
-            let mut state = self.inner.state.write().await;
-            if let Some(previous) = previous {
-                state.schedules.insert(record.id.clone(), previous);
-            } else {
-                state.schedules.remove(&record.id);
-            }
-            return Err(ScheduleError::Persistence);
-        }
-        Ok((record, true))
+        let mut input = AutomationInput::owner(agent_id, prompt, trigger, target);
+        input.enabled = enabled;
+        input.import_idempotency_key = import_idempotency_key;
+        input.explicit_next_due_at_ms = explicit_next_due_at_ms;
+        input.created_at_override_ms = created_at_override_ms;
+        self.automations().create(input, now_ms()).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn update(
         &self,
         agent_id: &str,
@@ -329,60 +316,16 @@ impl SchedulerService {
         target: Option<ScheduleTarget>,
         enabled: Option<bool>,
     ) -> Result<ScheduledPromptRecord, ScheduleError> {
-        if let Some(prompt) = &prompt {
-            validate_prompt(prompt)?;
-        }
-        if let Some(trigger) = &trigger {
-            validate_trigger(trigger)?;
-        }
-        if prompt.is_none() && trigger.is_none() && target.is_none() && enabled.is_none() {
-            return Err(ScheduleError::Invalid("at least one field is required"));
-        }
-        let now = now_ms();
-        let _transaction = self.inner.runs.control_plane_transaction().await;
-        let (updated, previous, persist) = {
-            let mut state = self.inner.state.write().await;
-            let previous = state
-                .schedules
-                .get(schedule_id)
-                .filter(|item| item.agent_id == agent_id)
-                .cloned()
-                .ok_or(ScheduleError::NotFound)?;
-            let mut updated = previous.clone();
-            if let Some(prompt) = prompt {
-                updated.prompt = prompt;
-            }
-            if let Some(target) = target {
-                updated.target = target;
-            }
-            let was_enabled = updated.enabled;
-            if let Some(enabled) = enabled {
-                updated.enabled = enabled;
-            }
-            let timing_reset = trigger.is_some() || (!was_enabled && updated.enabled);
-            if let Some(trigger) = trigger {
-                updated.trigger = trigger;
-            }
-            if timing_reset {
-                updated.next_due_at_ms = next_due_at_ms(&updated.trigger, now)?;
-            }
-            validate_target(&state, agent_id, &updated.target, updated.enabled)?;
-            updated.updated_at_ms = now.max(updated.created_at_ms);
-            state
-                .schedules
-                .insert(schedule_id.to_string(), updated.clone());
-            (updated, previous, state.control_plane_persist_request())
+        let patch = AutomationPatch {
+            prompt,
+            trigger,
+            target,
+            enabled,
+            ..AutomationPatch::default()
         };
-        if persist.save().await.is_err() {
-            self.inner
-                .state
-                .write()
-                .await
-                .schedules
-                .insert(schedule_id.to_string(), previous);
-            return Err(ScheduleError::Persistence);
-        }
-        Ok(updated)
+        self.automations()
+            .update(agent_id, schedule_id, patch, now_ms())
+            .await
     }
 
     pub(crate) async fn delete(
@@ -390,29 +333,7 @@ impl SchedulerService {
         agent_id: &str,
         schedule_id: &str,
     ) -> Result<(), ScheduleError> {
-        let _transaction = self.inner.runs.control_plane_transaction().await;
-        let (removed, persist) = {
-            let mut state = self.inner.state.write().await;
-            if !state
-                .schedules
-                .get(schedule_id)
-                .is_some_and(|item| item.agent_id == agent_id)
-            {
-                return Err(ScheduleError::NotFound);
-            }
-            let removed = state.schedules.remove(schedule_id).expect("checked");
-            (removed, state.control_plane_persist_request())
-        };
-        if persist.save().await.is_err() {
-            self.inner
-                .state
-                .write()
-                .await
-                .schedules
-                .insert(schedule_id.to_string(), removed);
-            return Err(ScheduleError::Persistence);
-        }
-        Ok(())
+        self.automations().delete(agent_id, schedule_id).await
     }
 
     #[cfg(test)]
@@ -422,20 +343,31 @@ impl SchedulerService {
         result
     }
 
+    /// Awaits every job (tests drive Run now without the worker loop).
+    #[cfg(test)]
+    pub(crate) async fn drain(&self) {
+        drain_jobs(&self.inner).await;
+    }
+
+    /// Fires an automation now (spec §9.2). Its due time and switch stay,
+    /// one run per automation and the scheduler's admission cap still hold,
+    /// and the fire is recorded as manual. The claim and the job's start run
+    /// in their own task, so a dropped request still finishes them.
+    pub(crate) async fn run_now(
+        &self,
+        agent_id: &str,
+        schedule_id: &str,
+    ) -> Result<ScheduledPromptRecord, ScheduleError> {
+        let inner = Arc::clone(&self.inner);
+        let (agent_id, schedule_id) = (agent_id.to_string(), schedule_id.to_string());
+        tokio::spawn(async move { run_now_inner(&inner, &agent_id, &schedule_id, now_ms()).await })
+            .await
+            .unwrap_or(Err(ScheduleError::Persistence))
+    }
+
     async fn tick_inner(inner: &Arc<SchedulerInner>, now: u64) -> Result<usize, ScheduleError> {
         let mut jobs = inner.jobs.lock().await;
-        let finished = jobs
-            .iter()
-            .filter(|(_, job)| job.is_finished())
-            .map(|(id, _)| id.clone())
-            .collect::<Vec<_>>();
-        for id in finished {
-            if let Some(job) = jobs.remove(&id) {
-                if let Err(error) = job.await {
-                    tracing::warn!(?error, "scheduled worker stopped unexpectedly");
-                }
-            }
-        }
+        reap_finished(&mut jobs).await;
         // Reconcile only jobs with no live owner, including failures after startup.
         // Persistence failure closes admission for this tick; the next tick retries.
         let active_schedules = jobs.keys().cloned().collect();
@@ -490,6 +422,108 @@ async fn drain_jobs(inner: &Arc<SchedulerInner>) {
     }
 }
 
+/// Awaits the jobs that finished, so their automations can run again.
+async fn reap_finished(jobs: &mut BTreeMap<String, JoinHandle<()>>) {
+    let finished = jobs
+        .iter()
+        .filter(|(_, job)| job.is_finished())
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
+    for id in finished {
+        if let Some(job) = jobs.remove(&id) {
+            if let Err(error) = job.await {
+                tracing::warn!(?error, "scheduled worker stopped unexpectedly");
+            }
+        }
+    }
+}
+
+async fn run_now_inner(
+    inner: &Arc<SchedulerInner>,
+    agent_id: &str,
+    schedule_id: &str,
+    now: u64,
+) -> Result<ScheduledPromptRecord, ScheduleError> {
+    let owned = inner
+        .state
+        .read()
+        .await
+        .schedules
+        .get(schedule_id)
+        .is_some_and(|record| record.agent_id == agent_id);
+    if !owned {
+        return Err(ScheduleError::NotFound);
+    }
+    // The scheduler's lock order (controller ruling 4): `jobs` first, then
+    // the control-plane transaction (in `claim_manual`). Nothing takes `jobs`
+    // while holding the transaction.
+    let mut jobs = inner.jobs.lock().await;
+    reap_finished(&mut jobs).await;
+    if jobs.contains_key(schedule_id) {
+        return Err(ScheduleError::Conflict(AUTOMATION_ALREADY_RUNNING));
+    }
+    if jobs.len() >= MAX_ACTIVE_SCHEDULES {
+        return Err(ScheduleError::Busy(TOO_MANY_RUNNING_AUTOMATIONS));
+    }
+    let record = claim_manual(inner, agent_id, schedule_id, now).await?;
+    let job = {
+        let (inner, record) = (Arc::clone(inner), record.clone());
+        tokio::spawn(async move { execute_claimed(&inner, record, now).await })
+    };
+    jobs.insert(schedule_id.to_string(), job);
+    Ok(record)
+}
+
+/// Saves a manual occurrence's claim: `lastFired` (marked manual) and no
+/// outcome yet; the due time and the switch stay.
+async fn claim_manual(
+    inner: &Arc<SchedulerInner>,
+    agent_id: &str,
+    schedule_id: &str,
+    now: u64,
+) -> Result<ScheduledPromptRecord, ScheduleError> {
+    let _transaction = inner.runs.control_plane_transaction().await;
+    let (claimed, previous, persist) = {
+        let mut state = inner.state.write().await;
+        let previous = state
+            .schedules
+            .get(schedule_id)
+            .filter(|record| record.agent_id == agent_id)
+            .cloned()
+            .ok_or(ScheduleError::NotFound)?;
+        if unresolved_occurrence(&previous) {
+            return Err(ScheduleError::Conflict(AUTOMATION_ALREADY_RUNNING));
+        }
+        let mut claimed = previous.clone();
+        claimed.last_fired = Some(ScheduleLastFired {
+            fired_at_ms: now,
+            run_idempotency_key: format!("schedule:{}:manual:{now}", claimed.id),
+            manual: true,
+        });
+        claimed.last_safe_outcome = None;
+        claimed.updated_at_ms = now.max(claimed.created_at_ms).max(previous.updated_at_ms);
+        state
+            .schedules
+            .insert(schedule_id.to_string(), claimed.clone());
+        (claimed, previous, state.control_plane_persist_request())
+    };
+    if persist.save().await.is_err() {
+        inner
+            .state
+            .write()
+            .await
+            .schedules
+            .insert(schedule_id.to_string(), previous);
+        return Err(ScheduleError::Persistence);
+    }
+    inner
+        .state
+        .read()
+        .await
+        .publish_automation_updated(agent_id, schedule_id, false);
+    Ok(claimed)
+}
+
 fn unresolved_occurrence(record: &ScheduledPromptRecord) -> bool {
     record.last_fired.as_ref().is_some_and(|fired| {
         record
@@ -499,47 +533,57 @@ fn unresolved_occurrence(record: &ScheduledPromptRecord) -> bool {
     })
 }
 
+/// Its latest occurrence has no outcome yet: it is running, or a restart
+/// interrupted it and the next tick will record that.
+pub(crate) fn is_running(record: &ScheduledPromptRecord) -> bool {
+    unresolved_occurrence(record)
+}
+
 async fn reconcile_interrupted(
     inner: &Arc<SchedulerInner>,
     now: u64,
     active_schedules: &BTreeSet<String>,
 ) -> Result<(), ScheduleError> {
     let _transaction = inner.runs.control_plane_transaction().await;
-    let (previous, persist) = {
+    let (changes, persist) = {
         let mut state = inner.state.write().await;
         // Occurrences whose run the owner stopped before a restart could
         // record its outcome: the saved stop survives the restart on the
         // interrupted run, and a stop keeps the schedule enabled (spec §4.6,
         // audit M24).
-        let stopped: BTreeSet<String> = state
+        let unresolved = state
             .schedules
             .values()
             .filter(|s| !active_schedules.contains(&s.id) && unresolved_occurrence(s))
-            .filter(|s| {
+            .map(|s| {
                 let fired = s
                     .last_fired
                     .as_ref()
                     .expect("an unresolved occurrence fired");
-                state
+                let run = state
                     .runs
                     .find_by_idempotency_key(&s.agent_id, &fired.run_idempotency_key, 0)
-                    .is_some_and(|run| {
+                    .filter(|run| {
                         run.source == RunSource::Schedule
                             && run.source_ref.as_deref() == Some(s.id.as_str())
-                            && run.stop.is_some()
-                    })
+                    });
+                (
+                    s.id.clone(),
+                    s.agent_id.clone(),
+                    fired.fired_at_ms,
+                    run.is_some_and(|run| run.stop.is_some()),
+                    run.map(|run| (run.id.clone(), run.session_id.clone())),
+                )
             })
-            .map(|s| s.id.clone())
-            .collect();
-        let mut previous = Vec::new();
-        for schedule in state
-            .schedules
-            .values_mut()
-            .filter(|s| !active_schedules.contains(&s.id) && unresolved_occurrence(s))
-        {
-            previous.push(schedule.clone());
-            let occurred_at_ms = now.max(schedule.last_fired.as_ref().unwrap().fired_at_ms);
-            schedule.last_safe_outcome = Some(if stopped.contains(&schedule.id) {
+            .collect::<Vec<_>>();
+        if unresolved.is_empty() {
+            return Ok(());
+        }
+        let mut changes = Vec::new();
+        for (id, agent_id, fired_at_ms, stopped, run) in unresolved {
+            let previous = state.schedules[&id].clone();
+            let occurred_at_ms = now.max(fired_at_ms);
+            let outcome = if stopped {
                 let status = ScheduleOutcomeStatus::Stopped;
                 ScheduleSafeOutcome {
                     error_code: checkin_error_code(&status),
@@ -547,26 +591,38 @@ async fn reconcile_interrupted(
                     occurred_at_ms,
                 }
             } else {
-                schedule.enabled = false;
                 ScheduleSafeOutcome {
                     status: ScheduleOutcomeStatus::Failed,
                     occurred_at_ms,
                     error_code: Some("schedule_run_interrupted".into()),
                 }
-            });
+            };
+            // Spec §9.1: the outcome, the counters, and a fire record.
+            let undo = state.record_automation_outcome(&id, outcome, run, now);
+            let schedule = state.schedules.get_mut(&id).expect("just recorded");
+            if !stopped {
+                schedule.enabled = false;
+            }
             schedule.updated_at_ms = now.max(schedule.updated_at_ms);
+            changes.push((previous, undo, agent_id));
         }
-        if previous.is_empty() {
-            return Ok(());
-        }
-        (previous, state.control_plane_persist_request())
+        (changes, state.control_plane_persist_request())
     };
     if persist.save().await.is_err() {
+        // Controller ruling 3: exactly the previous records, counters, and
+        // fire log. Undo in reverse, so each fire log change unwinds in turn.
         let mut state = inner.state.write().await;
-        for record in previous {
-            state.schedules.insert(record.id.clone(), record);
+        for (previous, undo, _) in changes.into_iter().rev() {
+            if let Some(undo) = undo {
+                state.undo_automation_outcome(undo);
+            }
+            state.schedules.insert(previous.id.clone(), previous);
         }
         return Err(ScheduleError::Persistence);
+    }
+    let state = inner.state.read().await;
+    for (previous, _, agent_id) in &changes {
+        state.publish_automation_updated(agent_id, &previous.id, false);
     }
     Ok(())
 }
@@ -577,7 +633,7 @@ async fn claim_due(
     now: u64,
 ) -> Result<Option<ScheduledPromptRecord>, ScheduleError> {
     let _transaction = inner.runs.control_plane_transaction().await;
-    let (claimed, previous, persist) = {
+    let (claim, claimed, previous, persist) = {
         let mut state = inner.state.write().await;
         let Some(previous) = state
             .schedules
@@ -588,16 +644,45 @@ async fn claim_due(
             return Ok(None);
         };
         let mut claimed = previous.clone();
-        claimed.next_due_at_ms =
-            next_due_after_claim(&claimed.trigger, previous.next_due_at_ms, now)?;
-        claimed.last_fired = Some(ScheduleLastFired {
-            fired_at_ms: now,
-            run_idempotency_key: format!("schedule:{}:{}", claimed.id, now),
-        });
-        claimed.last_safe_outcome = None;
+        let claim = match next_due_after_claim(
+            &claimed.trigger,
+            claimed.active_hours.as_ref(),
+            previous.next_due_at_ms,
+            now,
+        ) {
+            Ok(next_due_at_ms) => {
+                claimed.next_due_at_ms = next_due_at_ms;
+                claimed.last_fired = Some(ScheduleLastFired {
+                    fired_at_ms: now,
+                    run_idempotency_key: format!("schedule:{}:{}", claimed.id, now),
+                    manual: false,
+                });
+                claimed.last_safe_outcome = None;
+                if matches!(claimed.trigger, ScheduleTrigger::Once { .. }) {
+                    // Spec §9.1: a one-time automation fires once, then turns
+                    // itself off.
+                    claimed.enabled = false;
+                }
+                true
+            }
+            // A stored trigger or window that can never fire again (restore
+            // only checks syntax) is turned off, so it cannot end the tick and
+            // starve the other due automations.
+            Err(ScheduleError::Rejected(error)) => {
+                tracing::warn!(schedule_id = %claimed.id, %error, "an automation has no next fire time; it was turned off");
+                claimed.enabled = false;
+                false
+            }
+            Err(error) => return Err(error),
+        };
         claimed.updated_at_ms = now.max(claimed.created_at_ms);
         state.schedules.insert(id.to_string(), claimed.clone());
-        (claimed, previous, state.control_plane_persist_request())
+        (
+            claim,
+            claimed,
+            previous,
+            state.control_plane_persist_request(),
+        )
     };
     if persist.save().await.is_err() {
         inner
@@ -608,7 +693,12 @@ async fn claim_due(
             .insert(id.to_string(), previous);
         return Err(ScheduleError::Persistence);
     }
-    Ok(Some(claimed))
+    inner
+        .state
+        .read()
+        .await
+        .publish_automation_updated(&claimed.agent_id, &claimed.id, false);
+    Ok(claim.then_some(claimed))
 }
 
 async fn execute_claimed(inner: &Arc<SchedulerInner>, record: ScheduledPromptRecord, now: u64) {
@@ -637,6 +727,7 @@ async fn execute_claimed(inner: &Arc<SchedulerInner>, record: ScheduledPromptRec
                     ScheduleOutcomeStatus::Failed,
                     Some("schedule_target_unavailable"),
                     now,
+                    None,
                 )
                 .await;
                 return;
@@ -644,9 +735,13 @@ async fn execute_claimed(inner: &Arc<SchedulerInner>, record: ScheduledPromptRec
             RunRoom::Stable(connector.room_id)
         }
     };
+    let run_key = record
+        .last_fired
+        .as_ref()
+        .map(|fired| fired.run_idempotency_key.clone());
     let schedule_id = record.id.clone();
+    let agent_id = record.agent_id.clone();
     let target = record.target.clone();
-    let rollback_schedule_id = schedule_id.clone();
     let request = AgentRunRequest {
         agent_id: record.agent_id.clone(),
         content: Content {
@@ -658,16 +753,14 @@ async fn execute_claimed(inner: &Arc<SchedulerInner>, record: ScheduledPromptRec
             attachments: None,
         },
         room,
-        idempotency_key: record
-            .last_fired
-            .as_ref()
-            .map(|item| item.run_idempotency_key.clone()),
+        idempotency_key: run_key.clone(),
         source: RunSource::Schedule,
         source_ref: Some(record.id.clone()),
         parent: None,
     };
+    // What the commit hook did, so the rollback undoes exactly that.
     let recorded = Arc::new(std::sync::Mutex::new(
-        None::<(ScheduleSafeOutcome, Option<TelegramOutboundRecord>)>,
+        None::<(Option<OutcomeUndo>, Option<TelegramOutboundRecord>)>,
     ));
     let commit_recorded = Arc::clone(&recorded);
     let result = inner
@@ -677,17 +770,9 @@ async fn execute_claimed(inner: &Arc<SchedulerInner>, record: ScheduledPromptRec
             move |state, outcome| {
                 let result = &outcome.result;
                 let status = checkin_outcome_status(outcome);
-                let safe = ScheduleSafeOutcome {
-                    status: status.clone(),
-                    occurred_at_ms: now,
-                    error_code: checkin_error_code(&status),
-                };
-                let schedule = state
-                    .schedules
-                    .get_mut(&schedule_id)
-                    .ok_or_else(ApiError::not_found)?;
-                schedule.last_safe_outcome = Some(safe.clone());
-                schedule.updated_at_ms = now.max(schedule.created_at_ms);
+                if !state.schedules.contains_key(&schedule_id) {
+                    return Err(ApiError::not_found());
+                }
                 let mut outbound = None;
                 if status == ScheduleOutcomeStatus::Spoke {
                     if let ScheduleTarget::Connector { connector_id } = &target {
@@ -728,19 +813,32 @@ async fn execute_claimed(inner: &Arc<SchedulerInner>, record: ScheduledPromptRec
                         }
                     }
                 }
-                *commit_recorded.lock().unwrap_or_else(|p| p.into_inner()) = Some((safe, outbound));
+                // Spec §9.1: the outcome, the counters, and a fire record,
+                // in the commit's save.
+                let undo = state.record_automation_outcome(
+                    &schedule_id,
+                    ScheduleSafeOutcome {
+                        error_code: checkin_error_code(&status),
+                        status,
+                        occurred_at_ms: now,
+                    },
+                    Some((outcome.run_id.clone(), outcome.session_id.clone())),
+                    now_ms(),
+                );
+                *commit_recorded.lock().unwrap_or_else(|p| p.into_inner()) = Some((undo, outbound));
                 Ok(())
             },
             move |state| {
-                if let Some((_, Some(outbound))) =
-                    recorded.lock().unwrap_or_else(|p| p.into_inner()).as_ref()
-                {
-                    if state.outbound.get(&outbound.id) == Some(outbound) {
-                        state.outbound.remove(&outbound.id);
+                let done = recorded.lock().unwrap_or_else(|p| p.into_inner()).take();
+                if let Some((undo, outbound)) = done {
+                    if let Some(outbound) = outbound {
+                        if state.outbound.get(&outbound.id) == Some(&outbound) {
+                            state.outbound.remove(&outbound.id);
+                        }
                     }
-                }
-                if let Some(schedule) = state.schedules.get_mut(&rollback_schedule_id) {
-                    schedule.last_safe_outcome = None;
+                    if let Some(undo) = undo {
+                        state.undo_automation_outcome(undo);
+                    }
                 }
                 Ok(())
             },
@@ -753,120 +851,105 @@ async fn execute_claimed(inner: &Arc<SchedulerInner>, record: ScheduledPromptRec
             ScheduleOutcomeStatus::Failed,
             Some("schedule_run_failed"),
             now,
+            run_key.as_deref(),
         )
         .await;
+    } else {
+        inner
+            .state
+            .read()
+            .await
+            .publish_automation_updated(&agent_id, &record.id, false);
     }
 }
 
+/// Records an occurrence's outcome outside a run's commit (a run that did
+/// not commit, an unavailable target): the outcome, the counters, and a fire
+/// record naming the occurrence's run, if one started (`run_key`).
 async fn record_outcome(
     inner: &Arc<SchedulerInner>,
     id: &str,
     status: ScheduleOutcomeStatus,
     error_code: Option<&str>,
     now: u64,
+    run_key: Option<&str>,
 ) -> Result<(), ScheduleError> {
     let _transaction = inner.runs.control_plane_transaction().await;
-    let (previous, persist) = {
+    let (agent_id, undo, persist) = {
         let mut state = inner.state.write().await;
-        let schedule = state.schedules.get_mut(id).ok_or(ScheduleError::NotFound)?;
-        let previous = schedule.clone();
-        schedule.last_safe_outcome = Some(ScheduleSafeOutcome {
-            status,
-            occurred_at_ms: now,
-            error_code: error_code.map(str::to_string),
-        });
-        schedule.updated_at_ms = now.max(schedule.created_at_ms);
-        (previous, state.control_plane_persist_request())
+        let agent_id = state
+            .schedules
+            .get(id)
+            .map(|record| record.agent_id.clone())
+            .ok_or(ScheduleError::NotFound)?;
+        let run = run_key
+            .and_then(|key| state.runs.find_by_idempotency_key(&agent_id, key, 0))
+            .map(|run| (run.id.clone(), run.session_id.clone()));
+        let undo = state
+            .record_automation_outcome(
+                id,
+                ScheduleSafeOutcome {
+                    status,
+                    occurred_at_ms: now,
+                    error_code: error_code.map(str::to_string),
+                },
+                run,
+                now_ms(),
+            )
+            .ok_or(ScheduleError::NotFound)?;
+        (agent_id, undo, state.control_plane_persist_request())
     };
     if persist.save().await.is_err() {
-        inner
-            .state
-            .write()
-            .await
-            .schedules
-            .insert(id.to_string(), previous);
+        // Controller ruling 3: exactly the previous outcome, counters, and
+        // fire log.
+        inner.state.write().await.undo_automation_outcome(undo);
         return Err(ScheduleError::Persistence);
     }
+    inner
+        .state
+        .read()
+        .await
+        .publish_automation_updated(&agent_id, id, false);
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn next_due_at_ms(
     trigger: &ScheduleTrigger,
     from_ms: u64,
 ) -> Result<u64, ScheduleError> {
-    validate_trigger(trigger)?;
-    match trigger {
-        ScheduleTrigger::Interval { interval_ms } => from_ms
-            .checked_add(*interval_ms)
-            .ok_or(ScheduleError::Invalid("schedule timing overflow")),
-        ScheduleTrigger::Daily {
-            hour,
-            minute,
-            time_zone,
-        } => next_daily_at_ms(*hour, *minute, time_zone, from_ms),
-    }
+    next_due(trigger, None, from_ms)
 }
 
-fn next_due_after_claim(
+/// The first fire of `trigger` after `from_ms` inside `active_hours`.
+pub(crate) fn next_due(
     trigger: &ScheduleTrigger,
+    active_hours: Option<&ActiveHours>,
+    from_ms: u64,
+) -> Result<u64, ScheduleError> {
+    let window = active_window(active_hours)?;
+    timing::next_fire_after(trigger, window.as_ref(), from_ms).map_err(ScheduleError::Rejected)
+}
+
+/// The due time after the occurrence due at `previous_due` was claimed.
+pub(crate) fn next_due_after_claim(
+    trigger: &ScheduleTrigger,
+    active_hours: Option<&ActiveHours>,
     previous_due: u64,
     now: u64,
 ) -> Result<u64, ScheduleError> {
-    match trigger {
-        ScheduleTrigger::Interval { interval_ms } => {
-            let elapsed = now.saturating_sub(previous_due);
-            let steps = elapsed / *interval_ms + 1;
-            previous_due
-                .checked_add(
-                    interval_ms
-                        .checked_mul(steps)
-                        .ok_or(ScheduleError::Invalid("schedule timing overflow"))?,
-                )
-                .ok_or(ScheduleError::Invalid("schedule timing overflow"))
-        }
-        ScheduleTrigger::Daily { .. } => next_due_at_ms(trigger, now),
-    }
+    let window = active_window(active_hours)?;
+    timing::next_fire_after_claim(trigger, window.as_ref(), previous_due, now)
+        .map_err(ScheduleError::Rejected)
 }
 
-fn next_daily_at_ms(
-    hour: u8,
-    minute: u8,
-    time_zone: &str,
-    from_ms: u64,
-) -> Result<u64, ScheduleError> {
-    let tz: Tz = time_zone
-        .parse()
-        .map_err(|_| ScheduleError::Invalid("timeZone is invalid"))?;
-    let from = Utc
-        .timestamp_millis_opt(
-            i64::try_from(from_ms)
-                .map_err(|_| ScheduleError::Invalid("schedule timing overflow"))?,
-        )
-        .single()
-        .ok_or(ScheduleError::Invalid("schedule timing is invalid"))?;
-    let local = from.with_timezone(&tz);
-    for day_offset in 0..=2 {
-        let date = local
-            .date_naive()
-            .checked_add_days(chrono::Days::new(day_offset))
-            .ok_or(ScheduleError::Invalid("schedule timing overflow"))?;
-        let naive = date
-            .and_hms_opt(u32::from(hour), u32::from(minute), 0)
-            .ok_or(ScheduleError::Invalid("daily trigger is invalid"))?;
-        let candidate = match tz.from_local_datetime(&naive) {
-            LocalResult::Single(value) => value,
-            LocalResult::Ambiguous(first, second) => first.min(second),
-            LocalResult::None => continue,
-        };
-        let millis = u64::try_from(candidate.timestamp_millis())
-            .map_err(|_| ScheduleError::Invalid("schedule timing is invalid"))?;
-        if millis > from_ms {
-            return Ok(millis);
-        }
-    }
-    Err(ScheduleError::Invalid(
-        "daily trigger has no next occurrence",
-    ))
+fn active_window(
+    active_hours: Option<&ActiveHours>,
+) -> Result<Option<timing::ActiveWindow>, ScheduleError> {
+    active_hours
+        .map(timing::ActiveWindow::parse)
+        .transpose()
+        .map_err(ScheduleError::Rejected)
 }
 
 pub(crate) fn legacy_next_due_at_ms(
@@ -915,43 +998,7 @@ fn validate_prompt(prompt: &str) -> Result<(), ScheduleError> {
 }
 
 fn validate_trigger(trigger: &ScheduleTrigger) -> Result<(), ScheduleError> {
-    let core_trigger = match trigger {
-        ScheduleTrigger::Interval { interval_ms } => {
-            if *interval_ms == 0 || interval_ms % 1_000 != 0 {
-                return Err(ScheduleError::Invalid(
-                    "intervalMs must be a positive whole number of seconds",
-                ));
-            }
-            anima_schedule::ScheduleTrigger::Every {
-                interval_secs: interval_ms / 1_000,
-            }
-        }
-        ScheduleTrigger::Daily {
-            hour,
-            minute,
-            time_zone,
-        } => {
-            let tz: Tz = time_zone
-                .parse()
-                .map_err(|_| ScheduleError::Invalid("timeZone is invalid"))?;
-            let now = Utc::now();
-            let offset_minutes = now.with_timezone(&tz).offset().fix().local_minus_utc() / 60;
-            anima_schedule::ScheduleTrigger::DailyAt {
-                hour: *hour,
-                minute: *minute,
-                tz_offset_minutes: offset_minutes,
-            }
-        }
-    };
-    anima_schedule::Scheduler::new(vec![anima_schedule::ScheduledJob {
-        name: "validation".into(),
-        agent_name: "agent".into(),
-        prompt: "prompt".into(),
-        trigger: core_trigger,
-        enabled: true,
-    }])
-    .map_err(|_| ScheduleError::Invalid("trigger is invalid"))?;
-    Ok(())
+    timing::validate_stored_trigger(trigger).map_err(ScheduleError::Rejected)
 }
 
 fn validate_target(
@@ -1008,7 +1055,7 @@ mod tests {
     use async_trait::async_trait;
     use tokio::sync::{RwLock, Semaphore};
 
-    struct NoopTelegram;
+    pub(super) struct NoopTelegram;
 
     #[async_trait]
     impl TelegramTransport for NoopTelegram {
@@ -1039,7 +1086,7 @@ mod tests {
         }
     }
 
-    fn service() -> (
+    pub(super) fn service() -> (
         SchedulerService,
         SharedDaemonState,
         String,
@@ -1048,7 +1095,7 @@ mod tests {
         service_with_daemon(DaemonState::new())
     }
 
-    fn service_with_daemon(
+    pub(super) fn service_with_daemon(
         mut daemon: DaemonState,
     ) -> (
         SchedulerService,
@@ -1091,9 +1138,9 @@ mod tests {
         )
     }
 
-    struct GatedModel {
-        entered: Arc<Semaphore>,
-        release: Arc<Semaphore>,
+    pub(super) struct GatedModel {
+        pub(super) entered: Arc<Semaphore>,
+        pub(super) release: Arc<Semaphore>,
     }
 
     #[async_trait]
@@ -1120,7 +1167,10 @@ mod tests {
         }
     }
 
-    async fn due_schedule(service: &SchedulerService, agent_id: &str) -> ScheduledPromptRecord {
+    pub(super) async fn due_schedule(
+        service: &SchedulerService,
+        agent_id: &str,
+    ) -> ScheduledPromptRecord {
         service
             .create(
                 agent_id.into(),
@@ -1137,6 +1187,86 @@ mod tests {
             .await
             .unwrap()
             .0
+    }
+
+    #[tokio::test]
+    async fn an_unfireable_stored_cron_is_disabled_and_does_not_starve_the_tick() {
+        let (service, state, agent_id, _) = service();
+        let now = now_ms();
+        let (bad, _) = service
+            .create(
+                agent_id.clone(),
+                "Never".into(),
+                ScheduleTrigger::Cron {
+                    expression: "0 0 31 2 *".into(),
+                    time_zone: "UTC".into(),
+                },
+                ScheduleTarget::Workspace,
+                true,
+                None,
+                Some(now - 10),
+                None,
+            )
+            .await
+            .unwrap();
+        let good = due_schedule(&service, &agent_id).await;
+        assert_eq!(service.tick_at(now_ms()).await.unwrap(), 1);
+        let guard = state.read().await;
+        assert!(!guard.schedules[&bad.id].enabled, "the bad one is off");
+        assert!(guard.schedules[&bad.id].last_fired.is_none());
+        assert!(guard.schedules[&good.id].last_fired.is_some());
+        assert!(guard.schedules[&good.id].enabled);
+    }
+
+    #[tokio::test]
+    async fn time_zones_are_stored_trimmed_on_create_and_update() {
+        let (service, _state, agent_id, _) = service();
+        let (record, _) = service
+            .create(
+                agent_id.clone(),
+                "Daily".into(),
+                ScheduleTrigger::Daily {
+                    hour: 9,
+                    minute: 0,
+                    time_zone: " America/New_York ".into(),
+                },
+                ScheduleTarget::Workspace,
+                true,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            record.trigger,
+            ScheduleTrigger::Daily {
+                hour: 9,
+                minute: 0,
+                time_zone: "America/New_York".into(),
+            }
+        );
+        let updated = service
+            .update(
+                &agent_id,
+                &record.id,
+                None,
+                Some(ScheduleTrigger::Cron {
+                    expression: "0 9 * * *".into(),
+                    time_zone: "	Europe/Paris ".into(),
+                }),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            updated.trigger,
+            ScheduleTrigger::Cron {
+                expression: "0 9 * * *".into(),
+                time_zone: "Europe/Paris".into(),
+            }
+        );
     }
 
     #[tokio::test]
@@ -1481,6 +1611,7 @@ mod tests {
             ScheduleOutcomeStatus::Spoke,
             None,
             now,
+            None,
         )
         .await
         .unwrap();
@@ -1891,3 +2022,6 @@ mod tests {
         manager.shutdown().await;
     }
 }
+
+#[cfg(test)]
+mod run_now_tests;

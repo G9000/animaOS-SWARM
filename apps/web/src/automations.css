@@ -1,0 +1,154 @@
+/* The Automations page (spec §15.4). Names, prompts, and history are text. */
+.automations-page {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  overflow-y: auto;
+  padding: 24px;
+}
+.automations-section,
+.automations-list,
+.automation-editor,
+.automation-history {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.automations-section h2 {
+  color: var(--color-ink);
+  font-size: 15px;
+  font-weight: 600;
+}
+.automations-header,
+.automation-row-header,
+.automation-actions,
+.automation-days,
+.automation-hours,
+.automation-history-header,
+.automation-history-run {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.automation-row,
+.automation-editor,
+.automation-history {
+  border: 1px solid var(--color-line);
+  border-radius: 12px;
+  padding: 10px 12px;
+}
+.automation-row:not([data-enabled]) {
+  opacity: 0.75;
+}
+.automation-name {
+  color: var(--color-ink);
+  font-size: 14px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.automation-badge {
+  border: 1px solid var(--color-line);
+  border-radius: 999px;
+  padding: 0 8px;
+  color: var(--color-ink-2);
+  font-size: 11px;
+}
+.automation-badge[data-running] {
+  color: var(--color-mint);
+}
+.automation-schedule,
+.automation-meta,
+.automation-note,
+.automations-empty {
+  color: var(--color-ink-3);
+  font-size: 12px;
+}
+.automation-prompt {
+  max-height: 8rem;
+  overflow: auto;
+  border-radius: 8px;
+  padding: 8px;
+  background: var(--color-abyss);
+  color: var(--color-ink-2);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.automation-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--color-ink-2);
+  font-size: 12px;
+}
+.automation-field input,
+.automation-field textarea,
+.automation-field select {
+  border: 1px solid var(--color-line);
+  border-radius: 8px;
+  padding: 6px 8px;
+  background: var(--color-abyss);
+  color: var(--color-ink);
+  font-size: 13px;
+}
+.automation-fieldset {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border: 1px solid var(--color-line);
+  border-radius: 8px;
+  padding: 8px;
+}
+.automation-fieldset legend,
+.automation-check {
+  color: var(--color-ink-2);
+  font-size: 12px;
+}
+.automation-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.automation-problem,
+.automations-error {
+  color: var(--color-danger);
+  font-size: 13px;
+}
+.automation-preview ul,
+.automation-history-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--color-ink-2);
+  font-size: 12px;
+}
+.automation-history-run [data-outcome='failed'] {
+  color: var(--color-danger);
+}
+.automation-history-run code {
+  color: var(--color-ink-3);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.automation-notice {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  border: 1px solid var(--color-line);
+  border-radius: 12px;
+  padding: 8px 10px;
+}
+.automation-notice-title {
+  color: var(--color-ink);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.automation-notice-detail {
+  color: var(--color-ink-3);
+  font-size: 12px;
+}

@@ -7239,6 +7239,11 @@ mod tests {
                     last_safe_outcome: None,
                     created_at_ms: now,
                     updated_at_ms: now,
+                    name: "check in".into(),
+                    active_hours: None,
+                    created_by: crate::schedules::AutomationCreator::Owner,
+                    preset: None,
+                    counters: Default::default(),
                 },
             );
         }

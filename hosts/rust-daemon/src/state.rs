@@ -1,4 +1,5 @@
 mod approval_state;
+mod automation_state;
 mod live_state;
 mod run_commit;
 pub(crate) mod run_stop;
@@ -11,6 +12,7 @@ mod swarm_tools;
 pub(crate) use self::approval_state::{
     ApprovalAsk, ApprovalUndo, OwnerDecision, SettleRefusal, Settlement,
 };
+pub(crate) use self::automation_state::OutcomeUndo;
 pub(crate) use self::run_commit::RunBuild;
 pub(crate) use self::run_commit::RunContextReport;
 pub(crate) use self::session_state::RunSessionRequest;
@@ -828,6 +830,45 @@ mod tests {
     }
 
     #[test]
+    fn restore_validates_every_trigger_variant() {
+        // `ScheduleTrigger` is already imported by this test module.
+        for (trigger, valid) in [
+            (
+                ScheduleTrigger::Cron {
+                    expression: "0 9 * * 1-5".into(),
+                    time_zone: "Europe/London".into(),
+                },
+                true,
+            ),
+            (ScheduleTrigger::Once { at_ms: 5 }, true),
+            (
+                ScheduleTrigger::Cron {
+                    expression: "0 9 * *".into(),
+                    time_zone: "Europe/London".into(),
+                },
+                false,
+            ),
+            (
+                ScheduleTrigger::Cron {
+                    expression: "0 9 * * *".into(),
+                    time_zone: "".into(),
+                },
+                false,
+            ),
+            (ScheduleTrigger::Once { at_ms: 0 }, false),
+        ] {
+            let (mut snapshot, _) = valid_connector_snapshot();
+            snapshot.schedules[0].trigger = trigger.clone();
+            let mut state = DaemonState::new();
+            assert_eq!(
+                state.restore_control_plane_snapshot(snapshot).is_ok(),
+                valid,
+                "{trigger:?}"
+            );
+        }
+    }
+
+    #[test]
     fn restore_does_not_validate_inbound_against_a_connector_absent_from_snapshot() {
         let mut state = DaemonState::new();
         let agent_id = state
@@ -1101,6 +1142,7 @@ mod tests {
             last_fired: Some(ScheduleLastFired {
                 fired_at_ms: 13,
                 run_idempotency_key: "schedule-1:13".into(),
+                manual: false,
             }),
             last_safe_outcome: Some(ScheduleSafeOutcome {
                 status: ScheduleOutcomeStatus::Spoke,
@@ -1109,6 +1151,15 @@ mod tests {
             }),
             created_at_ms: 10,
             updated_at_ms: 14,
+            name: "Review the workspace".into(),
+            active_hours: None,
+            created_by: crate::schedules::AutomationCreator::Owner,
+            preset: None,
+            counters: crate::schedules::AutomationCounters {
+                runs: 1,
+                failures: 0,
+                consecutive_failures: 0,
+            },
         }
     }
 
@@ -1175,7 +1226,7 @@ mod tests {
         }
 
         let snapshot = source.control_plane_snapshot();
-        assert_eq!(snapshot.version, 8);
+        assert_eq!(snapshot.version, 9);
         assert_eq!(
             snapshot.runs.len(),
             3,
@@ -1357,7 +1408,7 @@ mod tests {
             snapshot.version,
             crate::control_plane_store::CONTROL_PLANE_STORE_VERSION
         );
-        assert_eq!(snapshot.version, 8);
+        assert_eq!(snapshot.version, 9);
 
         let payload = serde_json::to_value(&snapshot).unwrap();
         assert_eq!(payload["inbound"][0]["processingState"], "stopped");
@@ -1379,7 +1430,7 @@ mod tests {
             .await
             .unwrap()
             .expect("the saved snapshot should load");
-        assert_eq!(loaded.version, 8);
+        assert_eq!(loaded.version, 9);
         assert_eq!(
             loaded.inbound[0].processing_state,
             InboundProcessingState::Stopped
@@ -1393,7 +1444,7 @@ mod tests {
 
         DaemonState::new()
             .restore_control_plane_snapshot(loaded)
-            .expect("a v8 snapshot holding stopped/suppressed values restores");
+            .expect("a v9 snapshot holding stopped/suppressed values restores");
         let _ = std::fs::remove_file(path);
     }
 
@@ -1507,6 +1558,8 @@ pub(crate) struct DaemonState {
     pub(crate) approvals: crate::approvals::ApprovalRegistry,
     /// Skill records, drafts, and the last scan (spec §8).
     pub(crate) skills: crate::skills::SkillRegistry,
+    /// Automation fires the history store does not hold yet (spec §9.1).
+    pub(crate) schedule_fires: crate::schedules::FireLog,
     pub(crate) history: crate::history::SharedHistory,
     /// Session creations per agent per minute (spec §14); not persisted.
     pub(crate) session_limiter: crate::sessions::SessionCreateLimiter,
@@ -1670,6 +1723,7 @@ impl DaemonState {
             sessions: crate::sessions::SessionRegistry::default(),
             approvals: crate::approvals::ApprovalRegistry::default(),
             skills: crate::skills::SkillRegistry::default(),
+            schedule_fires: crate::schedules::FireLog::default(),
             history: crate::history::HistoryService::ephemeral(),
             session_limiter: crate::sessions::SessionCreateLimiter::default(),
             tool_grants_applied: std::collections::BTreeSet::new(),
@@ -1880,6 +1934,7 @@ impl DaemonState {
         let skills = self.skills.snapshot();
         snapshot.skills = skills.skills;
         snapshot.skill_drafts = skills.drafts;
+        snapshot.schedule_fires = self.schedule_fires.snapshot();
         snapshot
     }
 
@@ -2031,6 +2086,7 @@ impl DaemonState {
             },
             anima_core::primitives::now_millis(),
         );
+        self.schedule_fires = crate::schedules::FireLog::restored(snapshot.schedule_fires);
 
         if relabelled_messages > 0 || relabelled_runs > 0 || mapped_runs > 0 {
             info!(
@@ -2109,6 +2165,7 @@ impl DaemonState {
             &snapshot.approval_rules,
         )?;
         crate::skills::SkillRegistry::validate(&snapshot.skills, &snapshot.skill_drafts)?;
+        crate::schedules::FireLog::validate(&snapshot.schedule_fires)?;
         let mut swarm_ids = HashSet::new();
         for swarm in &snapshot.swarms {
             let swarm_id = &swarm.state.id;
@@ -2340,28 +2397,17 @@ impl DaemonState {
                     ));
                 }
             }
-            match &schedule.trigger {
-                crate::schedules::ScheduleTrigger::Interval { interval_ms }
-                    if *interval_ms == 0 || *interval_ms % 1_000 != 0 =>
-                {
-                    return Err(format!("schedule '{}' has a zero interval", schedule.id));
-                }
-                crate::schedules::ScheduleTrigger::Daily {
-                    hour,
-                    minute,
-                    time_zone,
-                } if *hour > 23
-                    || *minute > 59
-                    || time_zone.trim().is_empty()
-                    || time_zone.parse::<chrono_tz::Tz>().is_err() =>
-                {
-                    return Err(format!(
-                        "schedule '{}' has an invalid daily trigger",
+            // Spec §9.1: every variant by name, no catch-all arm.
+            crate::schedules::timing::validate_stored_trigger(&schedule.trigger).map_err(
+                |problem| {
+                    format!(
+                        "schedule '{}' has an invalid trigger: {problem}",
                         schedule.id
-                    ));
-                }
-                _ => {}
-            }
+                    )
+                },
+            )?;
+            crate::schedules::validate_stored_automation(schedule)
+                .map_err(|problem| format!("schedule '{}' {problem}", schedule.id))?;
             if let Some(last_fired) = &schedule.last_fired {
                 if last_fired.fired_at_ms == 0
                     || last_fired.fired_at_ms > schedule.updated_at_ms

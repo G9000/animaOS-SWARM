@@ -918,7 +918,7 @@ mod tests {
             .unwrap();
 
         let payload = serde_json::to_value(source.control_plane_snapshot()).unwrap();
-        assert_eq!(payload["version"], 8);
+        assert_eq!(payload["version"], 9);
         assert_eq!(payload["approvals"].as_array().unwrap().len(), 2);
         assert_eq!(payload["approvalPolicies"][0]["policy"]["write"], "ask");
         assert_eq!(payload["approvalRules"][0]["id"], "rule_1");

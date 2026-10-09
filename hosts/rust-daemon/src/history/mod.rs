@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::approvals::ApprovalRequest;
 use crate::runs::RunRecord;
+use crate::schedules::ScheduleFireRecord;
 
 /// Rows per in-memory table in ephemeral mode (spec §13.1).
 pub(crate) const EPHEMERAL_HISTORY_MAX_ROWS: usize = 100_000;
@@ -204,6 +205,18 @@ pub(crate) trait HistoryStore: Send + Sync {
         query: &ApprovalPageQuery,
     ) -> Result<Vec<ApprovalRequest>, HistoryError>;
 
+    /// Automation fire records (spec §9.1), idempotent by id.
+    async fn upsert_schedule_runs(&self, fires: &[ScheduleFireRecord]) -> Result<(), HistoryError>;
+
+    /// An automation's fires, newest first (then by id, descending), at most
+    /// `limit`.
+    async fn page_schedule_runs(
+        &self,
+        agent_id: &str,
+        schedule_id: &str,
+        limit: usize,
+    ) -> Result<Vec<ScheduleFireRecord>, HistoryError>;
+
     async fn existing_message_ids(&self, ids: &[String]) -> Result<HashSet<String>, HistoryError>;
 
     async fn get_message(
@@ -250,11 +263,11 @@ pub(crate) trait HistoryStore: Send + Sync {
         limit: usize,
     ) -> Result<Vec<HistoryMessage>, HistoryError>;
 
-    /// Removes a session's messages, runs, approvals, and attachment records.
+    /// Removes a session's messages, runs, approvals, and attachment records; an automation's fire history stays.
     async fn delete_session(&self, agent_id: &str, session_id: &str) -> Result<(), HistoryError>;
 
-    /// Removes an agent's messages, runs, approvals, and attachment records
-    /// in every session; usage rows stay (spec §3.3).
+    /// Removes an agent's messages, runs, approvals, attachment records, and
+    /// automation fires in every session; usage rows stay (spec §3.3).
     async fn delete_agent(&self, agent_id: &str) -> Result<(), HistoryError>;
 }
 

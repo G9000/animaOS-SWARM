@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { emptyLiveRun } from '../../lib/session-events';
 import type { AgentDetail } from '../../lib/types';
+import { automationFixture } from '../../test/automations';
 import { runFixture } from '../../test/live';
 import { sessionFixture } from '../../test/sessions';
 import { SessionView, type SessionViewProps } from './SessionView';
@@ -266,5 +267,23 @@ describe('SessionView', () => {
       screen.getByRole('button', { name: 'Start a new chat' }),
     );
     expect(props.onNewChat).toHaveBeenCalled();
+  });
+
+  it('names a check-in’s schedule and opens its automation', async () => {
+    const user = userEvent.setup();
+    const automation = automationFixture('daily');
+    const props = renderView({
+      session: sessionFixture('schedule:daily', {
+        kind: 'checkin',
+        origin: 'schedule',
+        title: 'Check-in · goals',
+      }),
+      automation,
+      onEditAutomation: vi.fn(),
+    });
+
+    expect(screen.getByText('Check-in · every 30 min')).toBeVisible();
+    await user.click(screen.getByRole('button', { name: 'Edit automation' }));
+    expect(props.onEditAutomation).toHaveBeenCalledWith(automation);
   });
 });

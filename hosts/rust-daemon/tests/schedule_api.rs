@@ -49,11 +49,31 @@ async fn schedule_crud_is_agent_scoped_and_mutations_require_local_owner() {
     assert_eq!(created["schedule"]["agentId"], agent_id);
     assert!(created["schedule"]["nextDueAtMs"].as_u64().is_some());
 
+    let unguarded_list = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&create_uri)
+                .header("host", "127.0.0.1:8080")
+                .header("origin", "https://untrusted.example")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        unguarded_list.status(),
+        StatusCode::FORBIDDEN,
+        "the list needs the owner since M6"
+    );
+
     let listed = router
         .clone()
         .oneshot(
             Request::builder()
                 .uri(&create_uri)
+                .header("host", "127.0.0.1:8080")
+                .header("origin", "http://localhost:4200")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -161,6 +181,8 @@ async fn legacy_import_is_idempotent_and_preserves_browser_due_time() {
         .oneshot(
             Request::builder()
                 .uri(format!("/api/agents/{agent_id}/schedules"))
+                .header("host", "127.0.0.1:8080")
+                .header("origin", "http://localhost:4200")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -198,6 +220,15 @@ async fn openapi_registers_schedule_crud_and_import_contracts() {
     assert!(paths["/api/agents/{agent_id}/schedules/import"]
         .get("post")
         .is_some());
+    assert!(paths["/api/agents/{agent_id}/schedules/{schedule_id}/run"]
+        .get("post")
+        .is_some());
+    assert!(
+        paths["/api/agents/{agent_id}/schedules/{schedule_id}/history"]
+            .get("get")
+            .is_some()
+    );
+    assert!(paths["/api/schedules/preview"].get("post").is_some());
     assert!(document["tags"]
         .as_array()
         .unwrap()

@@ -5,10 +5,16 @@ import {
   type ReactNode,
   type RefObject,
 } from 'react';
-import { isTerminalRunStatus, type Session } from '@animaOS-SWARM/sdk';
+import {
+  isTerminalRunStatus,
+  type Automation,
+  type Session,
+} from '@animaOS-SWARM/sdk';
 
+import { describeTrigger } from '../../lib/automations';
 import type { LiveRun } from '../../lib/session-events';
 import { SESSION_KIND_LABELS } from '../../lib/session-groups';
+import { revealInvisible } from '../../lib/skills';
 import type { SlashCommand } from '../../lib/slash-commands';
 import type { AgentDetail, ChatMessage } from '../../lib/types';
 import { Composer, MessageList } from '../ChatScreen';
@@ -70,6 +76,10 @@ export interface SessionViewProps {
   onRename: (title: string) => Promise<boolean>;
   onToggleArchived: () => void;
   onExport: () => void;
+  /** A check-in's automation, for its header (spec §15.2). */
+  automation?: Automation | null;
+  /** Opens the automation's editor on the Automations page. */
+  onEditAutomation?: (automation: Automation) => void;
   notice?: ReactNode;
 }
 
@@ -111,11 +121,15 @@ function SessionHeader({
   onRename,
   onToggleArchived,
   onExport,
+  automation,
+  onEditAutomation,
 }: {
   session: Session;
   onRename: (title: string) => Promise<boolean>;
   onToggleArchived: () => void;
   onExport: () => void;
+  automation: Automation | null;
+  onEditAutomation?: (automation: Automation) => void;
 }) {
   const [editing, setEditing] = useState(false);
   const [title, setTitle] = useState(session.title);
@@ -164,6 +178,9 @@ function SessionHeader({
       )}
       <span className="session-kind-badge">
         {SESSION_KIND_LABELS[session.kind]}
+        {automation
+          ? ` · ${revealInvisible(describeTrigger(automation.trigger)).text}`
+          : ''}
       </span>
       {!editing && session.capabilities.rename && (
         <button
@@ -186,6 +203,15 @@ function SessionHeader({
       {session.capabilities.export && (
         <button type="button" className={ghostBtnCls} onClick={onExport}>
           Export
+        </button>
+      )}
+      {automation && onEditAutomation && (
+        <button
+          type="button"
+          className={ghostBtnCls}
+          onClick={() => onEditAutomation(automation)}
+        >
+          Edit automation
         </button>
       )}
     </header>
@@ -220,6 +246,8 @@ export function SessionView({
   onRename,
   onToggleArchived,
   onExport,
+  automation = null,
+  onEditAutomation,
   notice = null,
 }: SessionViewProps) {
   const conversation = useMemo(
@@ -269,6 +297,8 @@ export function SessionView({
           onRename={onRename}
           onToggleArchived={onToggleArchived}
           onExport={onExport}
+          automation={automation}
+          onEditAutomation={onEditAutomation}
         />
       ) : null}
       {notice}

@@ -17,6 +17,7 @@ use crate::approvals::{
     PendingApprovalStart, ResolvedBy,
 };
 use crate::runs::{RunRecord, RunSource, RunStart, RunStatus};
+use crate::schedules::{ScheduleFireRecord, ScheduleOutcomeStatus};
 
 pub(crate) fn history_message(
     id: &str,
@@ -217,6 +218,117 @@ pub(crate) async fn assert_history_store_approval_conformance(store: &dyn Histor
     assert_eq!(
         store.get_approval(&elsewhere.id).await.unwrap(),
         Some(elsewhere)
+    );
+}
+
+pub(crate) fn fire_record(
+    id: &str,
+    schedule_id: &str,
+    agent_id: &str,
+    fired_at_ms: u64,
+) -> ScheduleFireRecord {
+    ScheduleFireRecord {
+        id: id.into(),
+        schedule_id: schedule_id.into(),
+        agent_id: agent_id.into(),
+        fired_at_ms,
+        finished_at_ms: fired_at_ms + 10,
+        outcome: ScheduleOutcomeStatus::Spoke,
+        run_id: Some(format!("run_{id}")),
+        session_id: Some(format!("schedule:{schedule_id}")),
+        error_code: None,
+        manual: false,
+    }
+}
+
+/// Automation fire history (spec Â§9.1): idempotent writes, newest first per
+/// automation, kept by session deletions and removed with the agent.
+pub(crate) async fn assert_history_store_schedule_run_conformance(store: &dyn HistoryStore) {
+    let agent = format!("agent-{}", uuid::Uuid::new_v4());
+    let other = format!("agent-{}", uuid::Uuid::new_v4());
+    let schedule = format!("schedule-{}", uuid::Uuid::new_v4());
+    let fire =
+        |n: u32, at: u64| fire_record(&format!("schedule:{schedule}:{n}"), &schedule, &agent, at);
+    let (first, second, tie) = (fire(1, 100), fire(2, 200), fire(3, 200));
+    let elsewhere = fire_record(
+        &format!("elsewhere-{schedule}"),
+        "schedule-other",
+        &agent,
+        300,
+    );
+    let foreign = fire_record(&format!("foreign-{schedule}"), &schedule, &other, 400);
+    store
+        .upsert_schedule_runs(&[
+            first.clone(),
+            second.clone(),
+            tie.clone(),
+            elsewhere.clone(),
+            foreign.clone(),
+        ])
+        .await
+        .unwrap();
+    let mut rewritten = first.clone();
+    rewritten.outcome = ScheduleOutcomeStatus::Failed;
+    store
+        .upsert_schedule_runs(&[rewritten.clone()])
+        .await
+        .unwrap();
+    store.upsert_schedule_runs(&[]).await.unwrap();
+
+    assert_eq!(
+        store
+            .page_schedule_runs(&agent, &schedule, 50)
+            .await
+            .unwrap(),
+        vec![tie.clone(), second.clone(), rewritten.clone()],
+        "newest first, the id breaking a tie, the rewrite in place"
+    );
+    assert_eq!(
+        store
+            .page_schedule_runs(&agent, &schedule, 1)
+            .await
+            .unwrap(),
+        vec![tie]
+    );
+    assert_eq!(
+        store
+            .page_schedule_runs(&other, &schedule, 50)
+            .await
+            .unwrap(),
+        vec![foreign.clone()]
+    );
+
+    store
+        .delete_session(&agent, &format!("schedule:{schedule}"))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .page_schedule_runs(&agent, &schedule, 50)
+            .await
+            .unwrap()
+            .len(),
+        3,
+        "deleting a session leaves the automation's history"
+    );
+    store.delete_agent(&agent).await.unwrap();
+    assert!(store
+        .page_schedule_runs(&agent, &schedule, 50)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(store
+        .page_schedule_runs(&agent, "schedule-other", 50)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        store
+            .page_schedule_runs(&other, &schedule, 50)
+            .await
+            .unwrap(),
+        vec![foreign],
+        "another agent's history stays"
     );
 }
 
@@ -916,6 +1028,23 @@ impl HistoryStore for FlakyHistoryStore {
     ) -> Result<Vec<ApprovalRequest>, HistoryError> {
         self.check()?;
         self.inner.page_approvals(query).await
+    }
+
+    async fn upsert_schedule_runs(&self, fires: &[ScheduleFireRecord]) -> Result<(), HistoryError> {
+        self.check()?;
+        self.inner.upsert_schedule_runs(fires).await
+    }
+
+    async fn page_schedule_runs(
+        &self,
+        agent_id: &str,
+        schedule_id: &str,
+        limit: usize,
+    ) -> Result<Vec<ScheduleFireRecord>, HistoryError> {
+        self.check()?;
+        self.inner
+            .page_schedule_runs(agent_id, schedule_id, limit)
+            .await
     }
 
     async fn existing_message_ids(&self, ids: &[String]) -> Result<HashSet<String>, HistoryError> {

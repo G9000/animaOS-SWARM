@@ -2,6 +2,21 @@
 
 This document is for the next agent picking up the companion console upgrade. Read it first; it tells you where everything is and what to do next.
 
+## Update 2026-10-04: M6 done, PR open
+
+- M5 is merged (PR #11).
+- **M6 (Automations) is complete** on the new branch `feat/companion-console-m6`. Each milestone now gets its own branch, cut from `main` after the previous merge.
+- **Gates at `ccce91b`, all green:**
+  - `rust-daemon:test`: 1,874 passed, 7 ignored.
+  - SDK and web test, typecheck and build (web 845 tests).
+  - Formatting.
+- **Cost mode (the owner asked for it):**
+  - No separate pre-flight audit: the controller rules on the plan writer's risk list.
+  - Sonnet does most of the implementing, with Opus for the risky tasks.
+  - Batched reviews, and a web-only final review.
+- **Ledger:** `.superpowers/sdd/2026-09-23-companion-console-m6/progress.md`.
+- **Next:** M7 (memory). Keep it cheap: Sonnet writes a shorter plan (interfaces and tests, not full code), then the same cost mode.
+
 ## Update 2026-10-03: M5 done, PR open
 
 - **M5 (Skills) is complete** on `feat/companion-console`, and a PR to `main` is open.

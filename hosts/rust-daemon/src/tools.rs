@@ -1,3 +1,4 @@
+pub(crate) mod automations;
 pub(crate) mod calendar;
 mod conversations;
 mod filesystem;
@@ -29,6 +30,7 @@ use crate::memory_embeddings::SharedMemoryEmbeddings;
 use crate::memory_store::MemoryStoreConfig;
 use crate::state::SharedMemoryStore;
 
+pub(crate) use automations::is_automation_tool;
 pub(crate) use process::{
     background_process_count, new_shared_process_manager_with_limit, SharedProcessManager,
     DEFAULT_MAX_BACKGROUND_PROCESSES,
@@ -449,6 +451,77 @@ impl ToolRegistry {
                 ]),
             ),
             skills::propose_skill,
+        );
+        registry.register(
+            tool_descriptor(
+                "create_automation",
+                "Schedule a prompt that runs you again later, in the automation's own thread or in the owner's Telegram chat. The owner sees it in this chat with Undo and on the Automations page. Its runs must be at least 5 minutes apart; you may have at most 20 automations.",
+                object_parameters(vec![
+                    required_parameter(
+                        "prompt",
+                        non_blank_string_parameter("What to do on each run, at most 32 KiB"),
+                    ),
+                    required_parameter(
+                        "schedule",
+                        non_blank_string_parameter(
+                            "A 5-field cron expression or @hourly, @daily, @weekly, @monthly; \"every <n> minutes|hours|days\"; or \"at <RFC 3339 time>\" for one run",
+                        ),
+                    ),
+                    optional_parameter(
+                        "name",
+                        string_parameter("A short name, at most 80 characters; from the prompt when absent"),
+                    ),
+                    optional_parameter(
+                        "timeZone",
+                        string_parameter("IANA time zone for a cron schedule and active hours, such as Europe/London; UTC when absent"),
+                    ),
+                    optional_parameter(
+                        "target",
+                        string_enum_parameter(
+                            "Where it runs: its own thread (the default) or the owner's Telegram chat",
+                            &["thread", "telegram"],
+                        ),
+                    ),
+                    optional_parameter(
+                        "activeHours",
+                        object_parameter(vec![
+                            required_parameter("start", non_blank_string_parameter("HH:MM, 24-hour")),
+                            required_parameter(
+                                "end",
+                                non_blank_string_parameter("HH:MM, 24-hour; before start for an overnight window"),
+                            ),
+                            optional_parameter(
+                                "days",
+                                array_parameter(
+                                    "Days it may run, 0 for Sunday to 6 for Saturday; every day when absent",
+                                    bounded_integer_parameter("A day, 0 for Sunday", 0, 6),
+                                    Some(1),
+                                ),
+                            ),
+                        ]),
+                    ),
+                ]),
+            ),
+            automations::create_automation,
+        );
+        registry.register(
+            tool_descriptor(
+                "list_automations",
+                "List your automations: id, name, schedule, whether each is on, its next run, and its last outcome.",
+                object_parameters(vec![]),
+            ),
+            automations::list_automations,
+        );
+        registry.register(
+            tool_descriptor(
+                "pause_automation",
+                "Turn off one of your automations by its id (from list_automations). The owner can turn it back on.",
+                object_parameters(vec![required_parameter(
+                    "id",
+                    non_blank_string_parameter("The automation's id"),
+                )]),
+            ),
+            automations::pause_automation,
         );
         registry.register(
             tool_descriptor(
