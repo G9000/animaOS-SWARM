@@ -117,6 +117,12 @@ var.
 
 The daemon emits structured logs through `tracing` and adds `x-request-id` to
 HTTP responses so request logs and client-visible responses can be correlated.
+The daemon also keeps the last 2,000 log lines (each at most 4 KiB) in memory
+for the owner's log routes; every line is redacted at capture (API keys,
+`Authorization` and `Bearer` values, OAuth and Telegram tokens, JWTs, and long
+unlabeled tokens become `[redacted]`). Redaction is pattern-based, so treat
+`RUST_LOG=debug` (or `trace`) with care: it lets far more detail, such as
+request and provider payload fragments, into both the console and the log tail.
 
 ---
 
