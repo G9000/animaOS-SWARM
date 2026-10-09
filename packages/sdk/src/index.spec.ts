@@ -16,7 +16,7 @@ import {
 
 const originalFetchDescriptor = Object.getOwnPropertyDescriptor(
   globalThis,
-  'fetch'
+  'fetch',
 );
 
 function jsonResponse(body: unknown, init?: ResponseInit): Response {
@@ -45,7 +45,7 @@ function sseResponse(messages: string[]): Response {
       headers: {
         'content-type': 'text/event-stream',
       },
-    }
+    },
   );
 }
 
@@ -86,8 +86,8 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
               lastTask: null,
             },
           },
-          { status: 201 }
-        )
+          { status: 201 },
+        ),
       )
       .mockResolvedValueOnce(
         jsonResponse({
@@ -114,7 +114,7 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
             },
             durationMs: 12,
           },
-        })
+        }),
       );
 
     const client = createDaemonClient({ baseUrl: 'http://daemon.test/' });
@@ -122,7 +122,7 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
       agent({
         name: 'researcher',
         model: 'gpt-5.4',
-      })
+      }),
     );
     const runResult = await client.agents.run('agent-1', {
       text: 'Find the answer',
@@ -153,7 +153,7 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
           name: 'researcher',
           model: 'gpt-5.4',
         }),
-      })
+      }),
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
       2,
@@ -163,7 +163,7 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
         body: JSON.stringify({
           text: 'Find the answer',
         }),
-      })
+      }),
     );
   });
 
@@ -172,7 +172,7 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
       .mockResolvedValueOnce(
         jsonResponse({
           status: 'ok',
-        })
+        }),
       )
       .mockResolvedValueOnce(
         jsonResponse(
@@ -186,8 +186,8 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
             createdAt: 1712448000000,
             tags: ['daemon', 'memory'],
           },
-          { status: 201 }
-        )
+          { status: 201 },
+        ),
       )
       .mockResolvedValueOnce(
         jsonResponse({
@@ -204,7 +204,7 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
               score: 0.93,
             },
           ],
-        })
+        }),
       )
       .mockResolvedValueOnce(
         jsonResponse({
@@ -220,7 +220,7 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
               tags: ['recent'],
             },
           ],
-        })
+        }),
       );
 
     const client = createDaemonClient({ baseUrl: 'http://daemon.test/' });
@@ -237,7 +237,7 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
         content: 'Daemon memory endpoint created',
         importance: 0.8,
         tags: ['daemon', 'memory'],
-      })
+      }),
     ).resolves.toMatchObject({
       id: 'memory-1',
       agentId: 'agent-1',
@@ -250,7 +250,7 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
         type: 'fact',
         limit: 5,
         minImportance: 0.5,
-      })
+      }),
     ).resolves.toEqual([
       expect.objectContaining({
         id: 'memory-1',
@@ -262,7 +262,7 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
       client.memories.recent({
         agentId: 'agent-1',
         limit: 1,
-      })
+      }),
     ).resolves.toEqual([
       expect.objectContaining({
         id: 'memory-2',
@@ -277,7 +277,7 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
         headers: expect.objectContaining({
           accept: 'application/json',
         }),
-      })
+      }),
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
       2,
@@ -292,7 +292,7 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
           importance: 0.8,
           tags: ['daemon', 'memory'],
         }),
-      })
+      }),
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
       3,
@@ -301,7 +301,7 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
         headers: expect.objectContaining({
           accept: 'application/json',
         }),
-      })
+      }),
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
       4,
@@ -310,7 +310,7 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
         headers: expect.objectContaining({
           accept: 'application/json',
         }),
-      })
+      }),
     );
   });
 
@@ -327,8 +327,8 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
             createdAt: 1712448000000,
             updatedAt: 1712448000000,
           },
-          { status: 201 }
-        )
+          { status: 201 },
+        ),
       )
       .mockResolvedValueOnce(
         jsonResponse({
@@ -343,7 +343,7 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
               updatedAt: 1712448000000,
             },
           ],
-        })
+        }),
       )
       .mockResolvedValueOnce(
         jsonResponse({
@@ -352,7 +352,7 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
           score: 0.03,
           suggestedImportance: 0.05,
           duplicateMemoryId: null,
-        })
+        }),
       )
       .mockResolvedValueOnce(
         jsonResponse({
@@ -374,7 +374,7 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
             tags: ['preference'],
             scope: 'private',
           },
-        })
+        }),
       )
       .mockResolvedValueOnce(
         jsonResponse({
@@ -400,7 +400,7 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
               importanceScore: 0.74,
             },
           ],
-        })
+        }),
       )
       .mockResolvedValueOnce(
         jsonResponse({
@@ -445,7 +445,7 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
               updatedAt: 1712448000000,
             },
           ],
-        })
+        }),
       )
       .mockResolvedValueOnce(
         jsonResponse({
@@ -458,7 +458,7 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
           ],
           removedMemoryIds: ['memory-old'],
           removedRelationshipIds: ['relationship-old'],
-        })
+        }),
       )
       .mockResolvedValueOnce(
         jsonResponse({
@@ -490,7 +490,7 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
               },
             ],
           },
-        })
+        }),
       );
 
     const client = createDaemonClient({ baseUrl: 'http://daemon.test' });
@@ -502,14 +502,14 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
         name: 'Leo',
         aliases: ['operator'],
         summary: 'Primary operator',
-      })
+      }),
     ).resolves.toMatchObject({
       kind: 'user',
       id: 'user-1',
     });
 
     await expect(
-      client.memories.entities({ kind: 'user', alias: 'operator', limit: 5 })
+      client.memories.entities({ kind: 'user', alias: 'operator', limit: 5 }),
     ).resolves.toEqual([
       expect.objectContaining({
         id: 'user-1',
@@ -524,7 +524,7 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
         type: 'fact',
         content: 'ok',
         importance: 0.05,
-      })
+      }),
     ).resolves.toMatchObject({
       decision: 'ignore',
     });
@@ -538,7 +538,7 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
         importance: 0.4,
         tags: ['preference'],
         minContentChars: 8,
-      })
+      }),
     ).resolves.toMatchObject({
       evaluation: {
         decision: 'store',
@@ -555,7 +555,7 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
         recentLimit: 0,
         temporalLimit: 7,
         limit: 3,
-      })
+      }),
     ).resolves.toEqual([
       expect.objectContaining({
         memory: expect.objectContaining({
@@ -577,7 +577,7 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
         minImportance: 0.2,
         maxMemories: 100,
         decayHalfLifeMillis: 86_400_000,
-      })
+      }),
     ).resolves.toMatchObject({
       decayedMemories: [expect.objectContaining({ memoryId: 'memory-9' })],
       removedMemoryIds: ['memory-old'],
@@ -609,12 +609,12 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
           aliases: ['operator'],
           summary: 'Primary operator',
         }),
-      })
+      }),
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
       2,
       'http://daemon.test/api/memories/entities?kind=user&alias=operator&limit=5',
-      expect.any(Object)
+      expect.any(Object),
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
       3,
@@ -628,7 +628,7 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
           content: 'ok',
           importance: 0.05,
         }),
-      })
+      }),
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
       4,
@@ -644,17 +644,17 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
           tags: ['preference'],
           minContentChars: 8,
         }),
-      })
+      }),
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
       5,
       'http://daemon.test/api/memories/recall?q=evidence+probe&agentId=agent-1&limit=3&entityId=user-1&recentLimit=0&temporalLimit=7',
-      expect.any(Object)
+      expect.any(Object),
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
       6,
       'http://daemon.test/api/memories/memory-9/trace',
-      expect.any(Object)
+      expect.any(Object),
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
       7,
@@ -666,12 +666,12 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
           maxMemories: 100,
           decayHalfLifeMillis: 86_400_000,
         }),
-      })
+      }),
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
       8,
       'http://daemon.test/api/memories/readiness',
-      expect.any(Object)
+      expect.any(Object),
     );
   });
 
@@ -686,8 +686,8 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
               agentIds: ['manager', 'worker-a'],
             },
           },
-          { status: 201 }
-        )
+          { status: 201 },
+        ),
       )
       .mockResolvedValueOnce(
         jsonResponse({
@@ -702,7 +702,7 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
               text: '[manager]: coordinated',
             },
           },
-        })
+        }),
       );
 
     const client = createDaemonClient({ baseUrl: 'http://daemon.test' });
@@ -720,7 +720,7 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
           },
         ],
         maxTurns: 2,
-      })
+      }),
     );
     const runResult = await client.swarms.run('swarm-1', {
       text: 'Coordinate the patch',
@@ -755,7 +755,7 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
           ],
           maxTurns: 2,
         }),
-      })
+      }),
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
       2,
@@ -765,7 +765,7 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
         body: JSON.stringify({
           text: 'Coordinate the patch',
         }),
-      })
+      }),
     );
   });
 
@@ -789,8 +789,8 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
         {
           error: 'q query parameter is required',
         },
-        { status: 400 }
-      )
+        { status: 400 },
+      ),
     );
 
     const client = createDaemonClient({ baseUrl: 'http://daemon.test' });
@@ -814,7 +814,7 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
         'event: swarm:message\ndata: {"swarmId":"swarm-1","message":{"id":"swarm-msg-1","from":"manager-1","to":"worker-a-2","content":{"text":"hand off the plan"},"timestamp":123}}\n\n',
         'event: tool:after\ndata: {"agentId":"agent-1","agentName":"manager","toolName":"memory_search","status":"success","durationMs":12,"result":"Found prior note"}\n\n',
         'event: swarm:completed\ndata: {"swarmId":"swarm-1","state":{"status":"idle"},"result":{"status":"success"}}\n\n',
-      ])
+      ]),
     );
 
     const client = createDaemonClient({ baseUrl: 'http://daemon.test' });
@@ -834,7 +834,7 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
         headers: expect.objectContaining({
           accept: 'text/event-stream',
         }),
-      })
+      }),
     );
     expect(received).toEqual([
       {
@@ -901,8 +901,8 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
             start(controller) {
               controller.enqueue(
                 new TextEncoder().encode(
-                  'event: swarm:running\ndata: {"swarmId":"swarm-1"}\n\n'
-                )
+                  'event: swarm:running\ndata: {"swarmId":"swarm-1"}\n\n',
+                ),
               );
             },
             cancel(reason) {
@@ -913,8 +913,8 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
             headers: {
               'content-type': 'text/event-stream',
             },
-          }
-        )
+          },
+        ),
       );
     });
 
