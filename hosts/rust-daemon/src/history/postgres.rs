@@ -8,11 +8,12 @@ use sqlx::{PgPool, Row};
 
 use super::{
     message_ordinal, role_name, search_tokens, searchable_text, to_i64, ApprovalPageQuery,
-    HistoryError, HistoryMessage, HistoryStore, MessagePageQuery,
+    HistoryError, HistoryMessage, HistoryStore, MessagePageQuery, UsagePageQuery,
 };
 use crate::approvals::ApprovalRequest;
 use crate::runs::RunRecord;
 use crate::schedules::ScheduleFireRecord;
+use crate::usage::UsageRecord;
 
 const UPSERT_MESSAGE: &str = "
 INSERT INTO history_messages (id, agent_id, session_id, role, text, hidden, created_at_ms, ordinal, record)
@@ -53,6 +54,33 @@ WHERE ($1::text IS NULL OR agent_id = $1) AND created_at_ms >= $2
   AND ($3::bigint IS NULL OR created_at_ms < $3 OR (created_at_ms = $3 AND id COLLATE \"C\" < $4))
 ORDER BY created_at_ms DESC, id COLLATE \"C\" DESC
 LIMIT $5";
+
+/// A stored row keeps its price fields when the same id is written again
+/// (spec §11.1: priced when first mirrored); a legacy row without them takes
+/// the new ones.
+const UPSERT_USAGE: &str = "
+INSERT INTO history_usage (id, agent_id, session_id, run_id, created_at_ms, record)
+VALUES ($1, $2, $3, $4, $5, $6)
+ON CONFLICT (id) DO UPDATE SET
+    agent_id = EXCLUDED.agent_id,
+    session_id = EXCLUDED.session_id,
+    run_id = EXCLUDED.run_id,
+    created_at_ms = EXCLUDED.created_at_ms,
+    record = CASE
+        WHEN history_usage.record ->> 'pricingSource' IS NOT NULL
+        THEN EXCLUDED.record || jsonb_build_object(
+            'costMicros', history_usage.record -> 'costMicros',
+            'pricingSource', history_usage.record -> 'pricingSource')
+        ELSE EXCLUDED.record
+    END";
+
+const PAGE_USAGE: &str = "
+SELECT record FROM history_usage
+WHERE created_at_ms >= $1 AND created_at_ms < $2
+  AND ($3::text IS NULL OR agent_id = $3) AND ($4::text IS NULL OR session_id = $4)
+  AND ($5::bigint IS NULL OR created_at_ms < $5 OR (created_at_ms = $5 AND id COLLATE \"C\" < $6))
+ORDER BY created_at_ms DESC, id COLLATE \"C\" DESC
+LIMIT $7";
 
 const UPSERT_SCHEDULE_RUN: &str = "
 INSERT INTO history_schedule_runs (id, schedule_id, agent_id, fired_at_ms, record)
@@ -217,6 +245,49 @@ impl HistoryStore for PostgresHistoryStore {
             .await?;
         rows.iter()
             .map(|row| -> Result<ApprovalRequest, HistoryError> {
+                let record: serde_json::Value = row.try_get("record")?;
+                Ok(serde_json::from_value(record)?)
+            })
+            .collect()
+    }
+
+    async fn upsert_usage(&self, records: &[UsageRecord]) -> Result<(), HistoryError> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let mut transaction = self.pool.begin().await?;
+        for record in records {
+            sqlx::query(UPSERT_USAGE)
+                .bind(&record.id)
+                .bind(&record.agent_id)
+                .bind(record.session_id.as_deref())
+                .bind(record.run_id.as_deref())
+                .bind(to_i64(record.created_at_ms)?)
+                .bind(serde_json::to_value(record)?)
+                .execute(&mut *transaction)
+                .await?;
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn page_usage(&self, query: &UsagePageQuery) -> Result<Vec<UsageRecord>, HistoryError> {
+        let (before_at, before_id) = match &query.before {
+            Some((at_ms, id)) => (Some(to_i64(*at_ms)?), id.clone()),
+            None => (None, String::new()),
+        };
+        let rows = sqlx::query(PAGE_USAGE)
+            .bind(to_i64(query.from_ms)?)
+            .bind(to_i64(query.to_ms)?)
+            .bind(query.agent_id.as_deref())
+            .bind(query.session_id.as_deref())
+            .bind(before_at)
+            .bind(before_id)
+            .bind(i64::try_from(query.limit).unwrap_or(i64::MAX))
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter()
+            .map(|row| -> Result<UsageRecord, HistoryError> {
                 let record: serde_json::Value = row.try_get("record")?;
                 Ok(serde_json::from_value(record)?)
             })
@@ -478,7 +549,7 @@ mod tests {
         assert_history_store_conformance, assert_history_store_diacritics_conformance,
         assert_history_store_indexed_text_cap_conformance,
         assert_history_store_schedule_run_conformance,
-        assert_history_store_session_search_conformance,
+        assert_history_store_session_search_conformance, assert_history_store_usage_conformance,
     };
 
     #[test]
@@ -500,6 +571,7 @@ mod tests {
         assert_history_store_diacritics_conformance(&store).await;
         assert_history_store_approval_conformance(&store).await;
         assert_history_store_schedule_run_conformance(&store).await;
+        assert_history_store_usage_conformance(&store).await;
         assert_eq!(store.label(), "postgres");
     }
 }

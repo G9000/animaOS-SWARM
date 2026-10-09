@@ -772,3 +772,92 @@ describe('daemon memory requests', () => {
     ]);
   });
 });
+
+describe('daemon usage requests', () => {
+  it('reads usage, exports the csv, and reads and sets the pricing through the SDK routes', async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async (input) => {
+        const url = String(input);
+        if (url.includes('export.csv'))
+          return new Response('id,agent\n', { status: 200 });
+        const body = url.includes('/pricing')
+          ? { overrides: [], tableDate: '2026-09-01' }
+          : url.includes('/records')
+            ? { records: [], nextCursor: null }
+            : {};
+        return new Response(JSON.stringify(body), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await daemon.usageSummary({
+      from: 1,
+      to: 2,
+      agentId: 'agent 1',
+      groupBy: 'day',
+      tzOffsetMinutes: 60,
+    });
+    await daemon.usageRecords({ agentId: 'agent 1', limit: 50 });
+    expect(await daemon.exportUsageCsv({ from: 1, to: 2 })).toBe('id,agent\n');
+    await daemon.usagePricing();
+    await daemon.setUsagePricing([]);
+
+    expect(
+      fetchMock.mock.calls.map(
+        ([url, init]) => `${init?.method ?? 'GET'} ${String(url)}`,
+      ),
+    ).toEqual([
+      'GET /api/usage/summary?from=1&to=2&agentId=agent+1&groupBy=day&tzOffsetMinutes=60',
+      'GET /api/usage/records?agentId=agent+1&limit=50',
+      'GET /api/usage/export.csv?from=1&to=2',
+      'GET /api/usage/pricing',
+      'PUT /api/usage/pricing',
+    ]);
+  });
+});
+
+describe('daemon logs and status requests', () => {
+  it('lists logs, opens the stream, and reads the status through the SDK routes', async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async (input) => {
+        const url = String(input);
+        if (url.startsWith('/api/logs/stream'))
+          return new Response(
+            'event: log\ndata: {"seq":7,"at":1,"level":"info","target":"t","message":"m"}\n\nevent: resync\ndata: {"newestSeq":9}\n\n',
+            {
+              status: 200,
+              headers: { 'content-type': 'text/event-stream' },
+            },
+          );
+        const body = url.startsWith('/api/logs')
+          ? { lines: [], newestSeq: 0 }
+          : { version: '1' };
+        return new Response(JSON.stringify(body), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await daemon.logs({ level: 'warn', q: 'a b', after: 3, limit: 500 });
+    const events = [];
+    for await (const event of daemon.logStream({ level: 'info', after: 5 }))
+      events.push(event);
+    await daemon.status();
+
+    expect(
+      fetchMock.mock.calls.map(
+        ([url, init]) => `${init?.method ?? 'GET'} ${String(url)}`,
+      ),
+    ).toEqual([
+      'GET /api/logs?level=warn&q=a+b&after=3&limit=500',
+      'GET /api/logs/stream?level=info&after=5',
+      'GET /api/status',
+    ]);
+    expect(events.map((event) => event.kind)).toEqual(['line', 'resync']);
+  });
+});

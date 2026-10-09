@@ -133,6 +133,48 @@ export type {
   AutomationTrigger,
   HeartbeatInput,
 } from './automations.js';
+export {
+  MAX_PRICE_MICROS_PER_MTOK,
+  MAX_PRICING_OVERRIDES,
+  MAX_USAGE_RECORDS_LIMIT,
+  UsageClient,
+} from './usage.js';
+export type {
+  Pricing,
+  PricingOverride,
+  PricingSource,
+  UsageExportQuery,
+  UsageGroup,
+  UsageGroupBy,
+  UsageQuery,
+  UsageRecord,
+  UsageRecordsPage,
+  UsageRecordsQuery,
+  UsageSource,
+  UsageSummary,
+  UsageTotals,
+} from './usage.js';
+export { LOG_LEVELS, LogsClient, MAX_LOGS_LIMIT } from './logs.js';
+export type {
+  LogEvent,
+  LogLevel,
+  LogLine,
+  LogStreamOptions,
+  LogsPage,
+  LogsQuery,
+} from './logs.js';
+export { STATUS_TOO_OLD, StatusClient, StatusTooOldError } from './status.js';
+export type {
+  DaemonStatus,
+  StatusAutomations,
+  StatusConnector,
+  StatusHistory,
+  StatusLimits,
+  StatusProvider,
+  StatusReadiness,
+  StatusRuns,
+  StatusStorage,
+} from './status.js';
 export { ChatGptClient } from './chatgpt.js';
 export type { ChatGptLogin, ChatGptStatus } from './chatgpt.js';
 export type {

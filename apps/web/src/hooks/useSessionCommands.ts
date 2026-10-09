@@ -155,6 +155,7 @@ export function useSessionCommands(
         help: () => current.showCommands(),
         search: (words) => current.search(words),
         model: () => current.chooseModel(),
+        usage: () => current.navigate({ kind: 'page', page: 'usage' }),
       };
       const { session, activeRun } = current;
       if (!session) return result;

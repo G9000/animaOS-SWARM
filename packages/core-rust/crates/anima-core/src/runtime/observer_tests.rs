@@ -1,6 +1,10 @@
 //! Live run frames and streamed model calls (spec §4.5).
 
-use super::{AgentRuntime, RunFrame, RunObserver, MODEL_STREAM_WITHOUT_FINAL};
+use super::observer::StepSink;
+use super::{
+    AgentRuntime, CancelSignal, RunControl, RunFrame, RunObserver, MODEL_STREAM_WITHOUT_FINAL,
+    RUN_STOPPED_ERROR,
+};
 use crate::agent::{AgentConfig, TokenUsage, ToolDescriptor};
 use crate::components::{Evaluator, EvaluatorResult};
 use crate::model::{
@@ -577,4 +581,173 @@ fn adapters_that_only_generate_still_run_through_the_default_stream() {
             },
         ]
     );
+}
+
+/// Reports `usage` (when set), streams one delta, then either waits for a
+/// stop (`cancel` set), fails (`error` set), or finishes with `usage`.
+struct UsageThenEnd {
+    usage: Option<TokenUsage>,
+    cancel: Option<CancelSignal>,
+    error: Option<&'static str>,
+}
+
+#[async_trait]
+impl ModelAdapter for UsageThenEnd {
+    fn provider(&self) -> &str {
+        "usage-then-end"
+    }
+
+    async fn generate(
+        &self,
+        _config: &AgentConfig,
+        _request: &ModelGenerateRequest,
+    ) -> Result<ModelGenerateResponse, String> {
+        Err("the runtime streams every model call".into())
+    }
+
+    async fn stream(
+        &self,
+        _config: &AgentConfig,
+        _request: &ModelGenerateRequest,
+        sink: &dyn ModelStreamSink,
+    ) -> Result<(), String> {
+        if let Some(usage) = &self.usage {
+            sink.emit(ModelStreamFrame::Usage(usage.clone())).await?;
+        }
+        sink.emit(ModelStreamFrame::TextDelta("Part".into()))
+            .await?;
+        if let Some(cancel) = &self.cancel {
+            cancel.cancel();
+            futures::future::pending::<()>().await;
+        }
+        if let Some(error) = self.error {
+            return Err(error.into());
+        }
+        sink.emit(ModelStreamFrame::Final(ModelGenerateResponse {
+            content: text("Part done"),
+            tool_calls: None,
+            usage: usage(7, 3),
+            stop_reason: ModelStopReason::End,
+        }))
+        .await
+    }
+}
+
+fn step_usage_frames(frames: &[RunFrame]) -> Vec<TokenUsage> {
+    frames
+        .iter()
+        .filter_map(|frame| match frame {
+            RunFrame::StepUsage { usage, .. } => Some(usage.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn stopped_run(usage: Option<TokenUsage>) -> (AgentRuntime, Arc<Frames>, TaskResult<Content>) {
+    let control = RunControl::new();
+    let frames = Arc::new(Frames::default());
+    let mut runtime = AgentRuntime::new(
+        config(&[]),
+        Arc::new(UsageThenEnd {
+            usage,
+            cancel: Some(control.cancel.clone()),
+            error: None,
+        }),
+    );
+    runtime.init();
+    runtime.set_run_id("run_u");
+    runtime.set_run_observer(frames.clone());
+    runtime.set_run_control(control);
+    let result = block_on(runtime.run(text("hi")));
+    (runtime, frames, result)
+}
+
+#[test]
+fn a_stopped_call_records_the_prompt_tokens_already_reported() {
+    let (runtime, frames, result) = stopped_run(Some(usage(120, 0)));
+
+    assert_eq!(result.error.as_deref(), Some(RUN_STOPPED_ERROR));
+    assert_eq!(runtime.state().token_usage.prompt_tokens, 120);
+    assert_eq!(runtime.state().token_usage.total_tokens, 120);
+    let frames = frames.take();
+    assert_eq!(step_usage_frames(&frames), vec![usage(120, 0)]);
+    let usage_at = frames
+        .iter()
+        .position(|frame| matches!(frame, RunFrame::StepUsage { .. }))
+        .unwrap();
+    let finished_at = frames
+        .iter()
+        .position(|frame| matches!(frame, RunFrame::StepFinished { .. }))
+        .unwrap();
+    assert!(usage_at < finished_at);
+}
+
+#[test]
+fn a_failed_stream_records_the_running_usage() {
+    let frames = Arc::new(Frames::default());
+    let mut runtime = AgentRuntime::new(
+        config(&[]),
+        Arc::new(UsageThenEnd {
+            usage: Some(usage(120, 4)),
+            cancel: None,
+            error: Some("connection reset"),
+        }),
+    );
+    runtime.init();
+    runtime.set_run_id("run_u");
+    runtime.set_run_observer(frames.clone());
+
+    let result = block_on(runtime.run(text("hi")));
+
+    assert_eq!(result.status, TaskStatus::Error);
+    assert_eq!(result.error.as_deref(), Some("connection reset"));
+    assert_eq!(runtime.state().token_usage.prompt_tokens, 120);
+    assert_eq!(runtime.state().token_usage.completion_tokens, 4);
+    let frames = frames.take();
+    assert_eq!(step_usage_frames(&frames), vec![usage(120, 4)]);
+    assert!(matches!(frames.last(), Some(RunFrame::StepFinished { .. })));
+}
+
+#[test]
+fn a_call_without_usage_frames_records_nothing_extra() {
+    let (runtime, frames, result) = stopped_run(None);
+
+    assert_eq!(result.error.as_deref(), Some(RUN_STOPPED_ERROR));
+    assert_eq!(runtime.state().token_usage.total_tokens, 0);
+    assert!(step_usage_frames(&frames.take()).is_empty());
+}
+
+#[test]
+fn a_completed_call_counts_its_usage_once() {
+    let frames = Arc::new(Frames::default());
+    let mut runtime = AgentRuntime::new(
+        config(&[]),
+        Arc::new(UsageThenEnd {
+            usage: Some(usage(6, 0)),
+            cancel: None,
+            error: None,
+        }),
+    );
+    runtime.init();
+    runtime.set_run_observer(frames.clone());
+
+    let result = block_on(runtime.run(text("hi")));
+
+    assert_eq!(result.status, TaskStatus::Success);
+    assert_eq!(runtime.state().token_usage.prompt_tokens, 7);
+    assert_eq!(runtime.state().token_usage.total_tokens, 10);
+    assert_eq!(step_usage_frames(&frames.take()), vec![usage(7, 3)]);
+}
+
+#[test]
+fn partial_usage_is_none_for_a_zero_total() {
+    let sink = StepSink::new(None, "run:1".into());
+    assert_eq!(sink.partial_usage(), None);
+
+    block_on(sink.emit(ModelStreamFrame::Usage(TokenUsage::default()))).unwrap();
+    assert_eq!(sink.partial_usage(), None);
+
+    block_on(sink.emit(ModelStreamFrame::Usage(usage(5, 0)))).unwrap();
+    block_on(sink.emit(ModelStreamFrame::Usage(usage(5, 2)))).unwrap();
+    assert_eq!(sink.partial_usage(), Some(usage(5, 2)), "the latest wins");
 }

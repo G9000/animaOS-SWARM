@@ -291,6 +291,7 @@ pub(crate) async fn prune_in_transaction(
     }
     let history = state.read().await.history.clone();
     history.forget_mirrored(undo.message_ids.iter().map(String::as_str));
+    history.note_pruned(undo.message_ids.len());
     Ok(undo.message_ids.len())
 }
 
@@ -777,9 +778,15 @@ mod tests {
             202
         );
         assert!(state.read().await.history.is_mirrored("a000"));
+        assert_eq!(
+            state.read().await.history.stats().pruned_messages,
+            0,
+            "a failed prune counts nothing"
+        );
 
         assert_eq!(prune_once(&state, &transactions, NOW_MS).await, Ok(2));
         let guard = state.read().await;
+        assert_eq!(guard.history.stats().pruned_messages, 2);
         let hot = guard.get_agent(&agent).unwrap().messages;
         assert_eq!(hot.len(), 200);
         assert_eq!(hot[0].id, "a002");

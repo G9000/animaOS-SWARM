@@ -38,6 +38,9 @@ pub(crate) enum Step {
     /// Streams these chunks, then never finishes: the call ends only when
     /// the run drops it (a stop).
     Hold(Vec<&'static str>),
+    /// Reports this usage, as a provider does before its last chunk, then
+    /// holds like `Hold`.
+    HoldAfterUsage(TokenUsage, Vec<&'static str>),
     /// Panics, as a crashing adapter would.
     Panic(&'static str),
 }
@@ -188,7 +191,7 @@ impl ModelAdapter for ScriptedModel {
             Step::Text(chunks) => Ok(response(chunks.concat(), None)),
             Step::Tools(calls) => Ok(response(String::new(), Some(calls))),
             Step::Fail(error) => Err(error.to_string()),
-            Step::Hold(_) => std::future::pending().await,
+            Step::Hold(_) | Step::HoldAfterUsage(..) => std::future::pending().await,
             Step::Panic(message) => panic!("{message}"),
         }
     }
@@ -216,6 +219,14 @@ impl ModelAdapter for ScriptedModel {
                 .await
             }
             Step::Fail(error) => Err(error.to_string()),
+            Step::HoldAfterUsage(usage, chunks) => {
+                sink.emit(ModelStreamFrame::Usage(usage)).await?;
+                for chunk in &chunks {
+                    sink.emit(ModelStreamFrame::TextDelta((*chunk).to_string()))
+                        .await?;
+                }
+                std::future::pending().await
+            }
             Step::Hold(chunks) => {
                 for chunk in &chunks {
                     sink.emit(ModelStreamFrame::TextDelta((*chunk).to_string()))

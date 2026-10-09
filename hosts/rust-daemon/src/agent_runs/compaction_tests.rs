@@ -184,6 +184,87 @@ async fn turns_about_to_be_dropped_are_summarized_before_the_run() {
     assert!(started < compacting);
 }
 
+/// M8 Task 4: the summary call's tokens are a `compaction` row for the
+/// session, queued before the run goes on.
+#[tokio::test]
+async fn compaction_records_usage_with_source_compaction() {
+    let model = ScriptedModel::with_secondary(
+        vec![Step::Text(vec!["Booked"])],
+        vec![Step::Text(vec!["They planned a trip to Lisbon."])],
+    );
+    let (coordinator, agent_id) = long_session(model.clone(), true).await;
+
+    coordinator
+        .run(chat_request(&agent_id, "chat:long", "book one"))
+        .await
+        .unwrap();
+
+    let rows = coordinator.state.read().await.history.pending_usage();
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(row.source, crate::usage::UsageSource::Compaction);
+    assert_eq!(row.agent_id, agent_id);
+    assert_eq!(row.session_id.as_deref(), Some("chat:long"));
+    assert_eq!(row.run_id, None);
+    assert_eq!(
+        (row.provider.as_str(), row.model.as_str()),
+        ("openai", "gpt-5.4")
+    );
+    assert_eq!((row.prompt_tokens, row.completion_tokens), (10, 2));
+}
+
+/// M8 Task 4: a summary call a stop dropped spent nothing the provider
+/// reported, so it records no row.
+#[tokio::test]
+async fn a_cancelled_compaction_records_nothing_for_the_dropped_call() {
+    let model = ScriptedModel::with_secondary(
+        vec![Step::Text(vec!["Booked"])],
+        vec![Step::Hold(Vec::new())],
+    );
+    let (coordinator, agent_id) = long_session(model.clone(), true).await;
+    let running = {
+        let coordinator = coordinator.clone();
+        let request = chat_request(&agent_id, "chat:long", "book one");
+        tokio::spawn(async move { coordinator.run(request).await })
+    };
+    for _ in 0..500 {
+        if !model.secondary_requests().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        model.secondary_requests().len(),
+        1,
+        "the summary is underway"
+    );
+    let run_id = coordinator
+        .state
+        .read()
+        .await
+        .runs
+        .active_records()
+        .into_iter()
+        .find(|record| record.agent_id == agent_id)
+        .map(|record| record.id.clone())
+        .unwrap();
+
+    coordinator.stop_run(&agent_id, &run_id).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), running)
+        .await
+        .expect("the run ends at once")
+        .unwrap()
+        .unwrap();
+
+    assert!(coordinator
+        .state
+        .read()
+        .await
+        .history
+        .pending_usage()
+        .is_empty());
+}
+
 #[tokio::test]
 async fn a_failed_summary_is_recorded_and_the_run_goes_on_trimmed() {
     let model = ScriptedModel::with_secondary(

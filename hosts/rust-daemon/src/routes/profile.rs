@@ -1,10 +1,12 @@
-use anima_core::{AgentConfig, Content, Message, MessageRole, ModelGenerateRequest};
+use anima_core::{AgentConfig, Content, Message, MessageRole, ModelAdapter, ModelGenerateRequest};
 use serde_json::Value;
 
 use super::agencies::strip_code_fences;
 use super::contracts::{AgentProfileEnvelope, AgentProfileResponse, GenerateProfileRequest};
 use super::ApiError;
 use crate::app::SharedDaemonState;
+use crate::usage::metered::{record_secondary, Metered, SecondaryCall, USAGE_NO_AGENT};
+use crate::usage::UsageSource;
 
 /// Stable error prefix the web client matches on to trigger the preset-template
 /// fallback. Keep this exact string stable.
@@ -213,9 +215,17 @@ pub(crate) async fn handle_generate_profile(
         max_tokens: Some(1200),
     };
 
-    let response = adapter
-        .generate(&generator_config, &model_request)
-        .await
+    // The request names no agent, so its usage is the system's (spec §11).
+    let meter = Metered::new(adapter);
+    let response = meter.generate(&generator_config, &model_request).await;
+    let call = SecondaryCall::for_config(
+        USAGE_NO_AGENT,
+        None,
+        UsageSource::Profile,
+        &generator_config,
+    );
+    record_secondary(state, &meter, call).await;
+    let response = response
         .map_err(|message| ApiError::bad_request(format!("profile model error: {message}")))?;
     let profile = parse_profile_output(&response.content.text).map_err(|error| {
         ApiError::service_unavailable(format!(
@@ -258,7 +268,12 @@ mod tests {
                     metadata: None,
                 },
                 tool_calls: None,
-                usage: TokenUsage::default(),
+                usage: TokenUsage {
+                    prompt_tokens: 40,
+                    completion_tokens: 60,
+                    total_tokens: 100,
+                    ..TokenUsage::default()
+                },
                 stop_reason: ModelStopReason::End,
             })
         }
@@ -334,6 +349,27 @@ mod tests {
         assert_eq!(envelope.profile.bio, "A calm operator.");
         assert_eq!(envelope.profile.adjectives, vec!["calm", "precise"]);
         assert!(envelope.profile.system.contains("You are Anima"));
+    }
+
+    /// M8 Task 4: the generation call is a `profile` row for no agent.
+    #[tokio::test]
+    async fn profile_generation_records_usage_with_source_profile() {
+        for output in [SCRIPTED_PROFILE_JSON, "sorry, I cannot"] {
+            let state = scripted_state(output);
+            let _ = handle_generate_profile(request_body("chief-of-staff", Some("openai")), &state)
+                .await;
+            let rows = state.read().await.history.pending_usage();
+            assert_eq!(rows.len(), 1, "unusable output still spent tokens");
+            let row = &rows[0];
+            assert_eq!(row.source, crate::usage::UsageSource::Profile);
+            assert_eq!(row.agent_id, crate::usage::metered::USAGE_NO_AGENT);
+            assert_eq!(row.session_id, None);
+            assert_eq!(
+                (row.provider.as_str(), row.model.as_str()),
+                ("openai", "gpt-4o-mini")
+            );
+            assert_eq!(row.total_tokens, 100);
+        }
     }
 
     #[tokio::test]

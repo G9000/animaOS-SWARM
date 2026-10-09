@@ -13,9 +13,12 @@ import { PROMPT_LIBRARY } from '../lib/prompt-library';
 import { sessionKey } from '../lib/session-groups';
 import {
   BoltIcon,
+  ChartIcon,
   ChipIcon,
   ClockIcon,
   GearIcon,
+  HeartIcon,
+  LogIcon,
   PulseIcon,
   SendIcon,
   ShieldIcon,
@@ -33,6 +36,9 @@ export const AVAILABLE_PAGES = [
   'work',
   'files',
   'connectors',
+  'usage',
+  'logs',
+  'health',
   'capabilities',
 ] as const satisfies readonly HashPage[];
 export type AvailablePage = (typeof AVAILABLE_PAGES)[number];
@@ -60,6 +66,9 @@ const PRIMARY_DESTINATIONS: Destination[] = [
   { page: 'connectors', label: 'Connectors', icon: <GearIcon size={16} /> },
 ];
 const SYSTEM_DESTINATIONS: Destination[] = [
+  { page: 'usage', label: 'Usage', icon: <ChartIcon size={16} /> },
+  { page: 'logs', label: 'Logs', icon: <LogIcon size={16} /> },
+  { page: 'health', label: 'Health', icon: <HeartIcon size={16} /> },
   {
     page: 'capabilities',
     label: 'Capabilities',
@@ -296,6 +305,9 @@ export function WorkspaceShell({
   automations = null,
   skills = null,
   memory = null,
+  usage = null,
+  logs = null,
+  health = null,
   pendingApprovals = 0,
   sessions = [],
   onOpenSession,
@@ -325,6 +337,12 @@ export function WorkspaceShell({
   skills?: ReactNode | null;
   /** The Memory page, shown at `#/memory`. */
   memory?: ReactNode | null;
+  /** The Usage page, shown at `#/usage`. */
+  usage?: ReactNode | null;
+  /** The Logs page, shown at `#/logs`. */
+  logs?: ReactNode | null;
+  /** The Health page, shown at `#/health`. */
+  health?: ReactNode | null;
   /** Approvals waiting for the owner, for the destination's badge. */
   pendingApprovals?: number;
   /** The listed sessions the command menu offers by title. */
@@ -622,6 +640,12 @@ export function WorkspaceShell({
                 memory
               ) : page === 'skills' ? (
                 skills
+              ) : page === 'usage' ? (
+                usage
+              ) : page === 'logs' ? (
+                logs
+              ) : page === 'health' ? (
+                health
               ) : page === 'connectors' ? (
                 connectors
               ) : page === 'files' ? (

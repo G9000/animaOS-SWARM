@@ -165,6 +165,9 @@ impl DaemonState {
         let now_ms = now_millis();
         if !self.agents.contains_key(&change_set.agent_id) {
             if let Some(record) = self.runs.get_mut(&change_set.run_id) {
+                // What the run spent stays on its record (spec §11).
+                record.usage = change_set.token_delta.clone();
+                record.steps = self.live.runs().steps(&change_set.run_id);
                 record.finish(
                     RunStatus::Failed,
                     Some(RunError::new(
@@ -216,8 +219,10 @@ impl DaemonState {
         true
     }
 
-    /// Removes exactly one committed run's messages, events, usage, and steps
-    /// and records why its commit did not stand.
+    /// Removes exactly one committed run's messages, events, and token usage
+    /// from its agent and records why its commit did not stand. The run's
+    /// ledger record keeps its usage and steps: those model calls happened,
+    /// and the usage report counts them (spec §11, M8 Task 4).
     ///
     /// This is the one exception to "nothing streamed is retracted" (spec
     /// §4.5): a rejected or undurable commit removes the messages that hold
@@ -243,6 +248,13 @@ impl DaemonState {
         }
         if let Some(record) = self.runs.get_mut(&change_set.run_id) {
             record.reply_message_id = None;
+            record.usage = change_set.token_delta.clone();
+            // `commit_run` copied them already; a live entry gone since
+            // leaves that copy.
+            let steps = self.live.runs().steps(&change_set.run_id);
+            if !steps.is_empty() {
+                record.steps = steps;
+            }
             // The steers its transcript took in did not stand with it.
             record.revert_steers(&crate::agent_runs::steers_taken_in(
                 &change_set.delta.messages,
@@ -514,6 +526,62 @@ mod tests {
         assert_eq!(rolled_back.status, RunStatus::Failed);
         assert_eq!(rolled_back.error.as_ref().unwrap().code, "commit_failed");
         assert_eq!(state.runs.get(&run_b).unwrap().status, RunStatus::Completed);
+    }
+
+    /// M8 Task 4: the model calls of a run whose commit did not stand still
+    /// happened, so its record keeps their usage and steps for the usage
+    /// report, as does a run whose agent was deleted meanwhile.
+    #[tokio::test]
+    async fn a_rolled_back_run_keeps_its_steps_and_usage() {
+        let (mut state, agent_id) = state_with_agent();
+        let run_id = start_run(&mut state, &agent_id, "room-a");
+        state.live.runs().register(&run_id);
+        let step_usage = TokenUsage {
+            prompt_tokens: 3,
+            completion_tokens: 4,
+            total_tokens: 7,
+            ..TokenUsage::default()
+        };
+        state
+            .live
+            .runs()
+            .record_step_usage_at(&run_id, "step-1", step_usage.clone(), 5);
+        let (mut change_set, outcome) =
+            execute(&state, &agent_id, "room-a", &run_id, "first").await;
+        assert!(state.commit_run(&mut change_set, &outcome));
+
+        state.rollback_run(&change_set, RunError::new("commit_failed", "disk full"));
+
+        let record = state.runs.get(&run_id).unwrap();
+        assert_eq!(record.status, RunStatus::Failed);
+        assert_eq!(record.usage.total_tokens, 7);
+        assert_eq!(record.steps.len(), 1);
+        assert_eq!(record.steps[0].step_id, "step-1");
+        assert_eq!(record.steps[0].usage, step_usage);
+        assert_eq!(
+            state
+                .get_agent(&agent_id)
+                .unwrap()
+                .state
+                .token_usage
+                .total_tokens,
+            0,
+            "the agent's own total drops the rolled-back run"
+        );
+
+        let deleted_run = start_run(&mut state, &agent_id, "room-b");
+        state.live.runs().register(&deleted_run);
+        state
+            .live
+            .runs()
+            .record_step_usage_at(&deleted_run, "step-2", step_usage, 6);
+        let (mut change_set, outcome) =
+            execute(&state, &agent_id, "room-b", &deleted_run, "late").await;
+        state.remove_agent(&agent_id);
+        assert!(!state.commit_run(&mut change_set, &outcome));
+        let record = state.runs.get(&deleted_run).unwrap();
+        assert_eq!(record.usage.total_tokens, 7);
+        assert_eq!(record.steps.len(), 1);
     }
 
     #[tokio::test]

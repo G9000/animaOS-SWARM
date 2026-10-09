@@ -7,6 +7,7 @@ use anima_core::{DataValue, MessageRole};
 use super::test_support::{chat_request, coordinator_with, events_until, ScriptedModel, Step};
 use crate::sessions::test_support::{message, seed_messages, within};
 use crate::sessions::{SessionKind, SessionOrigin, SessionRecord, TitleSource};
+use crate::usage::{UsageRecord, UsageSource};
 
 /// Waits (bounded by `within`, 5 seconds) until `model` has received a
 /// secondary (title) call.
@@ -17,6 +18,76 @@ async fn wait_for_title_call(model: &ScriptedModel) {
         }
     })
     .await;
+}
+
+/// Waits (bounded by `within`) until the history service holds a queued
+/// secondary-call usage row, and returns them all.
+async fn wait_for_usage(coordinator: &super::AgentRunCoordinator) -> Vec<UsageRecord> {
+    let history = coordinator.state.read().await.history.clone();
+    within("a usage row", async {
+        loop {
+            let rows = history.pending_usage();
+            if !rows.is_empty() {
+                return rows;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+}
+
+/// M8 Task 4: the title call's tokens are recorded as a `title` row for the
+/// session, whether or not the title it wrote was usable.
+#[tokio::test]
+async fn a_title_call_records_usage_with_source_title() {
+    for (reply, usable) in [("\"Lisbon Trip Plan\"", true), ("Lisbon", false)] {
+        let model = ScriptedModel::with_secondary(
+            vec![Step::Text(vec!["Lisbon in May is lovely."])],
+            vec![Step::Text(vec![reply])],
+        );
+        let (coordinator, agent_id) = coordinator_with(model.clone()).await;
+        coordinator.state.write().await.set_generated_titles(true);
+
+        coordinator
+            .run(chat_request(
+                &agent_id,
+                "chat:new",
+                "Help me plan a trip to Lisbon",
+            ))
+            .await
+            .unwrap();
+
+        let rows = wait_for_usage(&coordinator).await;
+        assert_eq!(rows.len(), 1, "reply {reply}");
+        let row = &rows[0];
+        assert_eq!(row.source, UsageSource::Title);
+        assert_eq!(row.agent_id, agent_id);
+        assert_eq!(row.session_id.as_deref(), Some("chat:new"));
+        assert_eq!(row.run_id, None);
+        assert_eq!(
+            (row.provider.as_str(), row.model.as_str()),
+            ("openai", "gpt-5.4")
+        );
+        assert_eq!((row.prompt_tokens, row.completion_tokens), (10, 2));
+        if usable {
+            within("the title", async {
+                loop {
+                    let titled = coordinator
+                        .state
+                        .read()
+                        .await
+                        .sessions
+                        .get(&agent_id, "chat:new")
+                        .is_some_and(|session| session.title_source == TitleSource::Generated);
+                    if titled {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+        }
+    }
 }
 
 #[tokio::test]
@@ -245,4 +316,8 @@ async fn a_title_call_that_never_answers_times_out_and_keeps_the_first_message_t
     let session = guard.sessions.get(&agent_id, "chat:slow").unwrap();
     assert_eq!(session.title, "Plan the offsite");
     assert_eq!(session.title_source, TitleSource::FirstMessage);
+    assert!(
+        guard.history.pending_usage().is_empty(),
+        "a timed-out title call was dropped and records nothing"
+    );
 }

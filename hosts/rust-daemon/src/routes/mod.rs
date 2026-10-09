@@ -13,6 +13,7 @@ mod goals;
 mod health;
 mod http;
 mod jobs;
+mod logs;
 mod mail;
 mod memories;
 mod memory_edits;
@@ -23,7 +24,9 @@ mod runs;
 mod schedules;
 mod sessions;
 mod skills;
+mod status;
 mod swarms;
+mod usage;
 mod workspace;
 mod workspace_agent_yaml;
 mod workspace_files;
@@ -189,6 +192,10 @@ use crate::runtime_model::provider_summaries;
         memory_edits::patch_memory, memory_edits::delete_memory,
         memory_edits::list_facts, memory_edits::patch_fact, memory_edits::delete_fact,
         memory_edits::delete_entity,
+        logs::list_logs, logs::stream_logs,
+        usage::usage_summary, usage::usage_records, usage::usage_export,
+        usage::get_pricing, usage::put_pricing,
+        status::get_status,
     ),
     components(schemas(self::contracts::AgentSummariesEnvelope)),
     tags(
@@ -205,6 +212,9 @@ use crate::runtime_model::provider_summaries;
         (name = "runs", description = "Live runs: the agent event stream, session runs, and stop"),
         (name = "approvals", description = "Tool approvals: pending requests, decisions, policies, and rules"),
         (name = "skills", description = "Owner-approved skills, drafts, and imports"),
+        (name = "logs", description = "The redacted daemon log tail and its live stream"),
+        (name = "status", description = "One status aggregate for the Health page"),
+        (name = "usage", description = "Model-call usage, cost summaries, CSV export, and price overrides"),
         (name = "workspace", description = "Workspace configuration and onboarding"),
     )
 )]
@@ -223,6 +233,9 @@ struct AppState {
     scheduler: SchedulerService,
     jobs: crate::jobs::JobService,
     local_owner: self::http::LocalOwnerPolicy,
+    logs: Arc<crate::logs::LogBuffer>,
+    /// When this router was built, in epoch milliseconds (spec 11.3 uptime).
+    started_at_ms: u64,
     /// Keeps the history worker's loop running while this router lives.
     _history_owner: crate::history::HistoryWorkerOwner,
 }
@@ -351,6 +364,28 @@ pub(crate) fn router_with_services(
     connector_manager: ConnectorManager,
     bind_is_loopback: bool,
 ) -> Router {
+    router_with_services_and_logs(
+        state,
+        config,
+        run_limiter,
+        agent_runs,
+        connector_manager,
+        crate::logs::global(),
+        bind_is_loopback,
+    )
+}
+
+/// `router_with_services` over a chosen log buffer.
+#[allow(dead_code)]
+fn router_with_services_and_logs(
+    state: SharedDaemonState,
+    config: DaemonConfig,
+    run_limiter: Arc<Semaphore>,
+    agent_runs: AgentRunCoordinator,
+    connector_manager: ConnectorManager,
+    logs: Arc<crate::logs::LogBuffer>,
+    bind_is_loopback: bool,
+) -> Router {
     let scheduler = SchedulerService::new(
         Arc::clone(&state),
         agent_runs.clone(),
@@ -384,6 +419,7 @@ pub(crate) fn router_with_services(
         scheduler,
         jobs,
         crate::history::HistoryWorkerOwner::new(),
+        logs,
         bind_is_loopback,
     )
 }
@@ -400,6 +436,7 @@ pub(crate) fn router_with_all_services(
     scheduler: SchedulerService,
     jobs: crate::jobs::JobService,
     history_owner: crate::history::HistoryWorkerOwner,
+    logs: Arc<crate::logs::LogBuffer>,
     bind_is_loopback: bool,
 ) -> Router {
     router_with_services_with_policies(
@@ -414,6 +451,7 @@ pub(crate) fn router_with_all_services(
         scheduler,
         jobs,
         history_owner,
+        logs,
         self::http::LocalOwnerPolicy::from_env(bind_is_loopback),
         self::http::ApiKeyPolicy::from_env(),
     )
@@ -431,6 +469,7 @@ fn router_with_services_with_policies(
     scheduler: SchedulerService,
     jobs: crate::jobs::JobService,
     history_owner: crate::history::HistoryWorkerOwner,
+    logs: Arc<crate::logs::LogBuffer>,
     local_owner: self::http::LocalOwnerPolicy,
     api_key: self::http::ApiKeyPolicy,
 ) -> Router {
@@ -450,6 +489,8 @@ fn router_with_services_with_policies(
         scheduler,
         jobs,
         local_owner,
+        logs,
+        started_at_ms: anima_core::primitives::now_millis(),
         _history_owner: history_owner,
     };
     let request_middleware = ServiceBuilder::new()
@@ -574,6 +615,16 @@ fn router_with_services_with_policies(
         .route(
             "/api/skills/{slug}/approve",
             axum::routing::post(skills::approve_skill),
+        )
+        .route("/api/status", get(status::get_status))
+        .route("/api/logs", get(logs::list_logs))
+        .route("/api/logs/stream", get(logs::stream_logs))
+        .route("/api/usage/summary", get(usage::usage_summary))
+        .route("/api/usage/records", get(usage::usage_records))
+        .route("/api/usage/export.csv", get(usage::usage_export))
+        .route(
+            "/api/usage/pricing",
+            get(usage::get_pricing).put(usage::put_pricing),
         )
         .route("/api/ready", get(ready_entry))
         .route(
@@ -857,6 +908,26 @@ pub(crate) fn router_with_runs(
     config: DaemonConfig,
     configure: impl FnOnce(AgentRunCoordinator) -> AgentRunCoordinator,
 ) -> Router {
+    router_with_runs_and_logs(state, config, configure, crate::logs::global())
+}
+
+/// `router` over its own log buffer, so a test controls what the log routes see.
+#[cfg(test)]
+pub(crate) fn router_with_logs(
+    state: SharedDaemonState,
+    config: DaemonConfig,
+    logs: Arc<crate::logs::LogBuffer>,
+) -> Router {
+    router_with_runs_and_logs(state, config, |runs| runs, logs)
+}
+
+#[cfg(test)]
+fn router_with_runs_and_logs(
+    state: SharedDaemonState,
+    config: DaemonConfig,
+    configure: impl FnOnce(AgentRunCoordinator) -> AgentRunCoordinator,
+    logs: Arc<crate::logs::LogBuffer>,
+) -> Router {
     use crate::connectors::credentials::InMemoryCredentialStore;
     use crate::connectors::telegram::TelegramClient;
 
@@ -871,12 +942,13 @@ pub(crate) fn router_with_runs(
         Arc::new(InMemoryCredentialStore::default()),
         Arc::new(TelegramClient::new().expect("test Telegram client should configure")),
     );
-    router_with_services(
+    router_with_services_and_logs(
         state,
         config,
         run_limiter,
         agent_runs,
         connector_manager,
+        logs,
         configured_bind_is_loopback(),
     )
 }
@@ -950,7 +1022,15 @@ async fn ready_entry(State(state): State<AppState>) -> AxumResponse {
 }
 
 async fn metrics_entry(State(state): State<AppState>) -> AxumResponse {
-    let body = health::handle_metrics(&state.daemon, &state.config).await;
+    let snapshot = status::collect_for_metrics(
+        &state.daemon,
+        &state.config,
+        &state.logs,
+        state.started_at_ms,
+        anima_core::primitives::now_millis(),
+    )
+    .await;
+    let body = health::handle_metrics(&state.daemon, &state.config, &snapshot).await;
     (
         StatusCode::OK,
         [(
@@ -1714,6 +1794,13 @@ async fn swarm_events_entry(
     responses((status = 200, description = "Supported model providers", body = ProvidersEnvelope))
 )]
 async fn list_providers_entry(State(state): State<AppState>) -> AxumResponse {
+    let providers = provider_responses(&state.daemon).await;
+    json_response(StatusCode::OK, &ProvidersEnvelope { providers })
+}
+
+/// The provider catalog with each provider's `configured` flag, ChatGPT
+/// last; shared by `/api/providers` and the status aggregate.
+async fn provider_responses(daemon: &SharedDaemonState) -> Vec<ProviderResponse> {
     let mut providers = provider_summaries()
         .into_iter()
         .map(|summary| ProviderResponse {
@@ -1724,7 +1811,7 @@ async fn list_providers_entry(State(state): State<AppState>) -> AxumResponse {
             api_key_envs: summary.api_key_envs.iter().map(|s| s.to_string()).collect(),
         })
         .collect::<Vec<_>>();
-    let auth = state.daemon.read().await.chatgpt_auth.clone();
+    let auth = daemon.read().await.chatgpt_auth.clone();
     providers.push(ProviderResponse {
         id: "chatgpt".into(),
         label: "ChatGPT subscription".into(),
@@ -1732,7 +1819,7 @@ async fn list_providers_entry(State(state): State<AppState>) -> AxumResponse {
         configured: auth.status().await.is_ok_and(|s| s.connected),
         api_key_envs: vec![],
     });
-    json_response(StatusCode::OK, &ProvidersEnvelope { providers })
+    providers
 }
 
 #[utoipa::path(
@@ -2002,11 +2089,14 @@ mod tests {
     mod events;
     mod goals;
     mod jobs;
+    mod logs;
     mod memory_edits;
     mod runs;
     mod sessions;
     mod skills;
+    mod status;
     mod swarm_reliability;
+    mod usage;
 
     use super::{router, router_with_services, router_with_services_with_policies};
     use crate::agent_runs::AgentRunCoordinator;
@@ -2877,6 +2967,7 @@ mod tests {
             scheduler,
             jobs,
             crate::history::HistoryWorkerOwner::new(),
+            crate::logs::global(),
             LocalOwnerPolicy::for_test(true, Some("local-admin")),
             ApiKeyPolicy::for_test(Some("global-api")),
         );

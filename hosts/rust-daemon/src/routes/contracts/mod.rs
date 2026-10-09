@@ -3,6 +3,7 @@ mod agents;
 mod approvals;
 mod connectors;
 mod gcalendar;
+mod logs;
 mod memories;
 mod memory_edits;
 mod providers;
@@ -11,7 +12,9 @@ mod schedules;
 mod sessions;
 mod shared;
 mod skills;
+mod status;
 mod swarms;
+mod usage;
 mod workspace;
 
 pub(crate) use agencies::{
@@ -27,6 +30,7 @@ pub(crate) use agents::{
 pub(crate) use approvals::*;
 pub(crate) use connectors::*;
 pub(crate) use gcalendar::*;
+pub(crate) use logs::{LogLineResponse, LogsEnvelope};
 pub(crate) use memories::{
     AgentRelationshipCreateRequest, AgentRelationshipQuery, AgentRelationshipResponse,
     AgentRelationshipsEnvelope, MemoriesEnvelope, MemoryCreateRequest, MemoryEntitiesEnvelope,
@@ -50,9 +54,14 @@ pub(crate) use shared::{
     TaskResultResponse,
 };
 pub(crate) use skills::*;
+pub(crate) use status::*;
 pub(crate) use swarms::{
     SwarmCreateRequest, SwarmEnvelope, SwarmEventResponse, SwarmRunEnvelope, SwarmStateResponse,
     SwarmsEnvelope,
+};
+pub(crate) use usage::{
+    PricingEnvelope, PricingOverrideBody, PricingPutRequest, UsageRecordResponse,
+    UsageRecordsEnvelope, UsageSummaryResponse, UsageTotalsResponse,
 };
 pub(crate) use workspace::{
     BootstrapAgentRequest, WorkspaceBootstrapRequest, WorkspaceBootstrapResponse,

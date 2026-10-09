@@ -19,6 +19,8 @@ use crate::sessions::compaction::{
 use crate::sessions::context::{mark_context_trimmed, newest_left_out, ContextBudget};
 use crate::sessions::{SessionCompactionError, SessionSummary};
 use crate::state::{RunBuild, RunContextReport};
+use crate::usage::metered::{record_secondary, Metered, SecondaryCall};
+use crate::usage::UsageSource;
 
 /// A provider error is cut to this many characters on the session.
 const MAX_COMPACTION_ERROR_CHARS: usize = 500;
@@ -173,6 +175,7 @@ impl AgentRunCoordinator {
             )
         };
         let budget_tokens = ContextBudget::for_config(&config).budget_tokens;
+        let meter = Metered::new(adapter);
         let work = async {
             let turns: Cow<'_, [Message]> = match &pruned {
                 None => Cow::Borrowed(dropped),
@@ -200,7 +203,7 @@ impl AgentRunCoordinator {
                 return Err(NO_EARLIER_TURNS.to_string());
             }
             let text = summarize(
-                adapter.as_ref(),
+                &meter,
                 &config,
                 previous.as_ref().map(|summary| summary.text.as_str()),
                 &turns,
@@ -222,10 +225,18 @@ impl AgentRunCoordinator {
                 None => std::future::pending().await,
             }
         };
-        let summary: Result<(String, usize), String> = tokio::select! {
-            outcome = work => outcome,
-            () = tokio::time::sleep_until(deadline) => Err(COMPACTION_TIMED_OUT.to_string()),
-            () = stopped => return Compacted::Stopped,
+        let summary: Option<Result<(String, usize), String>> = tokio::select! {
+            outcome = work => Some(outcome),
+            () = tokio::time::sleep_until(deadline) => Some(Err(COMPACTION_TIMED_OUT.to_string())),
+            () = stopped => None,
+        };
+        // A call that completed before a stop or the deadline still counts
+        // (spec §11); a dropped one records nothing.
+        let call =
+            SecondaryCall::for_config(agent_id, Some(session_id), UsageSource::Compaction, &config);
+        record_secondary(&self.state, &meter, call).await;
+        let Some(summary) = summary else {
+            return Compacted::Stopped;
         };
 
         let now_ms = now_millis();

@@ -72,8 +72,15 @@ pub(crate) async fn consume_openai_sse(
     provider: &ProviderDefinition,
 ) -> Result<(), String> {
     let mut accumulator = StreamAccumulator::new(provider.id, provider.label);
-    let saw_done =
-        consume_sse_events(response, |payload| accumulator.openai(payload), sink).await?;
+    let saw_done = consume_sse_events(
+        response,
+        |payload| {
+            let delta = accumulator.openai(payload)?;
+            Ok((delta, accumulator.usage.running()))
+        },
+        sink,
+    )
+    .await?;
     // `[DONE]` is terminal, as is a finish reason (`openai` records that one).
     accumulator.terminal |= saw_done;
     sink.emit(ModelStreamFrame::Final(accumulator.finish()?))
@@ -86,7 +93,15 @@ pub(crate) async fn consume_anthropic_sse(
     sink: &dyn ModelStreamSink,
 ) -> Result<(), String> {
     let mut accumulator = StreamAccumulator::new("anthropic", "Anthropic");
-    consume_sse_events(response, |payload| accumulator.anthropic(payload), sink).await?;
+    consume_sse_events(
+        response,
+        |payload| {
+            let delta = accumulator.anthropic(payload)?;
+            Ok((delta, accumulator.usage.running()))
+        },
+        sink,
+    )
+    .await?;
     sink.emit(ModelStreamFrame::Final(accumulator.finish()?))
         .await
         .map_err(|_| "provider stream consumer failed".to_owned())
@@ -99,9 +114,16 @@ pub(crate) async fn consume_google_sse(
 ) -> Result<(), String> {
     let mut accumulator = crate::google::GoogleStreamAccumulator::default();
     // A Google error payload's message is upstream text, redacted like an error body.
-    consume_sse_events(response, |payload| accumulator.push(payload), sink)
-        .await
-        .map_err(|error| crate::adapter::sanitize_upstream_body(&error, Some(api_key)))?;
+    consume_sse_events(
+        response,
+        |payload| {
+            let delta = accumulator.push(payload)?;
+            Ok((delta, accumulator.running_usage()))
+        },
+        sink,
+    )
+    .await
+    .map_err(|error| crate::adapter::sanitize_upstream_body(&error, Some(api_key)))?;
     sink.emit(ModelStreamFrame::Final(accumulator.finish()?))
         .await
         .map_err(|_| "provider stream consumer failed".to_owned())
@@ -558,6 +580,23 @@ impl StreamUsage {
         merge_usage_value(&mut self.total, total)
     }
 
+    /// What `finish` would report so far, for a partial usage frame. `None`
+    /// while nothing is reported or the total is still zero. A reported total
+    /// below prompt + completion is raised to it.
+    fn running(&self) -> Option<TokenUsage> {
+        let prompt_tokens = self.prompt.unwrap_or(0);
+        let completion_tokens = self.completion.unwrap_or(0);
+        let computed = prompt_tokens.checked_add(completion_tokens)?;
+        let total_tokens = self.total.unwrap_or(0).max(computed);
+        (total_tokens > 0).then(|| TokenUsage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            cached_prompt_tokens: self.cached_prompt.unwrap_or(0),
+            reasoning_tokens: self.reasoning.unwrap_or(0),
+        })
+    }
+
     fn finish(self) -> Result<TokenUsage, String> {
         let prompt_tokens = self.prompt.unwrap_or(0);
         let completion_tokens = self.completion.unwrap_or(0);
@@ -737,16 +776,18 @@ impl BoundedFrameReader {
     }
 }
 
-/// Feeds every SSE `data:` payload to `parse` and emits the text it returns. Returns
-/// whether an OpenAI-style `data: [DONE]` sentinel arrived.
+/// Feeds every SSE `data:` payload to `parse`, which returns the text the payload adds
+/// and the usage reported so far. Emits the text, and a usage frame whenever that usage
+/// changed. Returns whether an OpenAI-style `data: [DONE]` sentinel arrived.
 async fn consume_sse_events(
     response: reqwest::Response,
-    mut parse: impl FnMut(&Value) -> Result<Option<String>, String>,
+    mut parse: impl FnMut(&Value) -> Result<(Option<String>, Option<TokenUsage>), String>,
     sink: &dyn ModelStreamSink,
 ) -> Result<bool, String> {
     let mut body = response.bytes_stream();
     let mut reader = BoundedFrameReader::new();
     let mut saw_done = false;
+    let mut emitted_usage: Option<TokenUsage> = None;
     while let Some(chunk) = body.next().await {
         let chunk = chunk
             .map_err(|error| format!("provider stream read failed: {}", error.without_url()))?;
@@ -763,8 +804,15 @@ async fn consume_sse_events(
                 }
                 let payload: Value =
                     serde_json::from_str(data).map_err(|_| stream_parse_error())?;
-                if let Some(delta) = parse(&payload)? {
+                let (delta, usage) = parse(&payload)?;
+                if let Some(delta) = delta {
                     let _ = sink.emit(ModelStreamFrame::TextDelta(delta)).await;
+                }
+                if let Some(usage) = usage {
+                    if emitted_usage.as_ref() != Some(&usage) {
+                        emitted_usage = Some(usage.clone());
+                        let _ = sink.emit(ModelStreamFrame::Usage(usage)).await;
+                    }
                 }
             }
         }

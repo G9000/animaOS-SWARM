@@ -4,11 +4,10 @@ use std::time::Duration;
 use anima_daemon::{serve, DaemonConfig, PersistenceMode};
 use tokio::net::TcpListener;
 use tracing::info;
-use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    init_tracing();
+    anima_daemon::init_tracing();
 
     let host = std::env::var("ANIMAOS_RS_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
     let port = std::env::var("ANIMAOS_RS_PORT").unwrap_or_else(|_| "8080".to_string());
@@ -211,17 +210,6 @@ fn parse_persistence_mode(default: PersistenceMode) -> io::Result<PersistenceMod
             format!("failed to read ANIMAOS_RS_PERSISTENCE_MODE: {error}"),
         )),
     }
-}
-
-fn init_tracing() {
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("anima_daemon=info,tower_http=info"));
-
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(env_filter)
-        .with_target(false)
-        .compact()
-        .try_init();
 }
 
 #[cfg(test)]

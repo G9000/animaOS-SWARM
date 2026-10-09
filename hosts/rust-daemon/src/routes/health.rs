@@ -1,5 +1,6 @@
 use crate::app::{DaemonConfig, PersistenceMode, SharedDaemonState};
 use crate::routes::contracts::{HealthResponse, ReadinessResponse};
+use crate::routes::status::StatusSnapshot;
 
 pub(crate) fn handle_health() -> HealthResponse {
     HealthResponse {
@@ -53,7 +54,13 @@ pub(crate) async fn handle_readiness(
     }
 }
 
-pub(crate) async fn handle_metrics(state: &SharedDaemonState, config: &DaemonConfig) -> String {
+/// The Prometheus text: the original lines, then the status snapshot's counts
+/// (spec 11.3). Counts only: no agent names, ids, prompts, or costs.
+pub(crate) async fn handle_metrics(
+    state: &SharedDaemonState,
+    config: &DaemonConfig,
+    snapshot: &StatusSnapshot,
+) -> String {
     let (
         agent_count,
         swarm_count,
@@ -84,7 +91,7 @@ pub(crate) async fn handle_metrics(state: &SharedDaemonState, config: &DaemonCon
             PersistenceMode::Postgres => database_configured,
         };
 
-    [
+    let mut lines = vec![
         "# HELP anima_daemon_ready Whether the daemon is ready to serve traffic.".to_string(),
         "# TYPE anima_daemon_ready gauge".to_string(),
         format!("anima_daemon_ready {}", usize::from(ready)),
@@ -151,8 +158,114 @@ pub(crate) async fn handle_metrics(state: &SharedDaemonState, config: &DaemonCon
             "anima_daemon_max_background_processes {}",
             config.max_background_processes
         ),
-    ]
-    .join("\n")
+    ];
+    lines.extend(status_metric_lines(snapshot));
+    lines.join("\n")
+}
+
+fn gauge(lines: &mut Vec<String>, name: &str, help: &str, value: impl std::fmt::Display) {
+    lines.push(format!("# HELP {name} {help}"));
+    lines.push(format!("# TYPE {name} gauge"));
+    lines.push(format!("{name} {value}"));
+}
+
+fn counter(lines: &mut Vec<String>, name: &str, help: &str, value: u64) {
+    lines.push(format!("# HELP {name} {help}"));
+    lines.push(format!("# TYPE {name} counter"));
+    lines.push(format!("{name} {value}"));
+}
+
+/// The metrics the status snapshot adds (spec 11.3).
+fn status_metric_lines(snapshot: &StatusSnapshot) -> Vec<String> {
+    let status = &snapshot.response;
+    let mut lines = Vec::new();
+    gauge(
+        &mut lines,
+        "anima_daemon_uptime_seconds",
+        "Seconds since the daemon started.",
+        status.uptime_seconds,
+    );
+    gauge(
+        &mut lines,
+        "anima_daemon_runs_running",
+        "Runs currently running.",
+        status.runs.running,
+    );
+    gauge(
+        &mut lines,
+        "anima_daemon_runs_queued",
+        "Runs accepted and waiting to start.",
+        status.runs.queued,
+    );
+    lines.push(
+        "# HELP anima_daemon_runs Runs the run ledger holds, by status; the ledger prunes old finished runs, so this is not a lifetime total."
+            .to_string(),
+    );
+    lines.push("# TYPE anima_daemon_runs gauge".to_string());
+    for (name, count) in &status.runs.by_status {
+        lines.push(format!("anima_daemon_runs{{status=\"{name}\"}} {count}"));
+    }
+    gauge(
+        &mut lines,
+        "anima_daemon_approvals_pending",
+        "Tool approvals waiting for the owner.",
+        status.approvals.pending,
+    );
+    gauge(
+        &mut lines,
+        "anima_daemon_event_subscribers",
+        "Open live event streams across all agents.",
+        status.events.subscribers,
+    );
+    gauge(
+        &mut lines,
+        "anima_daemon_history_pending_flush",
+        "History outbox items not yet written to the history store.",
+        status.storage.history.pending_flush,
+    );
+    gauge(
+        &mut lines,
+        "anima_daemon_history_usage_queued",
+        "Usage rows not yet written to the history store.",
+        status.storage.history.usage_queued,
+    );
+    gauge(
+        &mut lines,
+        "anima_daemon_history_failing",
+        "Whether history store writes are failing (1) or healthy (0).",
+        usize::from(!status.storage.history.healthy),
+    );
+    gauge(
+        &mut lines,
+        "anima_daemon_automations_failing",
+        "Automations whose latest runs failed in a row.",
+        status.automations.failing,
+    );
+    gauge(
+        &mut lines,
+        "anima_daemon_log_lines_buffered",
+        "Lines held in the daemon log tail.",
+        status.logs.buffered,
+    );
+    counter(
+        &mut lines,
+        "anima_daemon_event_lagged_total",
+        "Live events dropped for slow subscribers since start.",
+        status.events.lagged_events,
+    );
+    counter(
+        &mut lines,
+        "anima_daemon_history_flush_errors_total",
+        "Failed history store flushes since start.",
+        status.storage.history.flush_errors,
+    );
+    counter(
+        &mut lines,
+        "anima_daemon_messages_pruned_total",
+        "Messages moved out of the hot transcript since start.",
+        snapshot.pruned_messages,
+    );
+    lines
 }
 
 #[cfg(test)]

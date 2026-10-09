@@ -13,9 +13,9 @@ use super::test_support::{
 };
 use super::{AcceptRun, AcceptedRun, AgentRunCoordinator, SessionRunMode};
 use crate::control_plane_store::{load_control_plane_snapshot, ControlPlaneStoreConfig};
-use crate::runs::{RunLedger, RunRecord, RunSource, RunStatus, RunStopRequest};
+use crate::runs::{RunLedger, RunRecord, RunSource, RunStatus, RunSteer, RunStopRequest};
 
-fn message(agent_id: &str, key: &str, text: &str, mode: SessionRunMode) -> AcceptRun {
+pub(super) fn message(agent_id: &str, key: &str, text: &str, mode: SessionRunMode) -> AcceptRun {
     AcceptRun {
         agent_id: agent_id.into(),
         session_id: "chat:s".into(),
@@ -28,7 +28,7 @@ fn message(agent_id: &str, key: &str, text: &str, mode: SessionRunMode) -> Accep
     }
 }
 
-async fn accept(coordinator: &AgentRunCoordinator, request: AcceptRun) -> AcceptedRun {
+pub(super) async fn accept(coordinator: &AgentRunCoordinator, request: AcceptRun) -> AcceptedRun {
     let start = coordinator.web_start(
         request.agent_id.clone(),
         request.session_id.clone(),
@@ -38,7 +38,7 @@ async fn accept(coordinator: &AgentRunCoordinator, request: AcceptRun) -> Accept
     coordinator.accept_run(request, start).await.unwrap()
 }
 
-async fn wait_for_key(
+pub(super) async fn wait_for_key(
     coordinator: &AgentRunCoordinator,
     agent_id: &str,
     key: &str,
@@ -586,15 +586,29 @@ async fn steers_left_beyond_the_queue_cap_are_offered_again_instead() {
             panic!("{key} is queued");
         };
     }
-    for key in ["steer-1", "steer-2"] {
-        let AcceptedRun::Steered(_) = accept(
-            &coordinator,
-            message(&agent_id, key, key, SessionRunMode::Steer),
-        )
-        .await
-        else {
-            panic!("{key} joins the run");
-        };
+    let AcceptedRun::Steered(joined) = accept(
+        &coordinator,
+        message(&agent_id, "steer-1", "steer-1", SessionRunMode::Steer),
+    )
+    .await
+    else {
+        panic!("steer-1 joins the run");
+    };
+    // Eight messages now wait, so a second steer is refused at the door; one
+    // that got in anyway (a race the door cannot see) is still caught when
+    // the run ends.
+    {
+        let mut guard = coordinator.state.write().await;
+        guard
+            .runs
+            .get_mut(&joined.id)
+            .unwrap()
+            .pending_steers
+            .push(RunSteer {
+                idempotency_key: "steer-2".into(),
+                text: "steer-2".into(),
+                accepted_at_ms: anima_core::primitives::now_millis() + 60_000,
+            });
     }
 
     gate.release.add_permits(20);
@@ -611,6 +625,143 @@ async fn steers_left_beyond_the_queue_cap_are_offered_again_instead() {
     let kept = wait_for_key(&coordinator, &agent_id, "steer-1", RunStatus::Completed).await;
     assert_eq!(kept.input.text, "steer-1");
     wait_for_key(&coordinator, &agent_id, "queued-7", RunStatus::Completed).await;
+}
+
+/// Controller ruling 5 (M8 carry-over): a steer waits like a queued message,
+/// so the ninth waiting message is refused even when it is a steer.
+#[tokio::test]
+async fn a_steer_is_refused_with_429_when_eight_messages_wait() {
+    let gate = Gate::new();
+    let model = ScriptedModel::gated(vec![Step::Text(vec!["First answer"])], gate.clone());
+    let (coordinator, agent_id) = coordinator_with(model).await;
+    add_chat(&coordinator, &agent_id, "chat:s").await;
+    accept(
+        &coordinator,
+        message(&agent_id, "key-0", "hello", SessionRunMode::Queue),
+    )
+    .await;
+    gate.entered().await;
+    for n in 1..=7 {
+        let key = format!("queued-{n}");
+        accept(
+            &coordinator,
+            message(&agent_id, &key, &key, SessionRunMode::Queue),
+        )
+        .await;
+    }
+    let AcceptedRun::Steered(_) = accept(
+        &coordinator,
+        message(&agent_id, "steer-1", "steer-1", SessionRunMode::Steer),
+    )
+    .await
+    else {
+        panic!("the eighth waiting message joins the run");
+    };
+
+    let refused = message(&agent_id, "steer-2", "steer-2", SessionRunMode::Steer);
+    let start = coordinator.web_start(
+        refused.agent_id.clone(),
+        refused.session_id.clone(),
+        refused.text.clone(),
+        refused.idempotency_key.clone(),
+    );
+    let error = coordinator.accept_run(refused, start).await.unwrap_err();
+    assert_eq!(error.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(error.message(), super::QUEUE_FULL);
+    let guard = coordinator.state.read().await;
+    assert_eq!(guard.runs.queued_count(&agent_id), 8);
+    assert!(guard
+        .runs
+        .find_by_idempotency_key(&agent_id, "steer-2", 0)
+        .is_none());
+    drop(guard);
+    gate.release.add_permits(20);
+}
+
+/// The run's own steers are taken out of the run before the open slots are
+/// counted, so a full queue of messages and steers still hands them all on.
+#[tokio::test]
+async fn leftover_steers_use_the_open_slots_after_the_runs_own_are_taken() {
+    let gate = Gate::new();
+    let model = ScriptedModel::gated(vec![Step::Text(vec!["First answer"])], gate.clone());
+    let (coordinator, agent_id) = coordinator_with(model).await;
+    add_chat(&coordinator, &agent_id, "chat:s").await;
+    accept(
+        &coordinator,
+        message(&agent_id, "key-0", "hello", SessionRunMode::Queue),
+    )
+    .await;
+    gate.entered().await;
+    for n in 1..=6 {
+        let key = format!("queued-{n}");
+        accept(
+            &coordinator,
+            message(&agent_id, &key, &key, SessionRunMode::Queue),
+        )
+        .await;
+    }
+    for key in ["steer-1", "steer-2"] {
+        let AcceptedRun::Steered(_) = accept(
+            &coordinator,
+            message(&agent_id, key, key, SessionRunMode::Steer),
+        )
+        .await
+        else {
+            panic!("{key} joins the run");
+        };
+    }
+    assert_eq!(
+        coordinator.state.read().await.runs.queued_count(&agent_id),
+        8
+    );
+
+    gate.release.add_permits(20);
+    wait_for_key(&coordinator, &agent_id, "key-0", RunStatus::Completed).await;
+    for key in ["steer-1", "steer-2"] {
+        wait_for_key(&coordinator, &agent_id, key, RunStatus::Completed).await;
+    }
+}
+
+/// A full queue (queued messages and steers together) still refuses a new
+/// message.
+#[tokio::test]
+async fn a_full_queue_still_refuses_a_new_run() {
+    let gate = Gate::new();
+    let model = ScriptedModel::gated(vec![Step::Text(vec!["First answer"])], gate.clone());
+    let (coordinator, agent_id) = coordinator_with(model).await;
+    add_chat(&coordinator, &agent_id, "chat:s").await;
+    accept(
+        &coordinator,
+        message(&agent_id, "key-0", "hello", SessionRunMode::Queue),
+    )
+    .await;
+    gate.entered().await;
+    for n in 1..=6 {
+        let key = format!("queued-{n}");
+        accept(
+            &coordinator,
+            message(&agent_id, &key, &key, SessionRunMode::Queue),
+        )
+        .await;
+    }
+    for key in ["steer-1", "steer-2"] {
+        accept(
+            &coordinator,
+            message(&agent_id, key, key, SessionRunMode::Steer),
+        )
+        .await;
+    }
+
+    let refused = message(&agent_id, "one-more", "one-more", SessionRunMode::Queue);
+    let start = coordinator.web_start(
+        refused.agent_id.clone(),
+        refused.session_id.clone(),
+        refused.text.clone(),
+        refused.idempotency_key.clone(),
+    );
+    let error = coordinator.accept_run(refused, start).await.unwrap_err();
+    assert_eq!(error.status(), StatusCode::TOO_MANY_REQUESTS);
+    gate.release.add_permits(20);
 }
 
 /// Task 7 review Minor 2: acceptance times come from a coordinator-wide

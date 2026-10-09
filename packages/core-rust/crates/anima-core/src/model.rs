@@ -42,6 +42,8 @@ pub struct ModelGenerateResponse {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ModelStreamFrame {
     TextDelta(String),
+    /// Provider-reported usage so far; each frame replaces the last. `Final` still carries the definitive usage.
+    Usage(TokenUsage),
     Final(ModelGenerateResponse),
 }
 

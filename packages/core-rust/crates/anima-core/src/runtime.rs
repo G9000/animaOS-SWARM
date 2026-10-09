@@ -509,7 +509,9 @@ impl AgentRuntime {
             };
             let partial = sink.streamed_text();
             let Some(streamed) = streamed else {
-                // The partial text stays, marked stopped (spec §4.6).
+                // The partial text stays, marked stopped (spec §4.6); usage
+                // the provider already reported stays with the run.
+                self.record_partial_usage(&sink, &step_id);
                 let message_id =
                     self.record_unfinished_step(&room_id, &step_id, &partial, STOPPED_METADATA_KEY);
                 self.emit_frame(RunFrame::StepFinished {
@@ -912,7 +914,9 @@ impl AgentRuntime {
                 }
                 Err(error) => {
                     // Nothing streamed is retracted (spec §4.5): a call that
-                    // failed keeps the text it already showed.
+                    // failed keeps the text it already showed and the usage
+                    // the provider already reported.
+                    self.record_partial_usage(&sink, &step_id);
                     return self.fail_step(
                         &room_id,
                         &step_id,
@@ -1310,6 +1314,17 @@ impl AgentRuntime {
         }
 
         prepared_steps
+    }
+
+    /// Records the usage a call reported before it was stopped or failed.
+    fn record_partial_usage(&mut self, sink: &StepSink, step_id: &str) {
+        if let Some(usage) = sink.partial_usage() {
+            self.apply_token_usage(&usage);
+            self.emit_frame(RunFrame::StepUsage {
+                step_id: step_id.to_string(),
+                usage,
+            });
+        }
     }
 
     fn apply_token_usage(&mut self, usage: &TokenUsage) {

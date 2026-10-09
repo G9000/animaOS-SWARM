@@ -205,7 +205,7 @@ impl TelegramConnectorResponse {
     }
 }
 
-fn connector_status_name(status: ConnectorRuntimeStatus) -> &'static str {
+pub(crate) fn connector_status_name(status: ConnectorRuntimeStatus) -> &'static str {
     match status {
         ConnectorRuntimeStatus::Ready => "ready",
         ConnectorRuntimeStatus::Pairing => "pairing",

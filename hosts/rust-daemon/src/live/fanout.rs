@@ -126,8 +126,8 @@ impl LiveHub {
         })
     }
 
-    /// Open streams of `agent_id`; M8's status and metrics read it (spec §11.3).
-    #[allow(dead_code)]
+    /// Open streams of `agent_id`.
+    #[cfg(test)]
     pub(crate) fn subscribers(&self, agent_id: &str) -> usize {
         self.inner
             .channels()
@@ -135,9 +135,16 @@ impl LiveHub {
             .map_or(0, |channel| channel.subscribers)
     }
 
-    /// Events dropped for lagging subscribers since start; M8's metrics read
-    /// it (spec §11.3).
-    #[allow(dead_code)]
+    /// Open streams across every agent (spec §11.3).
+    pub(crate) fn total_subscribers(&self) -> usize {
+        self.inner
+            .channels()
+            .values()
+            .map(|channel| channel.subscribers)
+            .sum()
+    }
+
+    /// Events dropped for lagging subscribers since start (spec §11.3).
     pub(crate) fn lagged_events(&self) -> u64 {
         self.inner.lagged.load(Ordering::Relaxed)
     }

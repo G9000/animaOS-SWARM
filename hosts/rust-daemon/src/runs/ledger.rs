@@ -1,7 +1,7 @@
 //! Durable run ledger (spec §4.1): one record per coordinator run, kept in the
 //! control-plane snapshot, with restart recovery (spec §4.8) and retention.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anima_core::TokenUsage;
 use serde::{Deserialize, Serialize};
@@ -164,6 +164,12 @@ pub(crate) struct RunStepUsage {
     pub(crate) step_id: String,
     #[serde(default)]
     pub(crate) usage: TokenUsage,
+    /// When the step's usage was reported; 0 for a step saved before timing.
+    #[serde(default)]
+    pub(crate) at_ms: u64,
+    /// How long the step took; 0 when unknown.
+    #[serde(default)]
+    pub(crate) duration_ms: u64,
 }
 
 /// A steer saved with the run it joined (spec §4.7; controller ruling, M3
@@ -228,6 +234,12 @@ pub(crate) struct RunRecord {
     /// it in one, and a restart offers the rest again (audit I3).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) pending_steers: Vec<RunSteer>,
+    /// Keys of pending steers the run's transcript already took in, noted
+    /// when its execution ends and dropped when its commit settles them: they
+    /// wait for nothing, so the queue cap does not count them. Never saved (a
+    /// restart offers every pending steer again).
+    #[serde(skip)]
+    pub(crate) read_steer_keys: Vec<String>,
     /// Keys of the steers this run's committed transcript took in, so a
     /// retried one is answered with this run (spec §4.2).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -280,6 +292,7 @@ impl RunRecord {
             parent_run_id: start.parent_run_id,
             reply_message_id: None,
             pending_steers: Vec::new(),
+            read_steer_keys: Vec::new(),
             steered_keys: Vec::new(),
             mirrored: false,
         }
@@ -333,6 +346,7 @@ impl RunRecord {
                 .iter()
                 .any(|steer| steer.idempotency_key == pending.idempotency_key)
         });
+        self.forget_read_steers(taken);
         for steer in taken {
             if !self
                 .steered_keys
@@ -358,6 +372,8 @@ impl RunRecord {
                 .iter()
                 .any(|steer| steer.idempotency_key == steered.idempotency_key)
         });
+        // In no transcript that stands, they wait again.
+        self.forget_read_steers(taken);
         for steer in taken {
             if !self
                 .pending_steers
@@ -369,6 +385,35 @@ impl RunRecord {
         }
         self.pending_steers
             .sort_by_key(|pending| pending.accepted_at_ms);
+    }
+
+    /// Notes that the run's transcript took in the pending steers `keys`
+    /// (its execution ended; its commit is still to come).
+    pub(crate) fn note_steers_read<'a>(&mut self, keys: impl IntoIterator<Item = &'a String>) {
+        for key in keys {
+            if !self.read_steer_keys.contains(key) {
+                self.read_steer_keys.push(key.clone());
+            }
+        }
+    }
+
+    fn forget_read_steers(&mut self, steers: &[RunSteer]) {
+        self.read_steer_keys
+            .retain(|key| !steers.iter().any(|steer| &steer.idempotency_key == key));
+    }
+
+    /// Pending steers the run has not read: given the keys its open inbox
+    /// still holds, those; with no open inbox, every one its transcript did
+    /// not take in (a steer that found the inbox closing, or one a commit
+    /// that did not stand gave back).
+    pub(crate) fn unread_steer_count(&self, open_inbox: Option<&HashSet<&str>>) -> usize {
+        self.pending_steers
+            .iter()
+            .filter(|steer| !self.read_steer_keys.contains(&steer.idempotency_key))
+            .filter(|steer| {
+                open_inbox.is_none_or(|keys| keys.contains(steer.idempotency_key.as_str()))
+            })
+            .count()
     }
 
     /// Finished, and holding no steer a restart still has to hand on.
@@ -384,6 +429,7 @@ impl RunRecord {
         }
         // The history store's copy, if any, is written again without them.
         self.mirrored = false;
+        self.read_steer_keys.clear();
         std::mem::take(&mut self.pending_steers)
             .into_iter()
             .map(|steer| {
@@ -462,12 +508,49 @@ impl RunLedger {
             .count()
     }
 
-    /// Runs of this agent accepted but not started (spec §4.2's queue).
-    pub(crate) fn queued_count(&self, agent_id: &str) -> usize {
+    /// Messages of this agent waiting for their turn (spec §4.2's queue): its
+    /// `Queued` runs plus, for each other record but `except_run`, the steers
+    /// `unread_steers` says its run has not read (M3 carry-over; a steer
+    /// waits as surely as a queued run does, until the model reads it).
+    pub(crate) fn waiting_count(
+        &self,
+        agent_id: &str,
+        except_run: Option<&str>,
+        unread_steers: impl Fn(&RunRecord) -> usize,
+    ) -> usize {
         self.records
             .values()
-            .filter(|record| record.agent_id == agent_id && record.status == RunStatus::Queued)
-            .count()
+            .filter(|record| record.agent_id == agent_id && Some(record.id.as_str()) != except_run)
+            .map(|record| usize::from(record.status == RunStatus::Queued) + unread_steers(record))
+            .sum()
+    }
+
+    /// `waiting_count` from the records alone, counting every steer still in
+    /// an inbox as unread.
+    #[cfg(test)]
+    pub(crate) fn queued_count(&self, agent_id: &str) -> usize {
+        self.waiting_count(agent_id, None, |record| record.unread_steer_count(None))
+    }
+
+    /// Runs the ledger holds, by status name (spec §11.3). Every status is
+    /// listed, with 0 when none.
+    pub(crate) fn status_counts(&self) -> BTreeMap<&'static str, usize> {
+        let mut counts: BTreeMap<&'static str, usize> = [
+            RunStatus::Queued,
+            RunStatus::Running,
+            RunStatus::AwaitingApproval,
+            RunStatus::Completed,
+            RunStatus::Failed,
+            RunStatus::Cancelled,
+            RunStatus::Interrupted,
+        ]
+        .into_iter()
+        .map(|status| (status.as_str(), 0))
+        .collect();
+        for record in self.records.values() {
+            *counts.entry(record.status.as_str()).or_default() += 1;
+        }
+        counts
     }
 
     /// The newest run of this agent created with `key` at or after `since_ms`.
@@ -980,6 +1063,21 @@ mod tests {
         assert_eq!(minimal.reply_message_id, None);
         assert!(minimal.pending_steers.is_empty());
         assert!(minimal.steered_keys.is_empty());
+    }
+
+    #[test]
+    fn an_old_step_without_timing_loads_with_zeros() {
+        let step: RunStepUsage = serde_json::from_value(json!({
+            "stepId": "run_1:1",
+            "usage": { "prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5 }
+        }))
+        .unwrap();
+        assert_eq!(step.at_ms, 0);
+        assert_eq!(step.duration_ms, 0);
+        assert_eq!(step.usage.total_tokens, 5);
+        let written = serde_json::to_value(&step).unwrap();
+        assert_eq!(written["atMs"], 0);
+        assert_eq!(written["durationMs"], 0);
     }
 
     #[test]
@@ -1496,6 +1594,91 @@ mod tests {
         assert_eq!(run.started_at_ms, Some(20));
         assert_eq!(run.model, "gpt-5.5");
         assert_eq!(ledger.queued_count("agent-1"), 0);
+    }
+
+    fn steer(key: &str) -> RunSteer {
+        RunSteer {
+            idempotency_key: key.into(),
+            text: key.into(),
+            accepted_at_ms: 1,
+        }
+    }
+
+    #[test]
+    fn pending_steers_count_toward_the_waiting_total() {
+        let mut ledger = RunLedger::default();
+        let mut running = record("agent-1", 10);
+        running.pending_steers = vec![steer("a"), steer("b")];
+        ledger.insert(running);
+        let mut other = record("agent-2", 11);
+        other.pending_steers = vec![steer("c")];
+        ledger.insert(other);
+        ledger.insert(RunRecord::queued(start("agent-1"), 12));
+        assert_eq!(ledger.queued_count("agent-1"), 3);
+        assert_eq!(ledger.queued_count("agent-2"), 1);
+        assert_eq!(ledger.queued_count("agent-3"), 0);
+    }
+
+    #[test]
+    fn steers_the_run_read_wait_for_nothing_until_a_commit_gives_them_back() {
+        let mut run = record("agent-1", 10);
+        run.pending_steers = vec![steer("a"), steer("b"), steer("c")];
+        let inbox = HashSet::from(["c"]);
+        assert_eq!(run.unread_steer_count(Some(&inbox)), 1, "a, b were read");
+        assert_eq!(run.unread_steer_count(None), 3);
+
+        run.note_steers_read(&["a".to_string(), "b".to_string()]);
+        assert_eq!(run.unread_steer_count(None), 1);
+        run.commit_steers(&[steer("a"), steer("b")]);
+        assert_eq!(run.read_steer_keys, Vec::<String>::new());
+        assert_eq!(run.unread_steer_count(None), 1);
+        run.revert_steers(&[steer("a"), steer("b")]);
+        assert_eq!(run.unread_steer_count(None), 3, "back to waiting");
+
+        let mut ledger = RunLedger::default();
+        let id = run.id.clone();
+        ledger.insert(run);
+        ledger.insert(RunRecord::queued(start("agent-1"), 12));
+        assert_eq!(
+            ledger.waiting_count("agent-1", Some(&id), |record| record
+                .unread_steer_count(None)),
+            1,
+            "the excepted run is skipped"
+        );
+    }
+
+    #[test]
+    fn a_queued_run_is_counted_once() {
+        let mut ledger = RunLedger::default();
+        ledger.insert(RunRecord::queued(start("agent-1"), 10));
+        ledger.insert(RunRecord::queued(start("agent-1"), 11));
+        assert_eq!(ledger.queued_count("agent-1"), 2);
+    }
+
+    #[test]
+    fn status_counts_lists_every_status() {
+        let mut ledger = RunLedger::default();
+        ledger.insert(RunRecord::queued(start("agent-1"), 10));
+        ledger.insert(record("agent-1", 11));
+        ledger.insert(record("agent-2", 12));
+        ledger.insert(finished("agent-1", 13));
+        let counts = ledger.status_counts();
+        assert_eq!(
+            counts.keys().copied().collect::<Vec<_>>(),
+            [
+                "awaiting_approval",
+                "cancelled",
+                "completed",
+                "failed",
+                "interrupted",
+                "queued",
+                "running"
+            ]
+        );
+        assert_eq!(counts["queued"], 1);
+        assert_eq!(counts["running"], 2);
+        assert_eq!(counts["completed"], 1);
+        assert_eq!(counts["failed"], 0);
     }
 
     #[test]

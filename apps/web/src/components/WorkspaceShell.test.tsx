@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { toolNamesForProfile } from '../lib/agent-access';
 import { daemon } from '../lib/daemon-api';
-import type { HashRoute } from '../lib/hash-route';
+import type { HashPage, HashRoute } from '../lib/hash-route';
 import type { AgentDetail } from '../lib/types';
 import { sessionFixture } from '../test/sessions';
 import { SessionSidebar } from './sessions/SessionSidebar';
@@ -245,8 +245,13 @@ describe('WorkspaceShell', () => {
     expect(screen.getByText('Workspace canvas')).toBeVisible();
   });
 
-  it('shows the conversation for pages that arrive in later releases', () => {
-    render(<Shell initialRoute={{ kind: 'page', page: 'usage' }} />);
+  it('shows the conversation for a page the shell does not offer', () => {
+    // Every page of the route table is built now; an unknown one still falls back.
+    render(
+      <Shell
+        initialRoute={{ kind: 'page', page: 'later' as unknown as HashPage }}
+      />,
+    );
     expect(screen.getByText('Workspace canvas')).toBeVisible();
     expect(
       screen.queryByRole('button', { name: 'Open companion chat' }),
@@ -387,6 +392,67 @@ describe('WorkspaceShell', () => {
 
     await user.keyboard('{Control>}k{/Control}');
     expect(screen.getByRole('option', { name: /Go to Memory/ })).toBeVisible();
+  });
+
+  it('the System group lists Usage, Logs, Health, Capabilities in order', async () => {
+    render(<Shell />);
+    await userEvent.click(screen.getByRole('button', { name: 'System' }));
+    const names = within(
+      screen.getByRole('navigation', { name: 'Workspace navigation' }),
+    )
+      .getAllByRole('button')
+      .map((button) => button.textContent ?? '');
+    const usage = names.findIndex((name) => name.includes('Usage'));
+    expect(usage).toBeGreaterThan(-1);
+    expect(names.slice(usage, usage + 4).map((name) => name.trim())).toEqual([
+      'Usage',
+      'Logs',
+      'Health',
+      'Capabilities',
+    ]);
+  });
+
+  it('Logs and Health open their pages and the command menu offers them', async () => {
+    const user = userEvent.setup();
+    render(
+      <Shell logs={<div>Logs page</div>} health={<div>Health page</div>} />,
+    );
+    const nav = screen.getByRole('navigation', {
+      name: 'Workspace navigation',
+    });
+
+    await user.click(within(nav).getByRole('button', { name: 'System' }));
+    await user.click(within(nav).getByRole('button', { name: 'Logs' }));
+    expect(screen.getByText('Logs page')).toBeVisible();
+    expect(within(nav).getByRole('button', { name: 'Logs' })).toHaveAttribute(
+      'aria-current',
+      'page',
+    );
+    await user.click(within(nav).getByRole('button', { name: 'Health' }));
+    expect(screen.getByText('Health page')).toBeVisible();
+
+    await user.keyboard('{Control>}k{/Control}');
+    expect(screen.getByRole('option', { name: /Go to Logs/ })).toBeVisible();
+    expect(screen.getByRole('option', { name: /Go to Health/ })).toBeVisible();
+  });
+
+  it('Usage opens the usage page and the command menu offers Go to Usage', async () => {
+    const user = userEvent.setup();
+    render(<Shell usage={<div>Usage page</div>} />);
+    const nav = screen.getByRole('navigation', {
+      name: 'Workspace navigation',
+    });
+
+    await user.click(within(nav).getByRole('button', { name: 'System' }));
+    await user.click(within(nav).getByRole('button', { name: 'Usage' }));
+    expect(screen.getByText('Usage page')).toBeVisible();
+    expect(within(nav).getByRole('button', { name: 'Usage' })).toHaveAttribute(
+      'aria-current',
+      'page',
+    );
+
+    await user.keyboard('{Control>}k{/Control}');
+    expect(screen.getByRole('option', { name: /Go to Usage/ })).toBeVisible();
   });
 
   it('shows the main agent identity in the sidebar presence block', () => {

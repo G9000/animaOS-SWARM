@@ -8,6 +8,7 @@ use serde_json::Value;
 use utoipa::ToSchema;
 
 use super::shared::data_value_to_json;
+use super::usage::UsageTotalsResponse;
 use crate::sessions::views::{MessagePage, PageMessage, SessionPage, SessionView};
 use crate::sessions::SessionCapabilities;
 
@@ -124,6 +125,11 @@ pub(crate) struct SessionResponse {
     pub(crate) capabilities: SessionCapabilitiesResponse,
     #[serde(rename = "match", skip_serializing_if = "Option::is_none")]
     pub(crate) matched: Option<SessionMatchResponse>,
+    /// Only `GET` of one session carries it: the session's usage totals, or
+    /// `null` when they could not be read. The outer `None` leaves the key out.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<UsageTotalsResponse>)]
+    pub(crate) usage: Option<Option<UsageTotalsResponse>>,
 }
 
 impl From<&SessionView> for SessionResponse {
@@ -175,6 +181,7 @@ impl From<&SessionView> for SessionResponse {
                 message_id: found.message_id.clone(),
                 snippet: found.snippet.clone(),
             }),
+            usage: None,
         }
     }
 }

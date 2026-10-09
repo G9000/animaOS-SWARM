@@ -92,6 +92,7 @@ pub(crate) struct StepSink {
     step_id: String,
     text: Mutex<String>,
     response: Mutex<Option<ModelGenerateResponse>>,
+    usage: Mutex<Option<TokenUsage>>,
 }
 
 impl StepSink {
@@ -101,12 +102,22 @@ impl StepSink {
             step_id,
             text: Mutex::new(String::new()),
             response: Mutex::new(None),
+            usage: Mutex::new(None),
         }
     }
 
     /// Everything the call streamed so far.
     pub(crate) fn streamed_text(&self) -> String {
         self.text.lock_recover().clone()
+    }
+
+    /// The latest provider-reported usage of a call that has not finished;
+    /// `None` until a usage frame arrives and for a zero total.
+    pub(crate) fn partial_usage(&self) -> Option<TokenUsage> {
+        self.usage
+            .lock_recover()
+            .clone()
+            .filter(|usage| usage.total_tokens > 0)
     }
 
     pub(crate) fn take_response(&self) -> Option<ModelGenerateResponse> {
@@ -129,6 +140,9 @@ impl ModelStreamSink for StepSink {
                         text,
                     });
                 }
+            }
+            ModelStreamFrame::Usage(usage) => {
+                *self.usage.lock_recover() = Some(usage);
             }
             ModelStreamFrame::Final(response) => {
                 *self.response.lock_recover() = Some(response);

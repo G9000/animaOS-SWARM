@@ -8,6 +8,7 @@ mod events;
 mod history;
 mod jobs;
 mod live;
+mod logs;
 mod memory_embeddings;
 mod memory_store;
 mod memory_text;
@@ -20,8 +21,11 @@ mod sessions;
 mod skills;
 mod state;
 mod tools;
+mod usage;
 
 pub mod postgres;
+
+pub use logs::init_tracing;
 
 pub use app::{
     app, app_with_config, app_with_configured_persistence, app_with_database, serve, DaemonConfig,

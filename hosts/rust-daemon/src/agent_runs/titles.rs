@@ -11,6 +11,8 @@ use crate::live::LiveEventBody;
 use crate::runs::RunChangeSet;
 use crate::sessions::titles::{auto_title_enabled, generate_title};
 use crate::sessions::{SessionKind, TitleSource};
+use crate::usage::metered::{record_secondary, Metered, SecondaryCall};
+use crate::usage::UsageSource;
 
 /// Ruling 2 (M3 pre-flight audit, M19): an assistant message a run's own
 /// stop or failure left behind never blocks AI titles for good, because that
@@ -120,12 +122,24 @@ impl AgentRunCoordinator {
             }
             (Arc::clone(&guard.model_adapter), runtime.config().clone())
         };
-        let title = match tokio::time::timeout(
+        // The call's tokens count whether or not its title is usable (spec
+        // §11); a timed-out call was dropped and records nothing.
+        let meter = Metered::new(adapter);
+        let generated = tokio::time::timeout(
             self.title_timeout,
-            generate_title(adapter.as_ref(), &config, &first, &reply),
+            generate_title(&meter, &config, &first, &reply),
         )
-        .await
-        {
+        .await;
+        if generated.is_ok() {
+            let call = SecondaryCall::for_config(
+                &agent_id,
+                Some(&session_id),
+                UsageSource::Title,
+                &config,
+            );
+            record_secondary(&self.state, &meter, call).await;
+        }
+        let title = match generated {
             Ok(Ok(title)) => title,
             Ok(Err(error)) => {
                 warn!(agent_id = %agent_id, session_id = %session_id, error = %error, "could not title the chat");

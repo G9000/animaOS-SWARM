@@ -12,11 +12,13 @@ import {
 } from '@animaOS-SWARM/sdk';
 
 import { useSaveToMemory } from '../../hooks/useSaveToMemory';
+import { useSessionUsage } from '../../hooks/useSessionUsage';
 import { describeTrigger } from '../../lib/automations';
 import type { LiveRun } from '../../lib/session-events';
 import { SESSION_KIND_LABELS } from '../../lib/session-groups';
 import { revealInvisible } from '../../lib/skills';
 import type { SlashCommand } from '../../lib/slash-commands';
+import { sessionUsageLine } from '../../lib/usage';
 import type { AgentDetail, ChatMessage } from '../../lib/types';
 import { Composer, MessageList } from '../ChatScreen';
 import {
@@ -124,6 +126,7 @@ function SessionHeader({
   onExport,
   automation,
   onEditAutomation,
+  usageLine,
 }: {
   session: Session;
   onRename: (title: string) => Promise<boolean>;
@@ -131,6 +134,8 @@ function SessionHeader({
   onExport: () => void;
   automation: Automation | null;
   onEditAutomation?: (automation: Automation) => void;
+  /** Tokens and cost so far, e.g. '12.3k tokens · $0.04'. */
+  usageLine: string | null;
 }) {
   const [editing, setEditing] = useState(false);
   const [title, setTitle] = useState(session.title);
@@ -183,6 +188,7 @@ function SessionHeader({
           ? ` · ${revealInvisible(describeTrigger(automation.trigger)).text}`
           : ''}
       </span>
+      {usageLine && <span className="session-usage-line">{usageLine}</span>}
       {!editing && session.capabilities.rename && (
         <button
           type="button"
@@ -269,6 +275,11 @@ export function SessionView({
     [saveAgentId, saveAgentName, sessionId],
   );
   const { save, savedState } = useSaveToMemory(saveTarget);
+  // The usage line reads again when a run finishes.
+  const finishedRuns = runs.filter((item) =>
+    isTerminalRunStatus(item.run.status),
+  ).length;
+  const usage = useSessionUsage(saveTarget, finishedRuns);
   const transcriptActions = useMemo<TranscriptActions>(
     () => ({ ...actions, onSaveToMemory: save, savedToMemory: savedState }),
     [actions, save, savedState],
@@ -322,6 +333,7 @@ export function SessionView({
           onExport={onExport}
           automation={automation}
           onEditAutomation={onEditAutomation}
+          usageLine={sessionUsageLine(usage)}
         />
       ) : null}
       {notice}

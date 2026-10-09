@@ -2,6 +2,22 @@
 
 This document is for the next agent picking up the companion console upgrade. Read it first; it tells you where everything is and what to do next.
 
+## Update 2026-10-09: M8 done, PR open (stacked on M7)
+
+- **M8 (Usage, logs, health) is complete** on `feat/companion-console-m8`. Its PR targets `feat/companion-console-m7`; merge #12, then #13, then M8.
+- **Gates at `65122bd`, all green:**
+  - `rust-daemon:test`: 2,082 passed, 7 ignored.
+  - SDK and web test, typecheck and build (web 1,042 tests).
+  - Formatting, and a log-secrets audit.
+- **Snapshot v10** (pricing overrides). The first start writes a `.pre-usage.bak` backup.
+- **Gotcha:** the first gate run failed on corrupted build artifacts ("invalid metadata", an internal compiler error). Running `cargo clean -p anima-daemon -p anima-core -p anima-model-adapters -p anima-memory` fixed it and freed about 87 GB.
+- **GPG signing still times out** when the passphrase cache expires; Task 4's commit waited on the owner.
+- **Follow-ups:**
+  - Token estimation for providers that report usage only at the end.
+  - A combined usage summary endpoint.
+  - The Logs page can't tell an open-but-quiet stream from one that hasn't connected (no "open" event).
+- **Next:** M9 (attachments and voice).
+
 ## Update 2026-10-04 (later): M7 done, PR open (stacked on M6)
 
 - **M7 (Memory) is complete** on `feat/companion-console-m7`. The branch is based on the M6 branch, so its PR targets `feat/companion-console-m6`; merge M6 (#12) first.

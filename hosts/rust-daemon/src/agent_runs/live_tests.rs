@@ -100,6 +100,114 @@ async fn a_run_announces_its_start_text_messages_and_result_in_order() {
     assert_eq!(record.steps.len(), 1);
 }
 
+/// The usage rows the history store holds for `agent_id` after a flush,
+/// oldest first.
+async fn flushed_usage(
+    coordinator: &super::AgentRunCoordinator,
+    agent_id: &str,
+) -> Vec<crate::usage::UsageRecord> {
+    let history = coordinator.state.read().await.history.clone();
+    history
+        .flush_once(
+            &coordinator.state,
+            &coordinator.control_plane_transactions(),
+            anima_core::primitives::now_millis(),
+        )
+        .await
+        .unwrap();
+    let mut rows = history
+        .store()
+        .page_usage(&crate::history::UsagePageQuery {
+            from_ms: 0,
+            to_ms: u64::MAX,
+            agent_id: Some(agent_id.into()),
+            session_id: None,
+            before: None,
+            limit: 100,
+        })
+        .await
+        .unwrap();
+    rows.reverse();
+    rows
+}
+
+/// M8 Task 4, end to end: each model call of a finished run becomes a usage
+/// row once the outbox mirrors the run.
+#[tokio::test]
+async fn a_completed_run_records_a_usage_row_per_model_call_after_a_flush() {
+    let model = ScriptedModel::new(vec![
+        Step::Tools(vec![calculate_call("call-1", "6*7")]),
+        Step::Text(vec!["It is 42."]),
+    ]);
+    let (coordinator, agent_id) = coordinator_with(model).await;
+    let mut request = chat_request(&agent_id, "chat:usage", "what is 6*7?");
+    request.source = RunSource::Web;
+    coordinator.run(request).await.unwrap();
+
+    let rows = flushed_usage(&coordinator, &agent_id).await;
+    let run_id = rows[0].run_id.clone().expect("a run row names its run");
+
+    assert_eq!(
+        rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+        [format!("{run_id}:1"), format!("{run_id}:2")]
+    );
+    for row in &rows {
+        assert_eq!(row.source, crate::usage::UsageSource::Chat);
+        assert_eq!(
+            (row.provider.as_str(), row.model.as_str()),
+            ("openai", "gpt-5.4")
+        );
+        assert_eq!(row.session_id.as_deref(), Some("chat:usage"));
+        assert_eq!(row.run_id.as_deref(), Some(run_id.as_str()));
+        assert_eq!((row.prompt_tokens, row.completion_tokens), (10, 2));
+        assert_eq!(row.pricing_source, crate::usage::PricingSource::Table);
+        assert!(row.cost_micros.is_some_and(|cost| cost > 0));
+    }
+}
+
+/// M8 Task 4 with Task 1: a stopped call keeps the usage its provider
+/// already reported, and the run's mirror records it.
+#[tokio::test]
+async fn a_stopped_run_records_its_partial_usage_row() {
+    let reported = anima_core::TokenUsage {
+        prompt_tokens: 25,
+        total_tokens: 25,
+        ..anima_core::TokenUsage::default()
+    };
+    let model = ScriptedModel::new(vec![Step::HoldAfterUsage(reported.clone(), vec!["Half"])]);
+    let (coordinator, agent_id) = coordinator_with(model).await;
+    let hub = coordinator.state.read().await.live.clone();
+    let mut subscription = hub.subscribe(&agent_id).unwrap();
+    let running = {
+        let coordinator = coordinator.clone();
+        let request = chat_request(&agent_id, "chat:stopped", "think");
+        tokio::spawn(async move { coordinator.run(request).await })
+    };
+    let events = events_until(&mut subscription, "step.delta").await;
+    let run_id = events[1]["runId"].as_str().unwrap().to_string();
+    hub.runs().control(&run_id).unwrap().cancel.cancel();
+    within("the run", running).await.unwrap().unwrap();
+    assert_eq!(
+        coordinator
+            .state
+            .read()
+            .await
+            .runs
+            .get(&run_id)
+            .unwrap()
+            .status,
+        RunStatus::Cancelled
+    );
+
+    let rows = flushed_usage(&coordinator, &agent_id).await;
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, format!("{run_id}:1"));
+    assert_eq!(rows[0].prompt_tokens, 25);
+    assert_eq!(rows[0].total_tokens, 25);
+    assert_eq!(rows[0].source, crate::usage::UsageSource::Api);
+}
+
 #[tokio::test]
 async fn tool_steps_publish_cards_with_argument_and_result_previews() {
     let model = ScriptedModel::new(vec![
@@ -443,7 +551,7 @@ async fn the_version_six_snapshot_saves_reply_ids() {
     // Carry-forward (M3 Task 6): kept out of version-5 snapshots, which an
     // M2 daemon would load and silently drop it from; version 6 and later save it.
     let snapshot = guard.control_plane_snapshot();
-    assert_eq!(snapshot.version, 9);
+    assert_eq!(snapshot.version, 10);
     let saved = snapshot
         .runs
         .into_iter()

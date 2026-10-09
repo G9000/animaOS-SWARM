@@ -378,6 +378,7 @@ mod tests {
             scheduler,
             jobs,
             crate::history::HistoryWorkerOwner::new(),
+            crate::logs::global(),
             LocalOwnerPolicy::for_test(true, None),
             ApiKeyPolicy::for_test(None),
         )

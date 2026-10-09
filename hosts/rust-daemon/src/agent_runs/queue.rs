@@ -362,6 +362,36 @@ fn joinable_run(state: &DaemonState, agent_id: &str, session_id: &str) -> Option
         .map(|record| record.id.clone())
 }
 
+/// Messages of `agent_id` waiting for their turn, for the queue cap (spec
+/// §4.2): its queued runs plus the steers its runs hold that the model has
+/// not read, skipping `except_run`'s record. A run whose inbox is open has
+/// read every steer it no longer holds there; the inbox is read before it is
+/// asked whether it closed, so a run closing meanwhile counts every steer its
+/// transcript is not known to have taken (never too few). Called under the
+/// control-plane transaction, which a joining steer holds from its save
+/// until it is in the inbox.
+pub(crate) fn waiting_count(
+    state: &DaemonState,
+    agent_id: &str,
+    except_run: Option<&str>,
+) -> usize {
+    state.runs.waiting_count(agent_id, except_run, |record| {
+        if record.pending_steers.is_empty() {
+            return 0;
+        }
+        let held = state.live.runs().control(&record.id).and_then(|control| {
+            let held = control.steering.pending();
+            (!control.steering.is_closed()).then_some(held)
+        });
+        let keys = held.as_ref().map(|held| {
+            held.iter()
+                .filter_map(|content| metadata_text(content, CLIENT_REQUEST_ID_METADATA_KEY))
+                .collect::<HashSet<_>>()
+        });
+        record.unread_steer_count(keys.as_ref())
+    })
+}
+
 /// The steers `run_id` leaves behind, oldest first, taken off its record:
 /// what its closed inbox gave back, and each saved steer its transcript did
 /// not take in (one saved while the run was finishing found the inbox
@@ -378,6 +408,13 @@ fn take_leftover_steers(
             .into_iter()
             .partition(|steer| taken.contains(&steer.idempotency_key));
         record.pending_steers = kept;
+        // The ones kept are in its transcript, which its commit settles.
+        let read = record
+            .pending_steers
+            .iter()
+            .map(|steer| steer.idempotency_key.clone())
+            .collect::<Vec<_>>();
+        record.note_steers_read(&read);
         for steer in left {
             let unread = leftovers.iter().any(|content| {
                 metadata_text(content, CLIENT_REQUEST_ID_METADATA_KEY)
@@ -455,6 +492,11 @@ impl AgentRunCoordinator {
             }
             if request.mode == SessionRunMode::Steer {
                 if let Some(run_id) = joinable_run(&guard, &request.agent_id, &request.session_id) {
+                    // A steer waits like a queued message, so it counts toward
+                    // the same cap (M3 carry-over; controller ruling 5).
+                    if waiting_count(&guard, &request.agent_id, None) >= MAX_QUEUED_RUNS_PER_AGENT {
+                        return Err(ApiError::too_many_requests(QUEUE_FULL));
+                    }
                     // Saved with the run it joins (audit I3); nothing else is.
                     let steer = RunSteer {
                         idempotency_key: request.idempotency_key.clone(),
@@ -474,7 +516,7 @@ impl AgentRunCoordinator {
                 // Nothing to join, or the run is ending: the steer waits its
                 // turn as a message.
             }
-            if guard.runs.queued_count(&request.agent_id) >= MAX_QUEUED_RUNS_PER_AGENT {
+            if waiting_count(&guard, &request.agent_id, None) >= MAX_QUEUED_RUNS_PER_AGENT {
                 return Err(ApiError::too_many_requests(QUEUE_FULL));
             }
             let mut record = RunRecord::queued(
@@ -631,8 +673,12 @@ impl AgentRunCoordinator {
             let model = runtime.config().model.clone();
             let provider = runtime.config().provider.clone();
             let now_ms = now_millis();
-            let mut open_slots =
-                MAX_QUEUED_RUNS_PER_AGENT.saturating_sub(guard.runs.queued_count(&left.agent_id));
+            // The run's own record holds only steers its transcript took in.
+            let mut open_slots = MAX_QUEUED_RUNS_PER_AGENT.saturating_sub(waiting_count(
+                &guard,
+                &left.agent_id,
+                Some(&left.run_id),
+            ));
             let records = steers
                 .into_iter()
                 .map(|content| {
